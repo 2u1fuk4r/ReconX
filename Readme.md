@@ -1,4 +1,3 @@
-<img width="675" height="455" alt="image" src="https://github.com/user-attachments/assets/8852d3ce-d10a-4019-a47e-8e2585366d39" />
 
 # 🔍 ReconX v5.0  
 ### Sequential Bug Bounty Reconnaissance Pipeline
