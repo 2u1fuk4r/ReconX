@@ -22,6 +22,9 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 <img width="622" height="773" alt="image" src="https://github.com/user-attachments/assets/8ae92230-ca41-4ada-a77c-4b1846b81e18" />
 
+====== The Last Report Will create and showing on browser =====
+<img width="1783" height="680" alt="image" src="https://github.com/user-attachments/assets/84c88537-30c3-4960-9647-9ebaa9549bfa" />
+
 ---
 
 # ✨ Features
