@@ -1,0 +1,80 @@
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  🚀 RECONX PRO v4.0 - Enterprise Config (Python Compatible) ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+reconx:
+  threads: 50
+  timeout: 30
+  rate_limit: 100
+  respectful_mode: false
+  user_agent: "ReconX-Pro-v4.0 (+https://github.com/ReconX-Pro)"
+  max_depth: 3
+
+providers:
+  shodan: ""
+  censys_id: ""
+  censys_secret: ""
+  github: ""
+  virustotal: ""
+  chaos: ""
+  hunter: ""
+
+tools:
+  subfinder: true
+  httpx: true
+  nuclei: true
+  katana: true
+  dnsx: true
+  masscan: true
+  nmap_flags: "-sV -sC --open -T4 -Pn"
+  masscan_rate: 10000
+  gobuster_threads: 50
+  ffuf_threads: 40
+  wordlist: "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+  fallback_wordlist: "/usr/share/seclists/Discovery/Web-Content/common.txt"
+
+nuclei:
+  enabled: true
+  templates: true
+  severity: ["critical", "high", "medium"]
+  update_templates: true
+  exclude_tags: []
+
+output:
+  format: ["json", "html", "markdown"]
+  directory: "results"
+  timestamp: true
+  colors: true
+
+database:
+  postgres_host: "localhost"
+  postgres_port: 5432
+  postgres_db: "reconx"
+  postgres_user: "postgres"
+  postgres_pass: ""
+
+cache:
+  redis_host: "localhost"
+  redis_port: 6379
+  redis_db: 0
+  ttl: 86400  # 24 hours
+
+scope:
+  exclude_subdomains: []
+  exclude_ports: [22, 25, 53, 110, 143, 993, 995]
+  out_of_scope_ips: []
+  max_subdomains: 5000
+  max_urls: 100000
+
+advanced:
+  eyewitness: true
+  js_analysis: true
+  param_discovery: true
+  xss_testing: true
+  cors_testing: true
+  
+notifications:
+  slack_webhook: ""
+  discord_webhook: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
