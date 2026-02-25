@@ -25,6 +25,9 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 ====== The Last Report Will create and showing on browser =====
 <img width="1783" height="680" alt="image" src="https://github.com/user-attachments/assets/84c88537-30c3-4960-9647-9ebaa9549bfa" />
 
+==== Alive Hosts ====
+<img width="1770" height="691" alt="image" src="https://github.com/user-attachments/assets/bd060c62-e975-43c4-9c27-7483e3b12f61" />
+
 ---
 
 # ✨ Features
