@@ -49,8 +49,9 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 # 📦 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/reconx.git
-cd reconx
+git clone https://github.com/2u1fuk4r/ReconX
+cd ReconX
+sudo bash install.sh
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -68,6 +69,7 @@ ReconX loads `config.yaml` from the project root by default.
 You can override it with:
 
 ```bash
+sudo python reconx.py -d example.com
 python3 reconx.py -d example.com --config ./custom_config.yaml
 ```
 
@@ -143,7 +145,7 @@ api_keys:
 
 ## Full Pipeline
 ```bash
-python3 reconx.py -d example.com
+sudo python reconx.py -d example.com
 ```
 
 ## Run Specific Stages
