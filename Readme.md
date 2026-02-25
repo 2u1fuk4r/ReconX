@@ -1,163 +1,220 @@
-# 🔍 ReconX – Bug Bounty Reconnaissance Framework
 
-> **Professional, modular, fully automated recon platform for authorized bug bounty hunting.**
+# 🔍 ReconX v5.0  
+### Sequential Bug Bounty Reconnaissance Pipeline
+
+ReconX is a stage-based, automation-first reconnaissance framework designed for authorized bug bounty and penetration testing engagements.
+
+Pipeline:
+Recon → Subdomains → Alive → URLs → Categorize → Nuclei → XSS
 
 ---
 
 ## ⚠️ Legal Disclaimer
 
-This tool is intended **exclusively** for use against systems you are **authorized** to test, within the scope of a valid bug bounty program or with explicit written permission from the target organization. Unauthorized use violates the Computer Fraud and Abuse Act (CFAA), GDPR, KVKK, and similar laws worldwide.
+This tool must only be used on targets you are explicitly authorized to test.  
+Unauthorized scanning is illegal.
 
-**By using ReconX, you accept full legal responsibility for your actions.**
-
----
-
-## ✨ Features
-
-| Category | Tools |
-|---|---|
-| DNS Discovery | Sublist3r, amass, subfinder, assetfinder, altdns, dnscan, Knockpy |
-| Port Scanning | nmap, masscan, naabu |
-| Web Discovery | gobuster, dirsearch, ffuf, dirb, nuclei, EyeWitness, httpx |
-| GitHub Secrets | truffleHog, gitrob, gitleaks, git-secrets |
-| Cloud Storage | cloudbrute, bucket_finder, s3scanner |
-| Wayback / History | waybackurls, gau, hakrawler |
-| Google Dorks | GoogD0rker, auto-generated dork list |
-| Asset ID | Shodan, Censys, theHarvester, whois |
-
-**Other highlights:** parallel execution, HTML/Markdown/JSON reports, rate limiting, modular CLI menu, API key management, update mechanism.
+Use `--no-legal` only in CI or fully authorized automated environments.
 
 ---
 
-## 📦 Installation
+# ✨ Features
+
+- Stage-based automated recon workflow
+- Resume support via checkpoints
+- RAM-safe streaming URL processing
+- Integrated Nuclei scanning
+- Integrated Dalfox (3 XSS modes)
+- Automatic SUMMARY.json generation
+- Optional HTML report builder
+- Clean structured output
+- Safe Ctrl+C handling
+
+---
+
+# 🧱 Pipeline Stages
+
+| Stage | Name | Description |
+|-------|------|-------------|
+| 1 | Initial Recon | Whois, WhatWeb, WAF detection, Nmap, TheHarvester, Shodan |
+| 2 | Subdomain Enumeration | Subfinder, Assetfinder, Amass, etc |
+| 3 | Alive Detection | httpx probing & fingerprinting |
+| 4 | URL Discovery | gau, waybackurls, katana |
+| 5 | Categorization | Reflection detection & XSS prioritization |
+| 6 | Nuclei Scan | Template-based vulnerability scanning |
+| 7 | XSS Scan | Dalfox standard + DOM + redirect modes |
+
+---
+
+# 📦 Installation
 
 ```bash
-git clone <your-repo-url> reconx
+git clone https://github.com/YOUR_USERNAME/reconx.git
 cd reconx
-chmod +x install.sh
-sudo ./install.sh
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-The installer will:
-- Install system packages (nmap, dirb, python3, go, ruby…)
-- Clone and configure all git-based tools into `/opt/`
-- Install Go tools via `go install`
-- Download SecLists wordlists
-- Set up Python dependencies
+Ensure required external tools are installed and available in `$PATH`:
+httpx, nuclei, dalfox, subfinder, assetfinder, amass, gau, waybackurls, katana
 
 ---
 
-## ⚙️ Configuration
+# ⚙️ Configuration (config.yaml)
 
-Edit `config.yaml` before first use:
+ReconX loads `config.yaml` from the project root by default.  
+You can override it with:
+
+```bash
+python3 reconx.py -d example.com --config ./custom_config.yaml
+```
+
+---
+
+## 🔧 settings
+
+```yaml
+settings:
+  threads: 50
+  rate_limit: 5
+  timeout: 10
+```
+
+### threads
+- Controls worker/thread count for httpx, nuclei and dalfox.
+- Higher = faster scans, more CPU/RAM usage.
+- Recommended:
+  - VPS: 80–150
+  - Local machine: 30–80
+  - Stealth mode: 10–30
+
+### rate_limit
+- Controls request rate limiting for nuclei and dalfox.
+- Lower values reduce detection risk.
+- Example:
+  - 1–3 → stealth
+  - 5–10 → balanced
+  - 20+ → aggressive
+
+### timeout
+- HTTP timeout in seconds (used mainly by Dalfox).
+- Increase if scanning slow endpoints.
+- Default 10 is usually safe.
+
+---
+
+## 🛠 tools
+
+```yaml
+tools:
+  nuclei_severity: "critical,high,medium"
+```
+
+### nuclei_severity
+- Defines which severities Nuclei will scan for.
+- Available:
+  - info
+  - low
+  - medium
+  - high
+  - critical
+- Example configurations:
+  - Fast triage: "critical,high"
+  - Deep scan: "critical,high,medium,low"
+
+---
+
+## 🔑 api_keys
 
 ```yaml
 api_keys:
   shodan: "YOUR_SHODAN_KEY"
-  censys_id: "YOUR_CENSYS_ID"
-  github: "YOUR_GITHUB_TOKEN"
 ```
+
+### shodan
+- Enables Shodan integration in Stage 1 (if binary installed).
+- Leave empty to disable.
 
 ---
 
-## 🚀 Usage
+# 🚀 Usage
 
-### Interactive mode (recommended)
+## Full Pipeline
 ```bash
-python3 main.py
+python3 reconx.py -d example.com
 ```
-Enter your target domain and select modules from the menu.
 
-### CLI flags
+## Run Specific Stages
 ```bash
-# Run all modules against a target
-python3 main.py -d example.com -m A
-
-# Run only DNS + Port scan modules
-python3 main.py -d example.com -m 1 2
-
-# Update all tools
-python3 main.py --update
-
-# Skip legal warning (for CI pipelines)
-python3 main.py -d example.com -m A --no-legal
+python3 reconx.py -d example.com -s 1 2 3
 ```
 
-### Module numbers
-| # | Module |
-|---|--------|
-| 1 | DNS Discovery |
-| 2 | Port Scanning |
-| 3 | Web Discovery |
-| 4 | GitHub Secrets |
-| 5 | Cloud Storage |
-| 6 | Wayback / Old Content |
-| 7 | Google Dorks |
-| 8 | Asset Identification |
-| A | All modules |
-
----
-
-## 📁 Output Structure
-
-```
-output/
-└── example.com_20241201_143022/
-    ├── dns/
-    │   ├── sublist3r.txt
-    │   ├── amass.txt
-    │   └── subfinder.txt
-    ├── ports/
-    │   ├── nmap_scan.nmap
-    │   └── masscan.json
-    ├── web/
-    │   ├── gobuster.txt
-    │   ├── nuclei.txt
-    │   └── eyewitness/
-    ├── github/
-    │   └── trufflehog.txt
-    ├── cloud/
-    │   └── cloudbrute.txt
-    ├── wayback/
-    │   └── waybackurls.txt
-    ├── assets/
-    │   ├── shodan.txt
-    │   └── whois.txt
-    ├── results.json      ← machine-readable summary
-    ├── report.html       ← visual HTML report
-    ├── report.md         ← Markdown report
-    └── recon.log         ← full execution log
-```
-
----
-
-## 🔄 Updating Tools
-
+## Resume Scan
 ```bash
-python3 main.py --update
+python3 reconx.py -d example.com --resume
+```
+
+## Non-Interactive Mode
+```bash
+python3 reconx.py -d example.com --no-legal --auto-nuclei --auto-xss
 ```
 
 ---
 
-## 💡 Effective Bug Bounty Recon Workflow
+# 📁 Output Structure
 
-1. **DNS Discovery** → build subdomain list
-2. **Port Scanning** → identify exposed services
-3. **Web Discovery** → find hidden endpoints
-4. **Wayback** → uncover old/forgotten content
-5. **GitHub Secrets** → look for leaked credentials
-6. **Cloud Storage** → find misconfigured S3 buckets
-7. **Asset ID** → Shodan/Censys passive intel
-8. Manually investigate findings using the HTML report
+```
+output/<domain>_<timestamp>/
+├── 01_recon/
+├── 02_subdomains/
+├── 03_alive/
+├── 04_urls/
+├── 05_categorized/
+├── 06_nuclei/
+├── 07_xss/
+├── checkpoints/
+├── pipeline.log
+└── SUMMARY.json
+```
+
+- checkpoints → enables resume mode
+- SUMMARY.json → final statistics
+- HTML report generated if report_builder.py exists
 
 ---
 
-## 🤝 Contributing
+# ⌨️ Interrupt Behavior
 
-Pull requests welcome! Please ensure new modules follow the `(name, cmd, output_file)` tuple pattern used throughout the framework.
+- First Ctrl+C → Stops current tool and continues pipeline
+- Rapid second Ctrl+C → Safe exit + report generation
 
 ---
 
-## 📄 License
+# 🔒 Security Philosophy
 
-MIT – Use responsibly.
+ReconX is designed for:
+
+- Professional bug bounty workflows
+- Reproducible recon methodology
+- Reduced manual tool chaining
+- Clean report-ready output
+
+---
+
+# 📄 License
+
+MIT License
+
+---
+
+# 👤 Author
+
+Zulfukar Karabulut  
+Security Researcher | Bug Bounty Hunter
+Linkedin : https://linkedin.com/in/2u1fuk4r
+
+---
+
+Use responsibly.
