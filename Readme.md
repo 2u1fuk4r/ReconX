@@ -16,6 +16,10 @@ Unauthorized scanning is illegal.
 
 Use `--no-legal` only in CI or fully authorized automated environments.
 
+<img width="706" height="298" alt="image" src="https://github.com/user-attachments/assets/ab5297c5-0657-4357-a692-aac25889abda" />
+
+<img width="622" height="773" alt="image" src="https://github.com/user-attachments/assets/8ae92230-ca41-4ada-a77c-4b1846b81e18" />
+
 ---
 
 # ✨ Features
