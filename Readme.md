@@ -226,7 +226,7 @@ MIT License
 # 👤 Author
 
 Zulfukar Karabulut  
-Security Researcher | Bug Bounty Hunter
+Security Researcher | Pentester | eWPTX & eCPPT
 Linkedin : https://linkedin.com/in/2u1fuk4r
 
 ---
