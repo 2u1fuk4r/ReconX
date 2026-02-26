@@ -13,6 +13,7 @@ Changes v5.0:
   - RAM-safe streaming for large URL lists
 """
 
+
 import atexit, os, sys, re, json, yaml, time, logging, argparse
 import subprocess, shutil, threading, signal
 from pathlib import Path
@@ -1373,9 +1374,18 @@ def legal_warning():
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
     print(f"""{C.CYAN}{C.BOLD}
+    
+    ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗██╗  ██╗
+    ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║╚██╗██╔╝
+    ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║ ╚███╔╝ 
+    ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║ ██╔██╗ 
+    ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║██╔╝ ██╗
+    ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝    
   ╔══════════════════════════════════════════════════════╗
-  ║  ReconX Sequential Scanner v5.0                     ║
-  ║  Recon → Subs → Alive → URLs → Cats → Nuclei → XSS  ║
+  ║  ReconX Sequential Scanner v5.0                      ║
+  ║  Recon → Subs → Alive → URLs → Cats → Nuclei → XSS   ║
+  ║  By Zulfukar Karabulut & Pentester | Comp. Engineer  ║
+  ║  Linkedin : https://linkedin.com/in/2u1fuk4r         ║
   ╚══════════════════════════════════════════════════════╝{C.RESET}""")
 
     p = argparse.ArgumentParser(description="ReconX Bug Bounty Scanner v5.0")
