@@ -227,6 +227,7 @@ MIT License
 
 Zulfukar Karabulut  
 Security Researcher | Pentester | eWPTX & eCPPT
+
 Linkedin : https://linkedin.com/in/2u1fuk4r
 
 ---
