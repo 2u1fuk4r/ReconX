@@ -551,6 +551,148 @@ def _section_xss(xss):
             f'{alert}{body}</div>')
 
 
+def _section_threatmap(target: str, subs: dict, alive: list, nuclei: dict, xss: dict) -> str:
+    """Interactive D3.js force-directed threat map — drag, zoom, hover."""
+    from urllib.parse import urlparse as _up
+
+    all_subs  = subs.get("all", [])
+    alive_urls = [h.get("url", "") for h in alive if h.get("url")]
+    alive_set  = set()
+    for u in alive_urls:
+        try: alive_set.add(_up(u).hostname or "")
+        except: pass
+
+    # Nuclei findings per host
+    vuln_map: dict = {}
+    for r in nuclei.get("all", []):
+        h = r.get("host") or ""
+        try: h = _up(h).hostname or h
+        except: pass
+        if h:
+            vuln_map.setdefault(h, {"severity": "info", "count": 0})
+            vuln_map[h]["count"] += 1
+            sev_order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+            if sev_order.get(r.get("severity","info"), 1) > sev_order.get(vuln_map[h]["severity"], 1):
+                vuln_map[h]["severity"] = r.get("severity", "info")
+
+    # XSS per host
+    xss_set: set = set()
+    for u in xss.get("all", []):
+        try: xss_set.add(_up(u).hostname or "")
+        except: pass
+
+    # Build graph nodes/links
+    nodes = [{"id": target, "type": "root", "label": target,
+               "alive": True, "severity": "none", "vuln_count": 0, "xss": False}]
+    links = []
+
+    # Group by second-level (one level below root)
+    import re as _re
+    esc_target = _re.escape(target)
+    group_map: dict = {}
+    singletons: list = []
+
+    for s in all_subs:
+        if s == target:
+            continue
+        # strip root suffix
+        suffix = "." + target
+        local  = s[:-len(suffix)] if s.endswith(suffix) else s
+        parts  = local.split(".")
+        if len(parts) >= 2:
+            grp = parts[-1]  # e.g. "api" from "v1.api.example.com"
+            group_map.setdefault(grp, []).append(s)
+        else:
+            singletons.append(s)
+
+    # Add singleton subdomains directly
+    for s in singletons:
+        nodes.append({
+            "id": s, "type": "subdomain",
+            "label": s,
+            "alive": s in alive_set,
+            "severity": vuln_map.get(s, {}).get("severity", "none"),
+            "vuln_count": vuln_map.get(s, {}).get("count", 0),
+            "xss": s in xss_set,
+        })
+        links.append({"source": target, "target": s, "type": "sub"})
+
+    # Add group nodes + their children
+    for grp, members in group_map.items():
+        if len(members) == 1:
+            s = members[0]
+            nodes.append({
+                "id": s, "type": "subdomain",
+                "label": s,
+                "alive": s in alive_set,
+                "severity": vuln_map.get(s, {}).get("severity", "none"),
+                "vuln_count": vuln_map.get(s, {}).get("count", 0),
+                "xss": s in xss_set,
+            })
+            links.append({"source": target, "target": s, "type": "sub"})
+        else:
+            grp_id = f"_grp_{grp}"
+            grp_alive = any(m in alive_set for m in members)
+            nodes.append({"id": grp_id, "type": "group",
+                          "label": f"*.{grp}.{target}", "count": len(members),
+                          "alive": grp_alive, "severity": "none", "vuln_count": 0, "xss": False})
+            links.append({"source": target, "target": grp_id, "type": "group"})
+            for s in members:
+                nodes.append({
+                    "id": s, "type": "subdomain",
+                    "label": s,
+                    "alive": s in alive_set,
+                    "severity": vuln_map.get(s, {}).get("severity", "none"),
+                    "vuln_count": vuln_map.get(s, {}).get("count", 0),
+                    "xss": s in xss_set,
+                })
+                links.append({"source": grp_id, "target": s, "type": "sub"})
+
+    graph_json = json.dumps({"nodes": nodes, "links": links})
+    total_subs  = len(all_subs)
+    alive_count = len(alive_set)
+
+    return f'''<div id="s-threatmap" class="section">
+  <div class="sec-hdr">
+    <h2>🗺️ Threat Map</h2>
+    <p class="sec-sub">{total_subs:,} subdomains · {alive_count:,} alive · drag to move · scroll to zoom</p>
+  </div>
+  <div class="tm-legend">
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#4fa8e8"></span>Root</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#3d5a72"></span>Group</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#34c759"></span>Alive</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#6e8098"></span>Dead</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#ff453a"></span>Critical/High Vuln</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#ffa94d"></span>Medium Vuln</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#ff6b6b;border:2px solid #fff"></span>XSS</span>
+  </div>
+  <div class="tm-toolbar">
+    <button class="btn-sm" onclick="tmResetZoom()">⊙ Reset Zoom</button>
+    <button class="btn-sm" onclick="tmToggleLabels()">🏷 Toggle Labels</button>
+    <button class="btn-sm" onclick="tmFilterAlive()">💚 Alive Only</button>
+    <button class="btn-sm" onclick="tmFilterAll()">🌐 Show All</button>
+    <input id="tm-search" class="vs-search" style="max-width:220px" placeholder="Search node..." oninput="tmSearch()">
+    <span id="tm-info" style="font-size:12px;color:var(--mu);margin-left:auto"></span>
+  </div>
+  <div class="tm-wrap">
+    <svg id="tm-svg"></svg>
+    <div id="tm-tooltip" class="tm-tooltip"></div>
+  </div>
+  <script>
+  (function(){{
+    window._TM_DATA = {graph_json};
+    window._TM_SHOW_LABELS = true;
+    window._TM_FILTER = 'all';
+    if (document.readyState === 'loading') {{
+      document.addEventListener('DOMContentLoaded', initThreatMap, {{once:true}});
+    }} else {{
+      setTimeout(initThreatMap, 50);
+    }}
+  }})();
+  </script>
+</div>'''
+
+
 # ── CSS ────────────────────────────────────────────────────────────────────────
 _CSS = """
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Outfit:wght@300;400;500;700;800&display=swap');
@@ -725,6 +867,26 @@ code{font-family:var(--mono);font-size:12px;color:var(--ac)}
   .sidebar{display:none}.main{margin-left:0;padding:16px}
   .two-col{grid-template-columns:1fr}
 }
+
+/* ── Threat Map ───────────────────────────────────────────── */
+.tm-wrap{position:relative;background:var(--s1);border:1px solid var(--bd);
+         border-radius:12px;overflow:hidden;height:680px;margin-top:12px}
+#tm-svg{width:100%;height:100%;cursor:grab}
+#tm-svg:active{cursor:grabbing}
+.tm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.tm-legend{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;
+           padding:10px 14px;background:var(--s2);border-radius:8px;
+           border:1px solid var(--bd)}
+.tm-leg-item{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mu)}
+.tm-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.tm-tooltip{position:absolute;pointer-events:none;background:rgba(13,17,23,.97);
+            border:1px solid var(--bd2);border-radius:8px;padding:10px 14px;
+            font-size:12px;color:var(--tx);max-width:280px;display:none;
+            z-index:50;box-shadow:0 8px 32px rgba(0,0,0,.6);line-height:1.7}
+.tm-tooltip strong{color:var(--ac);font-family:var(--mono);font-size:11px;
+                   word-break:break-all;display:block;margin-bottom:4px}
+.tm-tt-badge{display:inline-block;padding:1px 8px;border-radius:20px;
+             font-size:10px;font-weight:700;margin:1px 2px}
 """
 
 # ── JS ────────────────────────────────────────────────────────────────────────
@@ -945,6 +1107,296 @@ document.addEventListener('keydown', function(e) {
     flush();
   }
 })();
+
+// ── Threat Map (D3 force-directed) ─────────────────────────────────────────
+function initThreatMap() {
+  var data = window._TM_DATA;
+  if (!data || typeof d3 === 'undefined') return;
+
+  var svg = d3.select('#tm-svg');
+  var wrap = document.querySelector('.tm-wrap');
+  if (!svg.node() || !wrap) return;
+
+  var W = wrap.clientWidth  || 900;
+  var H = wrap.clientHeight || 680;
+  svg.attr('viewBox', [0, 0, W, H]);
+
+  var g = svg.append('g');
+  var tooltip = document.getElementById('tm-tooltip');
+
+  // Color helpers
+  function nodeColor(d) {
+    if (d.type === 'root')  return '#4fa8e8';
+    if (d.type === 'group') return '#2d4a62';
+    var sevMap = {critical:'#ff453a', high:'#ff6b35', medium:'#ffa94d', low:'#74c0fc', none:'', info:''};
+    if (d.xss) return '#ff453a';
+    if (sevMap[d.severity]) return sevMap[d.severity];
+    return d.alive ? '#34c759' : '#3a4d60';
+  }
+  function nodeRadius(d) {
+    if (d.type === 'root')  return 22;
+    if (d.type === 'group') return 16;
+    return d.alive ? 9 : 6;
+  }
+  function nodeStroke(d) {
+    if (d.xss) return '#fff';
+    if (d.type === 'root') return '#74c0fc';
+    if (d.type === 'group') return '#3d6080';
+    return d.alive ? '#27a447' : '#2a3d50';
+  }
+  function linkColor(d) {
+    return d.type === 'group' ? '#243040' : '#1e2a36';
+  }
+
+  // Clone data for filtering
+  window._TM_ALL_NODES = data.nodes.slice();
+  window._TM_ALL_LINKS = data.links.slice();
+  window._TM_SIM = null;
+  window._TM_G = g;
+  window._TM_SVG = svg;
+  window._TM_W = W;
+  window._TM_H = H;
+  window._TM_NODE_COLOR = nodeColor;
+  window._TM_NODE_RADIUS = nodeRadius;
+  window._TM_NODE_STROKE = nodeStroke;
+  window._TM_LINK_COLOR = linkColor;
+
+  renderThreatMap(data.nodes, data.links);
+}
+
+function renderThreatMap(nodes, links) {
+  var svg    = window._TM_SVG;
+  var g      = window._TM_G;
+  var W      = window._TM_W;
+  var H      = window._TM_H;
+  var nodeColor  = window._TM_NODE_COLOR;
+  var nodeRadius = window._TM_NODE_RADIUS;
+  var nodeStroke = window._TM_NODE_STROKE;
+  var linkColor  = window._TM_LINK_COLOR;
+  var tooltip    = document.getElementById('tm-tooltip');
+
+  g.selectAll('*').remove();
+  if (window._TM_SIM) window._TM_SIM.stop();
+
+  // Zoom
+  var zoom = d3.zoom()
+    .scaleExtent([0.05, 4])
+    .on('zoom', function(event){ g.attr('transform', event.transform); });
+  svg.call(zoom);
+  window._TM_ZOOM = zoom;
+
+  // Build node map for link resolution
+  var nodeById = {};
+  nodes.forEach(function(n){ nodeById[n.id] = n; });
+
+  var resolvedLinks = links
+    .filter(function(l){ return nodeById[l.source] && nodeById[l.target]; })
+    .map(function(l){ return {source: l.source, target: l.target, type: l.type}; });
+
+  var sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(resolvedLinks)
+      .id(function(d){ return d.id; })
+      .distance(function(d){ return d.type === 'group' ? 120 : 70; })
+    )
+    .force('charge', d3.forceManyBody()
+      .strength(function(d){ return d.type === 'root' ? -800 : d.type === 'group' ? -300 : -80; })
+    )
+    .force('center', d3.forceCenter(W / 2, H / 2))
+    .force('collision', d3.forceCollide().radius(function(d){ return nodeRadius(d) + 5; }))
+    .alphaDecay(0.02);
+
+  window._TM_SIM = sim;
+
+  // Defs: glow filters
+  var defs = svg.select('defs');
+  if (defs.empty()) defs = svg.append('defs');
+  ['glow-blue','glow-red','glow-green'].forEach(function(id, i) {
+    var colors = ['#4fa8e8','#ff453a','#34c759'];
+    var filt = defs.append('filter').attr('id', id).attr('x','-30%').attr('y','-30%').attr('width','160%').attr('height','160%');
+    filt.append('feGaussianBlur').attr('stdDeviation','3').attr('result','blur');
+    var merge = filt.append('feMerge');
+    merge.append('feMergeNode').attr('in','blur');
+    merge.append('feMergeNode').attr('in','SourceGraphic');
+  });
+
+  // Links
+  var link = g.append('g').selectAll('line')
+    .data(resolvedLinks).join('line')
+    .attr('stroke', linkColor)
+    .attr('stroke-width', function(d){ return d.type === 'group' ? 1.5 : 1; })
+    .attr('stroke-dasharray', function(d){ return d.type === 'group' ? '6,3' : ''; })
+    .attr('opacity', 0.6);
+
+  // Node groups
+  var node = g.append('g').selectAll('g')
+    .data(nodes).join('g')
+    .attr('class', 'tm-node')
+    .style('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', function(event, d) {
+        if (!event.active) sim.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+      })
+      .on('drag', function(event, d) { d.fx = event.x; d.fy = event.y; })
+      .on('end', function(event, d) {
+        if (!event.active) sim.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      })
+    );
+
+  // Circles
+  node.append('circle')
+    .attr('r', nodeRadius)
+    .attr('fill', nodeColor)
+    .attr('stroke', nodeStroke)
+    .attr('stroke-width', function(d){ return d.xss ? 2.5 : 1.5; })
+    .attr('filter', function(d){
+      if (d.type === 'root') return 'url(#glow-blue)';
+      if (d.xss || d.severity === 'critical' || d.severity === 'high') return 'url(#glow-red)';
+      if (d.alive && d.type === 'subdomain') return 'url(#glow-green)';
+      return '';
+    });
+
+  // XSS ring
+  node.filter(function(d){ return d.xss; })
+    .append('circle')
+    .attr('r', function(d){ return nodeRadius(d) + 4; })
+    .attr('fill', 'none')
+    .attr('stroke', '#ff453a')
+    .attr('stroke-width', 1)
+    .attr('stroke-dasharray', '3,2')
+    .attr('opacity', 0.6);
+
+  // Vuln count badge
+  node.filter(function(d){ return d.vuln_count > 0; })
+    .append('text')
+    .text(function(d){ return d.vuln_count; })
+    .attr('dy', function(d){ return -nodeRadius(d) + 2; })
+    .attr('text-anchor', 'middle')
+    .attr('fill', '#ff6b6b')
+    .attr('font-size', '9px')
+    .attr('font-weight', '700')
+    .attr('font-family', 'JetBrains Mono, monospace');
+
+  // Labels
+  var labels = node.append('text')
+    .attr('class', 'tm-label')
+    .attr('dy', function(d){ return nodeRadius(d) + 13; })
+    .attr('text-anchor', 'middle')
+    .attr('fill', function(d){
+      if (d.type === 'root') return '#4fa8e8';
+      if (d.type === 'group') return '#6e8098';
+      return d.alive ? '#cdd9e5' : '#506070';
+    })
+    .attr('font-size', function(d){ return d.type === 'root' ? '12px' : d.type === 'group' ? '10px' : '9px'; })
+    .attr('font-family', 'JetBrains Mono, monospace')
+    .attr('font-weight', function(d){ return d.type === 'root' ? '700' : '400'; })
+    .text(function(d){
+      if (d.type === 'root') return d.label;
+      if (d.type === 'group') return d.label;
+      // Shorten label: show only first part
+      var parts = d.label.split('.');
+      return parts.length > 2 ? parts.slice(0, -2).join('.') : d.label;
+    })
+    .style('display', window._TM_SHOW_LABELS ? '' : 'none')
+    .style('pointer-events', 'none');
+
+  // Tooltip
+  node.on('mouseover', function(event, d) {
+    var sevColors = {critical:'#ff443a',high:'#ff6b35',medium:'#ffd43b',low:'#74c0fc',info:'#868e96',none:'#868e96'};
+    var sev = d.severity || 'none';
+    var html = '<strong>' + d.label + '</strong>';
+    if (d.type === 'group') {
+      html += '<span class="tm-tt-badge" style="background:#1a2d3d;color:#4fa8e8">GROUP · ' + d.count + ' subs</span>';
+    } else if (d.type !== 'root') {
+      html += '<span class="tm-tt-badge" style="background:' + (d.alive ? '#0d2414' : '#1a1f26') + ';color:' + (d.alive ? '#34c759' : '#6e8098') + '">' + (d.alive ? '✓ ALIVE' : '✗ DEAD') + '</span>';
+      if (sev !== 'none' && sev !== 'info') {
+        html += '<span class="tm-tt-badge" style="background:#2d0d0d;color:' + sevColors[sev] + '">' + sev.toUpperCase() + ' · ' + d.vuln_count + ' finding' + (d.vuln_count > 1 ? 's' : '') + '</span>';
+      }
+      if (d.xss) {
+        html += '<span class="tm-tt-badge" style="background:#2d0d0d;color:#ff453a">⚠ XSS</span>';
+      }
+    }
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+  })
+  .on('mousemove', function(event) {
+    var wrap = document.querySelector('.tm-wrap');
+    var rect = wrap.getBoundingClientRect();
+    var x = event.clientX - rect.left + 12;
+    var y = event.clientY - rect.top + 12;
+    if (x + 290 > wrap.clientWidth) x -= 300;
+    tooltip.style.left = x + 'px';
+    tooltip.style.top  = y + 'px';
+  })
+  .on('mouseout', function() { tooltip.style.display = 'none'; });
+
+  // Update info
+  var infoEl = document.getElementById('tm-info');
+  if (infoEl) infoEl.textContent = nodes.length + ' nodes · ' + resolvedLinks.length + ' edges';
+
+  sim.on('tick', function() {
+    link
+      .attr('x1', function(d){ return d.source.x; })
+      .attr('y1', function(d){ return d.source.y; })
+      .attr('x2', function(d){ return d.target.x; })
+      .attr('y2', function(d){ return d.target.y; });
+    node.attr('transform', function(d){ return 'translate(' + d.x + ',' + d.y + ')'; });
+  });
+}
+
+function tmResetZoom() {
+  if (!window._TM_SVG || !window._TM_ZOOM) return;
+  window._TM_SVG.transition().duration(500).call(
+    window._TM_ZOOM.transform, d3.zoomIdentity.translate(window._TM_W/2, window._TM_H/2).scale(0.8)
+  );
+}
+function tmToggleLabels() {
+  window._TM_SHOW_LABELS = !window._TM_SHOW_LABELS;
+  d3.selectAll('.tm-label').style('display', window._TM_SHOW_LABELS ? '' : 'none');
+}
+function tmFilterAlive() {
+  window._TM_FILTER = 'alive';
+  var all = window._TM_ALL_NODES;
+  var aliveIds = new Set(all.filter(function(n){ return n.alive || n.type === 'root'; }).map(function(n){ return n.id; }));
+  var nodes = all.filter(function(n){ return aliveIds.has(n.id); });
+  var links = window._TM_ALL_LINKS.filter(function(l){ return aliveIds.has(l.source) && aliveIds.has(l.target); });
+  renderThreatMap(nodes.map(function(n){ return Object.assign({}, n); }), links);
+}
+function tmFilterAll() {
+  window._TM_FILTER = 'all';
+  var nodes = window._TM_ALL_NODES.map(function(n){ return Object.assign({}, n); });
+  renderThreatMap(nodes, window._TM_ALL_LINKS);
+}
+function tmSearch() {
+  var q = document.getElementById('tm-search').value.toLowerCase();
+  if (!q) { d3.selectAll('.tm-node circle').attr('opacity', 1); return; }
+  d3.selectAll('.tm-node').each(function(d) {
+    var match = d.label && d.label.toLowerCase().indexOf(q) >= 0;
+    d3.select(this).selectAll('circle').attr('opacity', match ? 1 : 0.15);
+    d3.select(this).selectAll('text').attr('opacity', match ? 1 : 0.1);
+  });
+}
+
+// Re-init threat map when its section becomes visible
+var _origShowSection = typeof showSection !== 'undefined' ? showSection : null;
+function showSection(id, el) {
+  document.querySelectorAll('.section').forEach(function(s){ s.classList.remove('active'); });
+  document.querySelectorAll('.nav-a').forEach(function(n){ n.classList.remove('active'); });
+  var sec = document.getElementById('s-' + id);
+  if (sec) sec.classList.add('active');
+  if (el) el.classList.add('active');
+  if (sec) sec.querySelectorAll('.vs-vp').forEach(function(vp){
+    try { vsRender(vp.id.replace('-vp', '')); } catch(e) {}
+  });
+  if (id === 'threatmap' && window._TM_DATA && typeof d3 !== 'undefined') {
+    setTimeout(function() {
+      if (!window._TM_SIM || window._TM_SIM.alpha() < 0.001) {
+        initThreatMap();
+      }
+    }, 80);
+  }
+}
 """
 
 
@@ -974,6 +1426,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 </div>
 <div class="nav-grp"><div class="nav-lbl">Overview</div>
   {_nav("🏠","Dashboard","overview")}
+  {_nav("🗺️","Threat Map","threatmap", len(subs["all"]))}
 </div>
 <div class="nav-grp"><div class="nav-lbl">Reconnaissance</div>
   {_nav("🔍","Recon","recon")}
@@ -997,6 +1450,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 
     sections = "".join([
         _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, smry),
+        _section_threatmap(target, subs, alive, nuclei, xss),
         _section_recon(recon),
         _section_subdomains(subs),
         _section_alive(alive),
@@ -1024,6 +1478,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
   Use only on authorized targets under a valid bug bounty program.
 </div>
 </main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 <script>{_JS}</script>
 </body>
 </html>"""
