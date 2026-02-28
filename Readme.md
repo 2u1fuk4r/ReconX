@@ -25,6 +25,10 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 ====== The Last Report Will create and showing on browser =====
 <img width="1783" height="680" alt="image" src="https://github.com/user-attachments/assets/84c88537-30c3-4960-9647-9ebaa9549bfa" />
 
+===== Thread Map for all subdoamins ======
+<img width="871" height="639" alt="image" src="https://github.com/user-attachments/assets/9d354da1-61f2-43ee-82a3-08c6e36e37b5" />
+
+
 ==== Alive Hosts ====
 <img width="1770" height="691" alt="image" src="https://github.com/user-attachments/assets/bd060c62-e975-43c4-9c27-7483e3b12f61" />
 
