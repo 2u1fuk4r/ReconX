@@ -36,6 +36,19 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 ==== Alive Hosts ====
 <img width="1777" height="738" alt="image" src="https://github.com/user-attachments/assets/f37423b3-8dd8-4a56-8887-8e2db3b33e54" />
 
+
+==== All Urls =====
+<img width="1779" height="719" alt="image" src="https://github.com/user-attachments/assets/3960b8d1-5bd3-4739-85b3-1e9e44f6c3cd" />
+
+
+==== Parameters ====
+<img width="1802" height="737" alt="image" src="https://github.com/user-attachments/assets/51ac21ca-79d2-4fc7-97d2-3e059fe31b12" />
+
+
+==== Categorised =====
+<img width="1760" height="741" alt="image" src="https://github.com/user-attachments/assets/c07d1fac-e24a-4e27-a04a-d38aa8b2a208" />
+
+
 ---
 
 # ✨ Features
