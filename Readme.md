@@ -82,6 +82,7 @@ You can override it with:
 
 ```bash
 sudo python reconx.py -d example.com
+sudo python reconx.py -d example.com --single
 python3 reconx.py -d example.com --config ./custom_config.yaml
 ```
 
@@ -158,6 +159,10 @@ api_keys:
 ## Full Pipeline
 ```bash
 sudo python reconx.py -d example.com
+```
+## Sinle Target
+```bash
+sudo python reconx.py -d example.com --single
 ```
 
 ## Run Specific Stages
