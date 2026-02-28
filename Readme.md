@@ -16,21 +16,24 @@ Unauthorized scanning is illegal.
 
 Use `--no-legal` only in CI or fully authorized automated environments.
 
-<img width="593" height="298" alt="1" src="https://github.com/user-attachments/assets/a17de6aa-4c45-43d7-9932-69a9a4ba060b" />
+<img width="665" height="791" alt="image" src="https://github.com/user-attachments/assets/e8e71d50-10fb-44d4-a283-d106bb02780a" />
+
 
 ==== The Proccess will working for each tools and steages ====
 
-<img width="622" height="773" alt="image" src="https://github.com/user-attachments/assets/8ae92230-ca41-4ada-a77c-4b1846b81e18" />
+<img width="655" height="793" alt="image" src="https://github.com/user-attachments/assets/def8eba7-a40e-40b0-8a0d-da76367a9a4b" />
+
 
 ====== The Last Report Will create and showing on browser =====
-<img width="1783" height="680" alt="image" src="https://github.com/user-attachments/assets/84c88537-30c3-4960-9647-9ebaa9549bfa" />
+<img width="1742" height="717" alt="image" src="https://github.com/user-attachments/assets/46cc1b1a-e5f1-4d50-98f1-cd521ccb8f2f" />
+
 
 ===== Thread Map for all subdoamins ======
 <img width="871" height="639" alt="image" src="https://github.com/user-attachments/assets/9d354da1-61f2-43ee-82a3-08c6e36e37b5" />
 
 
 ==== Alive Hosts ====
-<img width="1770" height="691" alt="image" src="https://github.com/user-attachments/assets/bd060c62-e975-43c4-9c27-7483e3b12f61" />
+<img width="1777" height="738" alt="image" src="https://github.com/user-attachments/assets/f37423b3-8dd8-4a56-8887-8e2db3b33e54" />
 
 ---
 
