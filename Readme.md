@@ -39,7 +39,8 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 
 ==== All Urls =====
-<img width="1779" height="719" alt="image" src="https://github.com/user-attachments/assets/3960b8d1-5bd3-4739-85b3-1e9e44f6c3cd" />
+<img width="1777" height="738" alt="alive" src="https://github.com/user-attachments/assets/ddb76cbc-cd4c-4c56-ae8e-e99140565998" />
+
 
 
 ==== Parameters ====
