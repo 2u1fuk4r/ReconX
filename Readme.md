@@ -29,7 +29,8 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 
 ===== Thread Map for all subdoamins ======
-<img width="871" height="639" alt="image" src="https://github.com/user-attachments/assets/9d354da1-61f2-43ee-82a3-08c6e36e37b5" />
+<img width="949" height="721" alt="image" src="https://github.com/user-attachments/assets/eca77a6a-99c3-4b92-a5c2-ee6046471020" />
+
 
 
 ==== Alive Hosts ====
