@@ -34,7 +34,8 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 
 ==== Alive Hosts ====
-<img width="1777" height="738" alt="image" src="https://github.com/user-attachments/assets/f37423b3-8dd8-4a56-8887-8e2db3b33e54" />
+<img width="1760" height="741" alt="image" src="https://github.com/user-attachments/assets/dd910594-756a-4737-a970-1b0318f82415" />
+
 
 
 ==== All Urls =====
