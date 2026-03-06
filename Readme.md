@@ -189,7 +189,7 @@ sudo python reconx.py -d example.com
 ```
 ## Sinle Target
 ```bash
-sudo python reconx.py -d example.com --single
+sudo python reconx.py -u example.com 
 ```
 
 ## Run Specific Stages
