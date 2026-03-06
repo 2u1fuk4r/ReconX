@@ -22,7 +22,8 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 ==== The Proccess will working for each tools and steages ====
 
-<img width="655" height="793" alt="image" src="https://github.com/user-attachments/assets/def8eba7-a40e-40b0-8a0d-da76367a9a4b" />
+<img width="1004" height="739" alt="2" src="https://github.com/user-attachments/assets/06486d95-3b6d-4e03-9c66-8431bebcfca7" />
+
 
 
 ====== The Last Report Will create and showing on browser =====
