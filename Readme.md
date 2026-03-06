@@ -42,7 +42,6 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 <img width="1777" height="738" alt="alive" src="https://github.com/user-attachments/assets/b388072f-d995-4e50-8887-5d7a8272abb9" />
 
 
-
 ==== All Urls =====
 
 <img width="1779" height="719" alt="all urls" src="https://github.com/user-attachments/assets/ac04d77b-e7c0-496e-9200-58282a6702c0" />
