@@ -16,7 +16,8 @@ Unauthorized scanning is illegal.
 
 Use `--no-legal` only in CI or fully authorized automated environments.
 
-<img width="665" height="791" alt="image" src="https://github.com/user-attachments/assets/e8e71d50-10fb-44d4-a283-d106bb02780a" />
+
+![Screenshot 2026-03-07 002457 py](https://github.com/user-attachments/assets/ead8ef26-9225-48fd-b5e1-1d55c0cd7811)
 
 
 ==== The Proccess will working for each tools and steages ====
