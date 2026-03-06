@@ -1,5 +1,5 @@
 
-# 🔍 ReconX v5.0  
+# 🔍 ReconX v6.0  
 ### Sequential Bug Bounty Reconnaissance Pipeline
 
 ReconX is a stage-based, automation-first reconnaissance framework designed for authorized bug bounty and penetration testing engagements.
