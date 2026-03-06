@@ -19,6 +19,9 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 ![Screenshot 2026-03-07 002457 py](https://github.com/user-attachments/assets/ead8ef26-9225-48fd-b5e1-1d55c0cd7811)
 
+=====
+<img width="725" height="362" alt="1" src="https://github.com/user-attachments/assets/a3648e9c-27f1-415f-9f1d-f4d882abf94a" />
+
 
 ==== The Proccess will working for each tools and steages ====
 
@@ -27,7 +30,8 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 
 ====== The Last Report Will create and showing on browser =====
-<img width="1742" height="717" alt="image" src="https://github.com/user-attachments/assets/46cc1b1a-e5f1-4d50-98f1-cd521ccb8f2f" />
+
+![dashboard](https://github.com/user-attachments/assets/8598948a-5633-4875-95bb-a17197ea949e)
 
 
 ===== Thread Map for all subdoamins ======
