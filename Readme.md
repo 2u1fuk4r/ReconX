@@ -62,14 +62,14 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 =====  Founds Xss && Poc =====
 
 ![s9](https://github.com/user-attachments/assets/51c48778-211a-46ed-8953-27aff252c2f7)
+<img width="1603" height="746" alt="image" src="https://github.com/user-attachments/assets/97177540-00e7-4632-bbf6-31e1d615b7f1" />
 
 
 ==== Nuclei Vulns =====
 
 ![s10](https://github.com/user-attachments/assets/ea43bd00-41ef-49fa-a976-aab867bb4f08)
 
-=== Xss Poc ===
-<img width="1603" height="746" alt="image" src="https://github.com/user-attachments/assets/97177540-00e7-4632-bbf6-31e1d615b7f1" />
+
 
 ---
 
