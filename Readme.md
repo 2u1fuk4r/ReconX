@@ -17,7 +17,8 @@ Unauthorized scanning is illegal.
 Use `--no-legal` only in CI or fully authorized automated environments.
 
 
-![Screenshot 2026-03-07 002457 py](https://github.com/user-attachments/assets/ead8ef26-9225-48fd-b5e1-1d55c0cd7811)
+![s0](https://github.com/user-attachments/assets/3e2bbcc1-75c2-4e75-9aaa-16e367a808f4)
+
 
 <img width="725" height="362" alt="1" src="https://github.com/user-attachments/assets/a3648e9c-27f1-415f-9f1d-f4d882abf94a" />
 
