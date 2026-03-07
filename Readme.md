@@ -20,13 +20,14 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 ![s0](https://github.com/user-attachments/assets/3e2bbcc1-75c2-4e75-9aaa-16e367a808f4)
 
 
-<img width="725" height="362" alt="1" src="https://github.com/user-attachments/assets/a3648e9c-27f1-415f-9f1d-f4d882abf94a" />
-
 
 ==== The Proccess will working for each tools and steages ====
 
-<img width="1004" height="739" alt="2" src="https://github.com/user-attachments/assets/06486d95-3b6d-4e03-9c66-8431bebcfca7" />
+![process](https://github.com/user-attachments/assets/36e22773-8408-451d-a4d7-568f11b68dae)
 
+
+=== Founds Xss ===
+<img width="1289" height="748" alt="3" src="https://github.com/user-attachments/assets/1f27ac99-8d51-431a-bc81-f707f1b125db" />
 
 
 ====== The Last Report Will create and showing on browser =====
@@ -35,25 +36,37 @@ Use `--no-legal` only in CI or fully authorized automated environments.
 
 
 ===== Thread Map for all subdoamins ======
-<img width="949" height="721" alt="image" src="https://github.com/user-attachments/assets/eca77a6a-99c3-4b92-a5c2-ee6046471020" />
+![s2](https://github.com/user-attachments/assets/9c92fbad-fb9c-43de-aa18-a6e7e4fc1469)
+
 
 
 
 ==== Alive Hosts ====
-<img width="1777" height="738" alt="alive" src="https://github.com/user-attachments/assets/b388072f-d995-4e50-8887-5d7a8272abb9" />
+![s5](https://github.com/user-attachments/assets/c03bac8a-ae72-4370-882a-2290b040fc1d)
+
 
 
 ==== All Urls =====
 
-<img width="1779" height="719" alt="all urls" src="https://github.com/user-attachments/assets/ac04d77b-e7c0-496e-9200-58282a6702c0" />
+![s6](https://github.com/user-attachments/assets/3d19b0c4-4075-4b3a-a699-26ce5e77052b)
 
 
 ==== Parameters ====
-<img width="1802" height="737" alt="image" src="https://github.com/user-attachments/assets/51ac21ca-79d2-4fc7-97d2-3e059fe31b12" />
+![s7](https://github.com/user-attachments/assets/214d418e-a28e-4a57-ab87-5fec514f498d)
+
 
 
 ==== Categorised =====
-<img width="1760" height="741" alt="image" src="https://github.com/user-attachments/assets/c07d1fac-e24a-4e27-a04a-d38aa8b2a208" />
+![s8](https://github.com/user-attachments/assets/36856679-894e-4cb7-99b5-96f6d48d2bda)
+
+=====  Founds Xss && Poc =====
+
+![s9](https://github.com/user-attachments/assets/51c48778-211a-46ed-8953-27aff252c2f7)
+
+
+==== Nuclei Vulns =====
+
+![s10](https://github.com/user-attachments/assets/ea43bd00-41ef-49fa-a976-aab867bb4f08)
 
 
 ---
