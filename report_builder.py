@@ -44,10 +44,6 @@ def _safe_json(data) -> str:
 _UNSAFE_PROTO = re.compile(r'^\s*(javascript|data|vbscript)\s*:', re.I)
 
 def _safe_href(url: str) -> str:
-    """
-    Normal https:// URL → tıklanabilir link döndür.
-    javascript: / data: / vbscript: → boş string (sadece metin göster).
-    """
     s = url.strip()
     if _UNSAFE_PROTO.match(s):
         return ""
@@ -122,9 +118,33 @@ def _parse_alive(d: Path) -> list:
             seen.add(url)
             tech_raw = rec.get("tech") or rec.get("technologies") or []
             tech = ", ".join(str(t) for t in tech_raw[:8]) if isinstance(tech_raw, list) else str(tech_raw)[:120]
-            ip = rec.get("host") or rec.get("a") or rec.get("ip") or ""
-            if isinstance(ip, list):
-                ip = ip[0] if ip else ""
+
+            # ── IP extraction: always prefer a real IP address ──────────────
+            # httpx field priority: "ip" > "a" (list) > "host" (only if it looks like IP)
+            _IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+            ip = ""
+            # 1. Explicit "ip" field
+            _ip_raw = rec.get("ip") or ""
+            if isinstance(_ip_raw, list): _ip_raw = _ip_raw[0] if _ip_raw else ""
+            if _ip_raw and _IP_RE.match(str(_ip_raw).strip()):
+                ip = str(_ip_raw).strip()
+            # 2. "a" field (DNS A records list)
+            if not ip:
+                _a = rec.get("a") or []
+                if isinstance(_a, str): _a = [_a]
+                for _candidate in (_a if isinstance(_a, list) else []):
+                    if _IP_RE.match(str(_candidate).strip()):
+                        ip = str(_candidate).strip()
+                        break
+            # 3. "host" field — only if it looks like an IP (not a hostname)
+            if not ip:
+                _h = str(rec.get("host") or "").strip()
+                if _h and _IP_RE.match(_h):
+                    ip = _h
+            # 4. Fallback: try to resolve from URL hostname via already-parsed data
+            if not ip:
+                _host_header = str(rec.get("host") or "").strip()
+                ip = ""  # leave empty rather than show wrong subdomain name
             rt = rec.get("time") or rec.get("response-time") or ""
             cl = rec.get("content-length") or rec.get("content_length") or ""
             hosts.append({
@@ -244,7 +264,6 @@ def _extract_url_from_dalfox_line(line: str) -> str:
     return ""
 
 def _parse_xss(d: Path) -> dict:
-    # v6.6: tier dosyaları + eski dosyalar
     xd = d / "06_xss"
     if not xd.exists():
         xd = d / "07_xss"
@@ -252,17 +271,10 @@ def _parse_xss(d: Path) -> dict:
         return {"all": [], "pocs": [], "poc_urls": [], "r1": [], "r2": [], "r3": []}
 
     all_lines = []
-    # v6.6 tier dosyaları önce
     for fname in [
-        "dalfox_findings_tier1.txt",
-        "dalfox_findings_tier2.txt",
-        "dalfox_findings_tier3.txt",
-        "dalfox_all_findings.txt",
-        # eski isimler (geriye dönük uyumluluk)
-        "dalfox_findings.txt",
-        "dalfox_all.txt",
-        "dalfox_findings_rerun.txt",
-        "dalfox_all_rerun.txt",
+        "dalfox_findings_tier1.txt","dalfox_findings_tier2.txt","dalfox_findings_tier3.txt",
+        "dalfox_all_findings.txt","dalfox_findings.txt","dalfox_all.txt",
+        "dalfox_findings_rerun.txt","dalfox_all_rerun.txt",
     ]:
         p = xd / fname
         if p.exists():
@@ -305,19 +317,20 @@ def _parse_summary_json(d: Path) -> dict:
 # ── HTML components ────────────────────────────────────────────────────────────
 def _badge(text: str, color: str = "blue") -> str:
     colors = {
-        "red":    ("#2d0d0d", "#ff6b6b"),
-        "orange": ("#2d1a00", "#ffa94d"),
-        "yellow": ("#2a1f00", "#ffd43b"),
-        "blue":   ("#0d1f2d", "#74c0fc"),
-        "green":  ("#0d2414", "#69db7c"),
-        "purple": ("#1a0d2d", "#cc5de8"),
-        "gray":   ("#1a1f26", "#868e96"),
-        "cyan":   ("#001f26", "#3bc9db"),
-        "pink":   ("#2d0d1a", "#f783ac"),
+        "red":    ("rgba(239,68,68,.15)", "#f87171"),
+        "orange": ("rgba(249,115,22,.15)", "#fb923c"),
+        "yellow": ("rgba(234,179,8,.15)", "#facc15"),
+        "blue":   ("rgba(59,130,246,.15)", "#60a5fa"),
+        "green":  ("rgba(34,197,94,.15)", "#4ade80"),
+        "purple": ("rgba(168,85,247,.15)", "#c084fc"),
+        "gray":   ("rgba(107,114,128,.15)", "#9ca3af"),
+        "cyan":   ("rgba(6,182,212,.15)", "#22d3ee"),
+        "pink":   ("rgba(236,72,153,.15)", "#f472b6"),
     }
     bg, fg = colors.get(color, colors["blue"])
-    return (f'<span style="background:{bg};color:{fg};padding:2px 10px;border-radius:20px;'
-            f'font-size:11px;font-weight:700;letter-spacing:.4px;white-space:nowrap">'
+    return (f'<span style="background:{bg};color:{fg};padding:2px 10px;border-radius:6px;'
+            f'font-size:11px;font-weight:600;letter-spacing:.3px;white-space:nowrap;'
+            f'border:1px solid {fg}22">'
             f'{_e(text)}</span>')
 
 def _sev_badge(sev: str) -> str:
@@ -326,19 +339,24 @@ def _sev_badge(sev: str) -> str:
 
 def _stat(val, label: str, color: str, icon: str) -> str:
     cols = {
-        "red": "#ff6b6b", "orange": "#ffa94d", "blue": "#74c0fc",
-        "green": "#69db7c", "yellow": "#ffd43b", "purple": "#cc5de8", "gray": "#868e96"
+        "red": "#f87171", "orange": "#fb923c", "blue": "#60a5fa",
+        "green": "#4ade80", "yellow": "#facc15", "purple": "#c084fc", "gray": "#9ca3af"
     }
-    c = cols.get(color, "#74c0fc")
+    bgs = {
+        "red": "rgba(239,68,68,.08)", "orange": "rgba(249,115,22,.08)", "blue": "rgba(59,130,246,.08)",
+        "green": "rgba(34,197,94,.08)", "yellow": "rgba(234,179,8,.08)", "purple": "rgba(168,85,247,.08)", "gray": "rgba(107,114,128,.08)"
+    }
+    c = cols.get(color, "#60a5fa")
+    bg = bgs.get(color, "rgba(59,130,246,.08)")
     n = f"{val:,}" if isinstance(val, int) else str(val)
-    return (f'<div class="stat-card">'
+    return (f'<div class="stat-card" style="--accent:{c};--accent-bg:{bg}">'
             f'<div class="stat-icon">{icon}</div>'
-            f'<div class="stat-val" style="color:{c}">{n}</div>'
+            f'<div class="stat-val">{n}</div>'
             f'<div class="stat-lbl">{_e(label)}</div>'
             f'</div>')
 
 def _empty(msg: str = "No data recorded") -> str:
-    return f'<div class="empty-state">📭 {_e(msg)}</div>'
+    return f'<div class="empty-state"><span class="empty-icon">◌</span><span>{_e(msg)}</span></div>'
 
 def _code_block(text: str, max_lines: int = 400) -> str:
     if not text.strip():
@@ -420,14 +438,13 @@ def _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, summary
     poc_n   = len(xss["pocs"])
     by_sev  = nuclei["by_severity"]
 
-    # Nuclei sayısı: info hariç önemli bulgular
     nuc_important = sum(len(by_sev.get(s, [])) for s in ["critical","high","medium","low"])
 
     stats_html = "".join([
         _stat(sc_n,    "Subdomains",   "green",  "🌐"),
         _stat(alive_n, "Alive Hosts",  "blue",   "💻"),
         _stat(url_n,   "URLs Found",   "purple", "🔗"),
-        _stat(par_n,   "Param URLs",   "orange", "🧩"),
+        _stat(par_n,   "Param URLs",   "orange", "⚙️"),
         _stat(refl_n,  "Reflection",   "yellow", "🪞"),
         _stat(sens_n,  "Sensitive",    "red",    "⚠️"),
         _stat(nuc_important, "Nuclei Hits", "red", "🎯"),
@@ -442,9 +459,9 @@ def _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, summary
     waf_html = ""
     if waf_list:
         waf_badges = " ".join(_badge(w.upper(), "orange") for w in waf_list)
-        waf_html = f'<div class="panel" style="margin-top:12px"><h3>🛡️ WAF / CDN Detected</h3><div style="margin-top:8px">{waf_badges}</div></div>'
+        waf_html = f'<div class="panel" style="margin-top:14px"><div class="panel-header"><span class="panel-icon">🛡️</span><h3>WAF / CDN Detected</h3></div><div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">{waf_badges}</div></div>'
     else:
-        waf_html = '<div class="panel" style="margin-top:12px"><h3>🛡️ WAF / CDN</h3><div style="color:var(--mu);font-size:13px;margin-top:6px">No WAF detected</div></div>'
+        waf_html = '<div class="panel" style="margin-top:14px"><div class="panel-header"><span class="panel-icon">🛡️</span><h3>WAF / CDN</h3></div><div style="color:var(--muted);font-size:13px;margin-top:8px;display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block"></span>No WAF detected</div></div>'
 
     block_ratio = smry_json.get("block_ratio_httpx") or smry_json.get("stages", {}).get("stage3", {}).get("block_ratio") or 0
     adapt_mult  = smry_json.get("adaptive_multiplier") or 1.0
@@ -452,9 +469,8 @@ def _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, summary
     if float(block_ratio) > 0.05:
         pct = f"{float(block_ratio)*100:.1f}%"
         col = "red" if float(block_ratio) > 0.3 else "orange" if float(block_ratio) > 0.1 else "yellow"
-        adapt_html = (f'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-                      f'{_badge(f"Block ratio: {pct}", col)}'
-                      f'{_badge(f"Rate mult: {float(adapt_mult):.2f}x", "blue")}'
+        adapt_html = (f'<div class="info-banner info-{col}" style="margin-bottom:16px">'
+                      f'<span>⚡ Block ratio: <strong>{pct}</strong> · Rate multiplier: <strong>{float(adapt_mult):.2f}x</strong></span>'
                       f'</div>')
 
     stages = [
@@ -476,21 +492,21 @@ def _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, summary
     tl += "</div>"
 
     sev_bar = '<div class="sev-bar">'
-    for sev, col in [("critical", "#ff6b6b"), ("high", "#ffa94d"),
-                     ("medium", "#ffd43b"), ("low", "#74c0fc"), ("info", "#868e96")]:
+    for sev, col in [("critical", "#f87171"), ("high", "#fb923c"),
+                     ("medium", "#facc15"), ("low", "#60a5fa"), ("info", "#6b7280")]:
         c = len(by_sev.get(sev, []))
         if c:
-            sev_bar += (f'<div style="flex:{c};background:{col};min-width:3px;'
+            sev_bar += (f'<div style="flex:{c};background:{col};min-width:4px;'
                         f'border-radius:2px" title="{_e(sev)}: {c}"></div>')
     sev_bar += "</div>"
     sev_leg = '<div class="sev-legend">'
-    for sev, col in [("Critical", "#ff6b6b"), ("High", "#ffa94d"),
-                     ("Medium", "#ffd43b"), ("Low", "#74c0fc"), ("Info", "#868e96")]:
+    for sev, col in [("Critical", "#f87171"), ("High", "#fb923c"),
+                     ("Medium", "#facc15"), ("Low", "#60a5fa"), ("Info", "#6b7280")]:
         c = len(by_sev.get(sev.lower(), []))
         sev_leg += (f'<span class="sev-item">'
-                    f'<span style="background:{col};width:8px;height:8px;border-radius:50%;'
-                    f'display:inline-block;margin-right:5px"></span>'
-                    f'{_e(sev)}: <b>{c}</b></span>')
+                    f'<span style="background:{col};width:8px;height:8px;border-radius:2px;'
+                    f'display:inline-block;margin-right:6px;flex-shrink:0"></span>'
+                    f'{_e(sev)}: <b style="color:var(--text)">{c}</b></span>')
     sev_leg += "</div>"
 
     cat_data = {
@@ -499,67 +515,84 @@ def _section_overview(target, ts, recon, subs, alive, urls, nuclei, xss, summary
         "sensitive": sens_n, "forms": len(urls.get("forms",[])),
     }
     cat_max = max(cat_data.values()) if any(cat_data.values()) else 1
-    cat_colors = {"params":"#ffa94d","reflection":"#ff6b6b","admin":"#ff453a",
-                  "login":"#ffd43b","api":"#cc5de8","sensitive":"#f85149","forms":"#74c0fc"}
+    cat_colors = {"params":"#fb923c","reflection":"#f87171","admin":"#ef4444",
+                  "login":"#facc15","api":"#c084fc","sensitive":"#f87171","forms":"#60a5fa"}
+    cat_icons  = {"params":"⚙️","reflection":"🪞","admin":"🔑","login":"🚪","api":"⚡","sensitive":"⚠️","forms":"📝"}
     cat_bars = ""
     for k, v in sorted(cat_data.items(), key=lambda x: -x[1]):
         if v == 0:
             continue
         pct = max(4, int(v / cat_max * 100))
-        cat_bars += (f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
-                     f'<div style="width:75px;font-size:11px;color:var(--mu);text-align:right">{_e(k)}</div>'
-                     f'<div style="flex:1;background:var(--s3);border-radius:4px;height:16px;overflow:hidden">'
-                     f'<div style="width:{pct}%;background:{cat_colors.get(k,"#74c0fc")};height:100%;'
-                     f'border-radius:4px;min-width:4px;transition:width .5s"></div></div>'
-                     f'<div style="width:50px;font-size:11px;font-family:var(--mono);color:var(--tx)">{v:,}</div>'
+        col = cat_colors.get(k, "#60a5fa")
+        ico = cat_icons.get(k, "")
+        cat_bars += (f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
+                     f'<div style="width:88px;font-size:12px;color:var(--muted);text-align:right;display:flex;align-items:center;justify-content:flex-end;gap:4px">{ico} {_e(k)}</div>'
+                     f'<div style="flex:1;background:var(--surface3);border-radius:4px;height:14px;overflow:hidden">'
+                     f'<div style="width:{pct}%;background:{col};height:100%;border-radius:4px;transition:width .5s;opacity:.85"></div></div>'
+                     f'<div style="width:44px;font-size:12px;font-family:var(--mono);color:var(--text-dim);text-align:right">{v:,}</div>'
                      f'</div>')
 
     adapt_events = smry_json.get("adaptive_events") or []
     adapt_tl = ""
     if adapt_events:
-        adapt_tl = '<div style="margin-top:8px">'
+        adapt_tl = '<div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">'
         for ev in adapt_events[:8]:
             reason = _e(ev.get("reason", ""))
             ts_ev  = _e(ev.get("ts", ""))
             mb = ev.get("mult_before", 1.0)
             ma = ev.get("mult_after", 1.0)
             col = "red" if float(ma) < 0.3 else "orange"
-            adapt_tl += (f'<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;'
-                         f'padding:8px 10px;background:var(--s3);border-radius:6px;border-left:3px solid #{("ff453a" if col=="red" else "ffa94d")}">'
-                         f'<div style="flex:1"><div style="font-size:11px;color:var(--tx)">{reason}</div>'
-                         f'<div style="font-size:10px;color:var(--mu);margin-top:2px">{ts_ev}</div></div>'
-                         f'<div style="white-space:nowrap">{_badge(f"{mb:.2f}→{ma:.2f}x", col)}</div>'
+            bdr = "#ef4444" if col=="red" else "#f97316"
+            adapt_tl += (f'<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;'
+                         f'background:var(--surface3);border-radius:8px;border-left:3px solid {bdr}">'
+                         f'<div style="flex:1"><div style="font-size:12px;color:var(--text)">{reason}</div>'
+                         f'<div style="font-size:11px;color:var(--muted);margin-top:2px">{ts_ev}</div></div>'
+                         f'<div>{_badge(f"{mb:.2f}→{ma:.2f}x", col)}</div>'
                          f'</div>')
         if len(adapt_events) > 8:
-            adapt_tl += f'<div style="font-size:11px;color:var(--mu)">... +{len(adapt_events)-8} more events</div>'
+            adapt_tl += f'<div style="font-size:11px;color:var(--muted);padding:4px 12px">+{len(adapt_events)-8} more events</div>'
         adapt_tl += "</div>"
 
     return f'''
 <div id="s-overview" class="section active">
-  <div class="sec-hdr"><h2>Dashboard</h2><p class="sec-sub">Target: <code>{_e(target)}</code> · {_e(ts)}</p></div>
+  <div class="sec-hdr">
+    <div class="sec-hdr-inner">
+      <div>
+        <h2>Dashboard</h2>
+        <p class="sec-sub">Target: <code class="target-code">{_e(target)}</code> &nbsp;·&nbsp; {_e(ts)}</p>
+      </div>
+      <div class="sec-hdr-badge">{_badge("RECON COMPLETE", "green")}</div>
+    </div>
+  </div>
   {adapt_html}
   <div class="stat-grid">{stats_html}</div>
 
   <div class="two-col" style="margin-top:20px">
-    <div class="panel"><h3>Pipeline</h3>{tl}</div>
-    <div class="panel"><h3>Nuclei Severity</h3>{sev_bar}{sev_leg}
-      <div class="mini-grid" style="margin-top:14px">
-        <div class="mini-num" style="color:#ff6b6b">{len(by_sev.get("critical",[]))}<span>Critical</span></div>
-        <div class="mini-num" style="color:#ffa94d">{len(by_sev.get("high",[]))}<span>High</span></div>
-        <div class="mini-num" style="color:#ffd43b">{len(by_sev.get("medium",[]))}<span>Medium</span></div>
-        <div class="mini-num" style="color:#74c0fc">{len(by_sev.get("low",[]))}<span>Low</span></div>
+    <div class="panel">
+      <div class="panel-header"><span class="panel-icon">🚀</span><h3>Pipeline Status</h3></div>
+      {tl}
+    </div>
+    <div class="panel">
+      <div class="panel-header"><span class="panel-icon">🎯</span><h3>Nuclei Severity Distribution</h3></div>
+      <div style="margin-top:4px">{sev_bar}</div>
+      {sev_leg}
+      <div class="mini-grid" style="margin-top:16px">
+        <div class="mini-num" style="--nc:#f87171">{len(by_sev.get("critical",[]))}<span>Critical</span></div>
+        <div class="mini-num" style="--nc:#fb923c">{len(by_sev.get("high",[]))}<span>High</span></div>
+        <div class="mini-num" style="--nc:#facc15">{len(by_sev.get("medium",[]))}<span>Medium</span></div>
+        <div class="mini-num" style="--nc:#60a5fa">{len(by_sev.get("low",[]))}<span>Low</span></div>
       </div>
     </div>
   </div>
 
   <div class="two-col" style="margin-top:14px">
     <div class="panel">
-      <h3>URL Categories</h3>
-      <div style="margin-top:12px">{cat_bars if cat_bars else "<div style='color:var(--mu);font-size:13px'>No categorised URLs yet</div>"}</div>
+      <div class="panel-header"><span class="panel-icon">📊</span><h3>URL Categories</h3></div>
+      <div style="margin-top:14px">{cat_bars if cat_bars else "<div style='color:var(--muted);font-size:13px'>No categorised URLs yet</div>"}</div>
     </div>
     <div>
       {waf_html}
-      {"<div class='panel' style='margin-top:12px'><h3>⚡ Adaptive Rate Events</h3>" + adapt_tl + "</div>" if adapt_events else ""}
+      {"<div class='panel' style='margin-top:14px'><div class='panel-header'><span class='panel-icon'>⚡</span><h3>Adaptive Rate Events</h3></div>" + adapt_tl + "</div>" if adapt_events else ""}
     </div>
   </div>
 </div>'''
@@ -592,7 +625,7 @@ def _section_recon(recon):
     ]
     tab_items = [(tid, lbl, c) for tid, lbl, c in items if c != _empty()]
     body = _tabs(tab_items, "recon") if tab_items else _empty()
-    return f'<div id="s-recon" class="section"><div class="sec-hdr"><h2>🔍 Reconnaissance</h2></div>{body}</div>'
+    return f'<div id="s-recon" class="section"><div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>Reconnaissance</h2></div></div></div>{body}</div>'
 
 def _section_subdomains(subs):
     all_s = subs["all"]
@@ -602,19 +635,20 @@ def _section_subdomains(subs):
         key=lambda r: -int(r[1])
     )
     body = (f'{_vscroll(all_s, "vs-subs", "subdomain")}'
-            f'<div style="margin-top:24px"><h3 style="color:#868e96;font-size:12px;'
-            f'text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px">Tool Breakdown</h3>'
+            f'<div style="margin-top:28px"><div class="subsection-label">Tool Breakdown</div>'
             f'{_vtable(["Tool", "Count", "Sample"], tool_rows, "vt-sub-tools")}</div>'
             if all_s else _empty())
     return (f'<div id="s-subdomains" class="section">'
-            f'<div class="sec-hdr"><h2>🌐 Subdomains</h2>'
-            f'<p class="sec-sub">{len(all_s):,} unique subdomains discovered</p></div>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>Subdomains</h2>'
+            f'<p class="sec-sub">{len(all_s):,} unique subdomains discovered</p>'
+            f'</div></div></div>'
             f'{body}</div>')
 
 def _section_alive(alive):
     if not alive:
         return (f'<div id="s-alive" class="section">'
-                f'<div class="sec-hdr"><h2>💻 Alive Hosts</h2></div>{_empty()}</div>')
+                f'<div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>Alive Hosts</h2></div></div></div>{_empty()}</div>')
 
     sc_dist: dict = {}
     for h in alive:
@@ -623,10 +657,11 @@ def _section_alive(alive):
             grp = sc[0] + "xx"
             sc_dist[grp] = sc_dist.get(grp, 0) + 1
 
-    sc_colors = {"2xx": "#34c759", "3xx": "#74c0fc", "4xx": "#ffd43b", "5xx": "#ff453a"}
+    sc_colors = {"2xx": "#4ade80", "3xx": "#60a5fa", "4xx": "#facc15", "5xx": "#f87171"}
     sc_pills = " ".join(
-        f'<span style="background:{sc_colors.get(g,"#6e8098")}22;color:{sc_colors.get(g,"#6e8098")};'
-        f'padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;font-family:var(--mono)">'
+        f'<span style="background:{sc_colors.get(g,"#6b7280")}18;color:{sc_colors.get(g,"#6b7280")};'
+        f'padding:4px 12px;border-radius:6px;font-size:12px;font-weight:600;font-family:var(--mono);'
+        f'border:1px solid {sc_colors.get(g,"#6b7280")}30">'
         f'{_e(g)}: {c}</span>'
         for g, c in sorted(sc_dist.items())
     )
@@ -640,10 +675,11 @@ def _section_alive(alive):
     ]
     safe = _safe_json(rows)
     return f'''<div id="s-alive" class="section">
-  <div class="sec-hdr"><h2>💻 Alive Hosts</h2>
+  <div class="sec-hdr"><div class="sec-hdr-inner"><div>
+    <h2>Alive Hosts</h2>
     <p class="sec-sub">{len(alive):,} responsive hosts</p>
-  </div>
-  <div style="margin-bottom:12px">{sc_pills}</div>
+  </div></div></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">{sc_pills}</div>
   <div class="vt-wrap">
     <div class="vs-toolbar">
       <span class="vs-counter" id="alive-cnt"></span>
@@ -679,14 +715,16 @@ def _section_urls(urls):
                  for tid, label, data in tool_tabs if data]
     body = _tabs(tab_items, "url") if tab_items else _empty()
     return (f'<div id="s-urls" class="section">'
-            f'<div class="sec-hdr"><h2>🔗 URL Discovery</h2>'
-            f'<p class="sec-sub">{len(all_u):,} unique URLs</p></div>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>URL Discovery</h2>'
+            f'<p class="sec-sub">{len(all_u):,} unique URLs collected</p>'
+            f'</div></div></div>'
             f'{body}</div>')
 
 def _section_categorised(urls):
     cats = [
         ("reflection", "🪞 Reflection", "red",    "XSS candidates — high-signal params"),
-        ("params",     "🧩 Params",     "orange", "All URLs with query strings"),
+        ("params",     "⚙️ Params",     "orange", "All URLs with query strings"),
         ("sensitive",  "⚠️ Sensitive",  "red",    ".env · .git · backups · credentials"),
         ("admin",      "🔑 Admin",      "red",    "Admin/dashboard/management panels"),
         ("login",      "🚪 Login",      "yellow", "Authentication & SSO endpoints"),
@@ -704,7 +742,7 @@ def _section_categorised(urls):
         tab_items.append((key, f"{label} {badge}", content))
     body = _tabs(tab_items, "cat") if tab_items else _empty()
     return (f'<div id="s-categorised" class="section">'
-            f'<div class="sec-hdr"><h2>📂 Categorised URLs</h2></div>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>Categorised URLs</h2></div></div></div>'
             f'{body}</div>')
 
 def _section_params(urls):
@@ -724,20 +762,20 @@ def _section_params(urls):
          for k, v in params_map.items()],
         key=lambda r: -int(r[1])
     )
-    note = '<p style="color:#868e96;font-size:12px;margin-bottom:16px">🔴 High = common XSS/injection target · 🟡 Medium = filter/search params · ⚪ Low = general params</p>'
+    note = '<p style="color:var(--muted);font-size:12px;margin-bottom:16px;padding:8px 12px;background:var(--surface2);border-radius:6px;border-left:3px solid var(--border)">🔴 High = common XSS/injection target &nbsp;·&nbsp; 🟡 Medium = filter/search params &nbsp;·&nbsp; ⚪ Low = general params</p>'
     return (f'<div id="s-params" class="section">'
-            f'<div class="sec-hdr"><h2>🧩 Parameters</h2>'
-            f'<p class="sec-sub">{len(params_map):,} unique params across {len(urls.get("params",[])):,} URLs</p></div>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>Parameters</h2>'
+            f'<p class="sec-sub">{len(params_map):,} unique params across {len(urls.get("params",[])):,} URLs</p>'
+            f'</div></div></div>'
             f'{note}'
             f'{_vtable(["Parameter", "Occurrences", "XSS Risk", "Example URL"], rows, "vt-params")}'
             f'</div>')
 
-# ── Nuclei section — INFO varsayılan gizli ────────────────────────────────────
 def _section_nuclei(nuclei):
     all_r  = nuclei["all"]
     by_sev = nuclei["by_severity"]
 
-    # "All" tab: sadece critical/high/medium/low göster, info hariç
     important_sevs = ["critical", "high", "medium", "low"]
     all_important  = [r for r in all_r if r.get("severity","info") in important_sevs]
 
@@ -751,14 +789,14 @@ def _section_nuclei(nuclei):
                     if cve:
                         cve_html += (f'<a href="https://nvd.nist.gov/vuln/detail/{_e(cve)}" '
                                      f'target="_blank" rel="noopener" '
-                                     f'style="color:#ff6b6b;font-family:var(--mono);font-size:10px;margin-right:4px">'
+                                     f'style="color:#f87171;font-family:var(--mono);font-size:10px;margin-right:4px">'
                                      f'{_e(cve)}</a>')
             cvss = r.get("cvss", "")
-            cvss_badge = (f'<span style="color:#ffa94d;font-family:var(--mono);font-size:10px">'
-                          f'{_e(cvss)}</span>') if cvss else ""
+            cvss_badge = (f'<span style="color:#fb923c;font-family:var(--mono);font-size:10px">'
+                          f'CVSS {_e(cvss)}</span>') if cvss else ""
             name_cell = _e(r.get("name","")[:80] or r.get("raw","")[:80])
             if cve_html or cvss_badge:
-                name_cell += f'<br><small>{cve_html}{cvss_badge}</small>'
+                name_cell += f'<br><small style="opacity:.7">{cve_html}{cvss_badge}</small>'
             out.append([
                 r.get("severity","info").upper(),
                 name_cell,
@@ -768,12 +806,10 @@ def _section_nuclei(nuclei):
             ])
         return out
 
-    # Tab listesi: All (info hariç), sonra severity'ler, INFO en sona ve kapalı
     tab_items = []
 
-    # All tab — info hariç
     all_label = f"All ({len(all_important)})" + (
-        f' <span style="color:#3a4d60;font-size:10px">+{len(by_sev.get("info",[]))} info hidden</span>'
+        f' <span style="color:var(--muted);font-size:10px">+{len(by_sev.get("info",[]))} info hidden</span>'
         if by_sev.get("info") else ""
     )
     tab_items.append(("all", all_label, _vtable(
@@ -781,7 +817,6 @@ def _section_nuclei(nuclei):
         _rows(all_important), "vt-nuc-all"
     )))
 
-    # critical / high / medium / low — normal tab
     for sev, col in [("critical","red"),("high","orange"),("medium","yellow"),("low","blue")]:
         lst = by_sev.get(sev, [])
         if not lst:
@@ -796,7 +831,6 @@ def _section_nuclei(nuclei):
                                    for r in lst],
                                   f"vt-nuc-{sev}")))
 
-    # INFO — ayrı collapsible bölüm olarak (tab değil), tab sonuna ekliyoruz
     info_lst = by_sev.get("info", [])
     info_section = ""
     if info_lst:
@@ -811,10 +845,10 @@ def _section_nuclei(nuclei):
         )
         info_section = (
             f'<details style="margin-top:20px">'
-            f'<summary style="cursor:pointer;padding:10px 14px;background:var(--s2);'
-            f'border:1px solid var(--bd);border-radius:8px;font-size:12px;'
-            f'color:#3a4d60;user-select:none;list-style:none">'
-            f'▶ INFO findings — {len(info_lst):,} items (click to expand · genellikle gürültü)</summary>'
+            f'<summary style="cursor:pointer;padding:10px 14px;background:var(--surface2);'
+            f'border:1px solid var(--border);border-radius:8px;font-size:12px;'
+            f'color:var(--muted);user-select:none;list-style:none;display:flex;align-items:center;gap:8px">'
+            f'<span>▶</span> <span>INFO findings — {len(info_lst):,} items (usually noise)</span></summary>'
             f'<div style="margin-top:8px">{info_table}</div>'
             f'</details>'
         )
@@ -827,13 +861,14 @@ def _section_nuclei(nuclei):
     body = _tabs(tab_items, "nuc") if tab_items else _empty("No significant findings")
 
     return (f'<div id="s-nuclei" class="section">'
-            f'<div class="sec-hdr"><h2>🎯 Nuclei Findings</h2>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>Nuclei Findings</h2>'
             f'<p class="sec-sub">{len(all_important):,} significant findings'
-            f'{f" · {len(info_lst)} info (hidden)" if info_lst else ""}</p></div>'
+            f'{f" · {len(info_lst)} info (hidden)" if info_lst else ""}</p>'
+            f'</div></div></div>'
             f'{alert}{body}{info_section}</div>')
 
 
-# ── XSS section — PoC URL'leri doğrudan tıklanabilir ─────────────────────────
 def _section_xss(xss):
     all_x    = xss["all"]
     pocs     = xss["pocs"]
@@ -855,7 +890,6 @@ def _section_xss(xss):
             prefix_m = re.match(r'^(\[.*?\]\s*)+', raw_line)
             prefix   = prefix_m.group(0).strip() if prefix_m else ""
 
-            # javascript: / data: → sadece kopyalanabilir metin, tıklanamaz
             href = _safe_href(url)
 
             if href:
@@ -864,16 +898,15 @@ def _section_xss(xss):
                     f'{_e(url)}</a>'
                 )
             else:
-                # javascript: veya data: payload — kopyalanabilir metin, tıklanamaz
                 url_cell = (
                     f'<code class="poc-link" style="cursor:text;color:#f87171" '
                     f'title="javascript:/data: — cannot be opened as link, select to copy">'
                     f'{_e(url)}</code>'
-                    f'<span style="font-size:10px;color:#506070;margin-left:6px">[copy manually]</span>'
+                    f'<span style="font-size:10px;color:var(--muted);margin-left:6px">[copy manually]</span>'
                 )
 
             rows_html += f'''<tr class="poc-tr">
-  <td style="width:28px;text-align:center;color:#ff6b6b;font-size:13px">🔥</td>
+  <td style="width:28px;text-align:center;color:#f87171;font-size:14px">🔥</td>
   <td>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       {url_cell}
@@ -886,8 +919,8 @@ def _section_xss(xss):
 </tr>'''
 
         poc_html = f'''<div style="margin-bottom:12px">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap">
-    <span style="color:#ff6b6b;font-weight:700;font-size:13px">🔥 {len(poc_urls)} confirmed PoC URLs</span>
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+    <span style="color:#f87171;font-weight:700;font-size:13px">🔥 {len(poc_urls)} confirmed PoC URLs</span>
     <button class="btn-sm" onclick="copyAllPocUrls()">Copy all URLs</button>
     <button class="btn-sm" onclick="exportPocUrls()">Export .txt</button>
   </div>
@@ -922,8 +955,10 @@ function exportPocUrls() {{
     ]
     body = _tabs(tab_items, "xss")
     return (f'<div id="s-xss" class="section">'
-            f'<div class="sec-hdr"><h2>💉 XSS Testing (Dalfox)</h2>'
-            f'<p class="sec-sub">{total} findings · {len(poc_urls)} confirmed PoC URLs</p></div>'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>XSS Testing (Dalfox)</h2>'
+            f'<p class="sec-sub">{total} findings · {len(poc_urls)} confirmed PoC URLs</p>'
+            f'</div></div></div>'
             f'{alert}{body}</div>')
 
 
@@ -1042,19 +1077,19 @@ def _section_threatmap(target: str, subs: dict, alive: list, nuclei: dict, xss: 
                               "total_subs": len(all_subs), "rendered": len(nodes)})
 
     return f'''<div id="s-threatmap" class="section">
-  <div class="sec-hdr">
-    <h2>🗺️ Threat Map</h2>
-    <p class="sec-sub">{len(all_subs):,} subdomains · {len(alive_set):,} alive · {len(nodes):,} nodes · drag · scroll zoom</p>
-  </div>
+  <div class="sec-hdr"><div class="sec-hdr-inner"><div>
+    <h2>Threat Map</h2>
+    <p class="sec-sub">{len(all_subs):,} subdomains · {len(alive_set):,} alive · {len(nodes):,} nodes rendered · drag &amp; scroll to zoom</p>
+  </div></div></div>
   <div class="tm-legend">
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#4fa8e8"></span>Root</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#2d4a62;border:1px dashed #4fa8e8"></span>Group</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#7c7c7c"></span>Collapsed (+N)</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#34c759"></span>Alive</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#6e8098"></span>Dead</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#ff453a"></span>Crit/High Vuln</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#ffa94d"></span>Medium Vuln</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#ff6b6b;border:2px solid #fff"></span>XSS</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#3b82f6"></span>Root</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#1e3a50;border:1px dashed #3b82f6"></span>Group</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#374151"></span>Collapsed</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#22c55e"></span>Alive</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#475569"></span>Dead</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#ef4444"></span>Crit/High</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#f97316"></span>Medium</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#ef4444;border:2px solid #fff3"></span>XSS</span>
   </div>
   <div class="tm-toolbar">
     <button class="btn-sm" onclick="tmResetZoom()">⊙ Reset</button>
@@ -1063,7 +1098,7 @@ def _section_threatmap(target: str, subs: dict, alive: list, nuclei: dict, xss: 
     <button class="btn-sm" onclick="tmFilterVuln()">🔴 Vuln only</button>
     <button class="btn-sm" onclick="tmFilterAll()">🌐 All</button>
     <input id="tm-search" class="vs-search" style="max-width:200px" placeholder="Search node..." oninput="tmSearch()">
-    <span id="tm-info" style="font-size:12px;color:var(--mu);margin-left:auto"></span>
+    <span id="tm-info" style="font-size:12px;color:var(--muted);margin-left:auto"></span>
   </div>
   <div class="tm-wrap">
     <svg id="tm-svg"></svg>
@@ -1084,177 +1119,629 @@ def _section_threatmap(target: str, subs: dict, alive: list, nuclei: dict, xss: 
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
 _CSS = """
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Outfit:wght@300;400;500;700;800&display=swap');
-:root{
-  --bg:#080c10;--s1:#0d1117;--s2:#111820;--s3:#161d27;
-  --bd:#1e2a36;--bd2:#243040;
-  --tx:#cdd9e5;--mu:#6e8098;
-  --ac:#4fa8e8;--green:#34c759;--red:#ff453a;
-  --orange:#ff9f0a;--yellow:#f5a623;--purple:#bf5af2;
-  --mono:'JetBrains Mono',monospace;
-  --sans:'Outfit',sans-serif;
-  --sw:252px;--rh:34px;
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap');
+
+:root {
+  --bg:       #0a0d12;
+  --surface1: #0f1318;
+  --surface2: #141920;
+  --surface3: #1a2030;
+  --border:   #1e2838;
+  --border2:  #243044;
+  --text:     #d4dde8;
+  --text-dim: #8fa3b8;
+  --muted:    #4a6070;
+  --accent:   #3b82f6;
+  --accent2:  #60a5fa;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --orange:   #f97316;
+  --yellow:   #eab308;
+  --purple:   #a855f7;
+  --mono: 'IBM Plex Mono', monospace;
+  --sans: 'Inter', sans-serif;
+  --display: 'Syne', sans-serif;
+  --sw: 240px;
+  --rh: 34px;
+  --radius: 10px;
 }
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:14px;
-     display:flex;min-height:100vh;line-height:1.5}
-.sidebar{width:var(--sw);min-width:var(--sw);background:var(--s1);
-         border-right:1px solid var(--bd);position:fixed;top:0;left:0;
-         height:100vh;overflow-y:auto;z-index:100;display:flex;flex-direction:column}
-.sidebar::-webkit-scrollbar{width:3px}
-.sidebar::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:2px}
-.sb-brand{padding:20px 18px 16px;border-bottom:1px solid var(--bd);
-          background:linear-gradient(135deg,#0d1117 60%,#0d1f2d)}
-.sb-brand h1{font-size:15px;font-weight:800;color:var(--ac);letter-spacing:-.3px}
-.sb-target{font-family:var(--mono);font-size:11px;color:var(--mu);
-           margin-top:6px;word-break:break-all;line-height:1.4}
-.sb-ts{font-size:10px;color:#404d5c;margin-top:3px}
-.nav-grp{padding:10px 0 4px}
-.nav-lbl{color:#3a4d60;font-size:10px;font-weight:700;text-transform:uppercase;
-         letter-spacing:1.2px;padding:4px 18px 6px}
-.nav-a{display:flex;align-items:center;gap:9px;padding:9px 18px;color:var(--mu);
-       cursor:pointer;font-size:13px;border-left:2px solid transparent;
-       transition:all .12s;text-decoration:none}
-.nav-a:hover{color:var(--tx);background:rgba(79,168,232,.05)}
-.nav-a.active{color:var(--ac);background:rgba(79,168,232,.08);
-              border-left-color:var(--ac);font-weight:500}
-.nav-ico{font-size:15px;width:18px;text-align:center;flex-shrink:0}
-.nav-cnt{margin-left:auto;background:var(--s2);color:#506070;font-size:10px;
-         padding:1px 7px;border-radius:20px;font-family:var(--mono)}
-.nav-hr{border:none;border-top:1px solid var(--bd);margin:6px 0}
-.main{margin-left:var(--sw);flex:1;padding:28px 36px 60px;max-width:1500px}
-.section{display:none}.section.active{display:block}
-.sec-hdr{margin-bottom:22px}
-.sec-hdr h2{font-size:21px;font-weight:800;color:var(--ac);letter-spacing:-.4px}
-.sec-sub{color:var(--mu);font-size:12px;margin-top:4px}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:10px;margin-top:10px}
-.stat-card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;
-           padding:16px 10px;text-align:center;transition:transform .15s,border-color .15s;cursor:default}
-.stat-card:hover{transform:translateY(-3px);border-color:var(--bd2)}
-.stat-icon{font-size:22px;margin-bottom:6px}
-.stat-val{font-size:24px;font-weight:800;line-height:1;font-family:var(--mono)}
-.stat-lbl{font-size:10px;color:var(--mu);margin-top:4px;text-transform:uppercase;letter-spacing:.8px}
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.panel{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:18px 20px}
-.panel h3{font-size:12px;font-weight:700;color:var(--mu);text-transform:uppercase;
-          letter-spacing:.8px;margin-bottom:14px}
-.mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
-.mini-num{background:var(--s2);border:1px solid var(--bd);border-radius:8px;
-          padding:10px 14px;display:flex;flex-direction:column;align-items:center;gap:2px;
-          font-size:20px;font-weight:800;font-family:var(--mono)}
-.mini-num span{font-size:10px;color:var(--mu);font-weight:400;font-family:var(--sans)}
-.timeline{display:flex;gap:0;overflow-x:auto;padding-bottom:2px}
-.tl-step{display:flex;flex-direction:column;align-items:center;min-width:70px;position:relative;flex:1}
-.tl-step:not(:last-child)::after{content:'';position:absolute;top:20px;left:56%;width:88%;height:2px;background:var(--bd2)}
-.tl-step.tl-done:not(:last-child)::after{background:var(--green)}
-.tl-dot{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;
-        justify-content:center;font-size:18px;background:var(--s2);border:2px solid var(--bd2);position:relative;z-index:1}
-.tl-step.tl-done .tl-dot{background:rgba(52,199,89,.15);border-color:var(--green)}
-.tl-step.tl-skip .tl-dot{opacity:.35;filter:grayscale(1)}
-.tl-lbl{font-size:10px;color:var(--mu);margin-top:6px;text-align:center}
-.tl-step.tl-done .tl-lbl{color:var(--tx)}
-.sev-bar{display:flex;gap:1px;height:8px;border-radius:8px;overflow:hidden;background:var(--s2);margin-bottom:12px}
-.sev-legend{display:flex;gap:14px;flex-wrap:wrap}
-.sev-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mu)}
-.tab-row{display:flex;gap:2px;border-bottom:1px solid var(--bd);margin-bottom:16px;flex-wrap:wrap}
-.tab{background:none;border:none;color:var(--mu);padding:9px 14px;cursor:pointer;
-     font-size:12px;font-family:var(--sans);font-weight:500;
-     border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;white-space:nowrap}
-.tab:hover{color:var(--tx)}.tab.active{color:var(--ac);border-bottom-color:var(--ac)}
-.panes .pane{display:none}.panes .pane.active{display:block}
-.code-block{background:var(--s2);border:1px solid var(--bd);border-radius:8px;
-            padding:16px;font-family:var(--mono);font-size:12px;line-height:1.65;
-            overflow:auto;white-space:pre-wrap;word-break:break-all;max-height:550px;color:#b0bec5}
-.code-block::-webkit-scrollbar{width:6px;height:6px}
-.code-block::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:3px}
-.vs-wrap,.vt-wrap{position:relative}
-.vs-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
-.vs-counter{font-family:var(--mono);font-size:12px;color:var(--mu);white-space:nowrap;min-width:80px}
-.vs-search{background:var(--s2);border:1px solid var(--bd);color:var(--tx);
-           padding:8px 13px;border-radius:8px;font-size:13px;flex:1;min-width:180px;
-           outline:none;font-family:var(--sans);transition:border-color .12s}
-.vs-search:focus{border-color:var(--ac)}
-.btn-sm{background:var(--s2);border:1px solid var(--bd2);color:var(--mu);
-        padding:7px 14px;border-radius:8px;cursor:pointer;font-size:12px;
-        font-family:var(--sans);white-space:nowrap;transition:all .12s}
-.btn-sm:hover{color:var(--ac);border-color:var(--ac)}
-.vs-scroll{height:520px;overflow-y:auto;background:var(--s2);border:1px solid var(--bd);border-radius:8px;position:relative}
-.vs-scroll::-webkit-scrollbar{width:6px}
-.vs-scroll::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:3px}
-.vs-vp{position:relative}
-.vs-row{height:var(--rh);display:flex;align-items:center;padding:0 14px;
-        border-bottom:1px solid rgba(30,42,54,.8);position:absolute;width:100%}
-.vs-row:hover{background:rgba(79,168,232,.05)}
-.vs-row a{font-family:var(--mono);font-size:12px;color:var(--mu);text-decoration:none;
-          white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%}
-.vs-row a:hover{color:var(--ac)}
-.url-host{color:#506070}.url-path{color:var(--tx)}.url-qs{color:var(--orange)}
-.tbl-scroll{overflow-x:auto;border:1px solid var(--bd);border-radius:8px}
-.tbl-scroll::-webkit-scrollbar{height:6px}
-.tbl-scroll::-webkit-scrollbar-thumb{background:var(--bd2)}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:var(--s2);color:var(--mu);padding:10px 14px;text-align:left;
-   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;
-   white-space:nowrap;position:sticky;top:0;z-index:1}
-td{padding:8px 14px;border-bottom:1px solid var(--bd);vertical-align:middle;
-   max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-   font-family:var(--mono);font-size:12px}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(79,168,232,.03)}
-.vt-more{padding:10px 14px;font-size:12px;color:var(--mu);background:var(--s2);
-         border-top:1px solid var(--bd);display:flex;align-items:center;gap:10px}
-.load-btn{background:none;border:1px solid var(--bd2);color:var(--ac);
-          padding:4px 14px;border-radius:20px;cursor:pointer;font-size:12px;
-          font-family:var(--sans);transition:all .12s}
-.load-btn:hover{background:rgba(79,168,232,.1)}
-.alert-box{border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;font-weight:500;border:1px solid}
-.alert-red{background:rgba(255,69,58,.08);border-color:rgba(255,69,58,.25);color:var(--red)}
-.alert-blue{background:rgba(79,168,232,.07);border-color:rgba(79,168,232,.2);color:var(--ac)}
-.cat-desc{color:var(--mu);font-size:12px;margin-bottom:12px;padding:8px 12px;
-          background:var(--s2);border-radius:6px;border-left:3px solid var(--bd2)}
-.empty-state{color:var(--mu);font-style:italic;padding:32px;text-align:center;
-             background:var(--s2);border-radius:8px;border:1px dashed var(--bd)}
-code{font-family:var(--mono);font-size:12px;color:var(--ac)}
-.footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--bd);color:#3a4d60;font-size:11px}
-.probe-card{background:var(--s2);border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-bottom:16px}
-.probe-row{display:flex;padding:9px 14px;border-bottom:1px solid var(--bd);align-items:center;gap:12px}
-.probe-row:last-child{border-bottom:none}
-.probe-row span{color:var(--mu);font-size:12px;width:120px;flex-shrink:0}
-.probe-row b{font-family:var(--mono);font-size:12px;color:var(--tx);font-weight:500}
-/* XSS PoC Table */
-.poc-table-wrap{max-height:600px;overflow-y:auto;border-radius:8px}
-.poc-table-wrap::-webkit-scrollbar{width:6px}
-.poc-table-wrap::-webkit-scrollbar-thumb{background:rgba(255,69,58,.3);border-radius:3px}
-.poc-tr td{white-space:normal;word-break:break-all;max-width:none}
-.poc-link{font-family:var(--mono);font-size:12px;color:#ff9f9f;text-decoration:none;
-          flex:1;min-width:0;word-break:break-all;line-height:1.5;
-          transition:color .12s;padding:2px 0}
-.poc-link:hover{color:#ff6b6b;text-decoration:underline}
-.poc-prefix{font-family:var(--mono);font-size:10px;color:#506070;margin-top:3px;letter-spacing:.3px}
-/* details/summary INFO collapse */
-details summary::-webkit-details-marker{display:none}
-details[open] summary{border-radius:8px 8px 0 0}
-@media(max-width:900px){
-  .sidebar{display:none}.main{margin-left:0;padding:16px}
-  .two-col{grid-template-columns:1fr}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  display: flex;
+  min-height: 100vh;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
 }
-.tm-wrap{position:relative;background:var(--s1);border:1px solid var(--bd);
-         border-radius:12px;overflow:hidden;height:680px;margin-top:12px}
-#tm-svg{width:100%;height:100%;cursor:grab}
-#tm-svg:active{cursor:grabbing}
-.tm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
-.tm-legend{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;
-           padding:10px 14px;background:var(--s2);border-radius:8px;border:1px solid var(--bd)}
-.tm-leg-item{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mu)}
-.tm-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-.tm-tooltip{position:absolute;pointer-events:none;background:rgba(13,17,23,.97);
-            border:1px solid var(--bd2);border-radius:8px;padding:10px 14px;
-            font-size:12px;color:var(--tx);max-width:300px;display:none;
-            z-index:50;box-shadow:0 8px 32px rgba(0,0,0,.6);line-height:1.7}
-.tm-tooltip strong{color:var(--ac);font-family:var(--mono);font-size:11px;
-                   word-break:break-all;display:block;margin-bottom:4px}
-.tm-tt-badge{display:inline-block;padding:1px 8px;border-radius:20px;
-             font-size:10px;font-weight:700;margin:1px 2px}
+
+/* ── Sidebar ── */
+.sidebar {
+  width: var(--sw);
+  min-width: var(--sw);
+  background: var(--surface1);
+  border-right: 1px solid var(--border);
+  position: fixed;
+  top: 0; left: 0;
+  height: 100vh;
+  overflow-y: auto;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar::-webkit-scrollbar { width: 3px; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+.sb-brand {
+  padding: 20px 18px 18px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(160deg, #0f1318 0%, #111827 100%);
+}
+.sb-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.sb-logo-mark {
+  width: 32px; height: 32px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+  box-shadow: 0 0 16px rgba(59,130,246,.3);
+  flex-shrink: 0;
+}
+.sb-brand h1 {
+  font-family: var(--display);
+  font-size: 16px;
+  font-weight: 800;
+  color: #fff;
+  letter-spacing: -.3px;
+}
+.sb-brand h1 span { color: var(--accent2); }
+.sb-target {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 6px 10px;
+  background: var(--surface3);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  word-break: break-all;
+  line-height: 1.5;
+}
+.sb-ts { font-size: 10px; color: var(--muted); margin-top: 6px; }
+
+.nav-grp { padding: 8px 0 4px; }
+.nav-lbl {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  padding: 4px 16px 6px;
+  font-family: var(--display);
+}
+.nav-a {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 16px;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  border-left: 2px solid transparent;
+  transition: all .15s;
+  text-decoration: none;
+  font-weight: 400;
+}
+.nav-a:hover { color: var(--text); background: rgba(59,130,246,.05); }
+.nav-a.active {
+  color: var(--accent2);
+  background: rgba(59,130,246,.08);
+  border-left-color: var(--accent);
+  font-weight: 500;
+}
+.nav-ico { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
+.nav-cnt {
+  margin-left: auto;
+  background: var(--surface3);
+  color: var(--muted);
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 20px;
+  font-family: var(--mono);
+}
+.nav-hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
+.sb-hint {
+  padding: 10px 16px 16px;
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.8;
+}
+.sb-hint kbd {
+  background: var(--surface3);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  border: 1px solid var(--border2);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+/* ── Main ── */
+.main { margin-left: var(--sw); flex: 1; padding: 32px 40px 72px; max-width: 1500px; }
+.section { display: none; }
+.section.active { display: block; }
+
+/* ── Section Header ── */
+.sec-hdr { margin-bottom: 24px; }
+.sec-hdr-inner { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.sec-hdr h2 {
+  font-family: var(--display);
+  font-size: 24px;
+  font-weight: 800;
+  color: #fff;
+  letter-spacing: -.5px;
+}
+.sec-sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.sec-hdr-badge { margin-top: 4px; }
+.target-code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent2);
+  background: rgba(59,130,246,.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* ── Stat Cards ── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.stat-card {
+  background: var(--surface1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 12px;
+  text-align: center;
+  transition: transform .15s, border-color .15s, box-shadow .15s;
+  cursor: default;
+  position: relative;
+  overflow: hidden;
+}
+.stat-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: .5;
+}
+.stat-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--accent);
+  box-shadow: 0 8px 24px rgba(0,0,0,.3);
+}
+.stat-icon { font-size: 22px; margin-bottom: 8px; }
+.stat-val { font-size: 22px; font-weight: 800; line-height: 1; font-family: var(--mono); color: var(--accent); }
+.stat-lbl { font-size: 10px; color: var(--muted); margin-top: 5px; text-transform: uppercase; letter-spacing: .8px; font-weight: 500; }
+
+/* ── Two-col grid ── */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* ── Panel ── */
+.panel {
+  background: var(--surface1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.panel-icon { font-size: 16px; }
+.panel h3 {
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: .6px;
+}
+
+/* ── Mini numbers ── */
+.mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mini-num {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  font-size: 20px; font-weight: 800; font-family: var(--mono);
+  color: var(--nc, var(--accent));
+}
+.mini-num span { font-size: 10px; color: var(--muted); font-weight: 400; font-family: var(--sans); text-transform: uppercase; letter-spacing: .5px; }
+
+/* ── Timeline ── */
+.timeline { display: flex; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+.tl-step { display: flex; flex-direction: column; align-items: center; min-width: 70px; position: relative; flex: 1; }
+.tl-step:not(:last-child)::after { content: ''; position: absolute; top: 20px; left: 56%; width: 88%; height: 2px; background: var(--border2); }
+.tl-step.tl-done:not(:last-child)::after { background: var(--green); }
+.tl-dot {
+  width: 40px; height: 40px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px; background: var(--surface2); border: 2px solid var(--border2);
+  position: relative; z-index: 1;
+}
+.tl-step.tl-done .tl-dot { background: rgba(34,197,94,.12); border-color: var(--green); }
+.tl-step.tl-skip .tl-dot { opacity: .3; filter: grayscale(1); }
+.tl-lbl { font-size: 10px; color: var(--muted); margin-top: 6px; text-align: center; font-weight: 500; }
+.tl-step.tl-done .tl-lbl { color: var(--text-dim); }
+
+/* ── Severity bar ── */
+.sev-bar { display: flex; gap: 2px; height: 8px; border-radius: 8px; overflow: hidden; background: var(--surface3); margin-bottom: 12px; }
+.sev-legend { display: flex; gap: 14px; flex-wrap: wrap; }
+.sev-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+
+/* ── Tabs ── */
+.tab-row {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.tab {
+  background: none; border: none;
+  color: var(--muted);
+  padding: 9px 14px;
+  cursor: pointer; font-size: 12px; font-weight: 500;
+  font-family: var(--sans);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: all .12s;
+  white-space: nowrap;
+  letter-spacing: .2px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent2); border-bottom-color: var(--accent); }
+.panes .pane { display: none; }
+.panes .pane.active { display: block; }
+
+/* ── Code block ── */
+.code-block {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 550px;
+  color: var(--text-dim);
+}
+.code-block::-webkit-scrollbar { width: 6px; height: 6px; }
+.code-block::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+/* ── Virtual scroll ── */
+.vs-wrap, .vt-wrap { position: relative; }
+.vs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.vs-counter {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  min-width: 80px;
+}
+.vs-search {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 13px;
+  border-radius: 8px;
+  font-size: 13px;
+  flex: 1;
+  min-width: 180px;
+  outline: none;
+  font-family: var(--sans);
+  transition: border-color .12s;
+}
+.vs-search::placeholder { color: var(--muted); }
+.vs-search:focus { border-color: var(--accent); background: var(--surface3); }
+.btn-sm {
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  color: var(--text-dim);
+  padding: 7px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--sans);
+  white-space: nowrap;
+  transition: all .12s;
+  font-weight: 500;
+}
+.btn-sm:hover { color: var(--accent2); border-color: var(--accent); background: rgba(59,130,246,.06); }
+
+.vs-scroll {
+  height: 520px;
+  overflow-y: auto;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  position: relative;
+}
+.vs-scroll::-webkit-scrollbar { width: 6px; }
+.vs-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+.vs-vp { position: relative; }
+.vs-row {
+  height: var(--rh);
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  border-bottom: 1px solid rgba(30,40,56,.7);
+  position: absolute;
+  width: 100%;
+}
+.vs-row:hover { background: rgba(59,130,246,.04); }
+.vs-row a {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+.vs-row a:hover { color: var(--accent2); }
+.url-host { color: #475569; }
+.url-path { color: var(--text-dim); }
+.url-qs { color: #fb923c; }
+
+/* ── Table ── */
+.tbl-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.tbl-scroll::-webkit-scrollbar { height: 6px; }
+.tbl-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  background: var(--surface2);
+  color: var(--muted);
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  white-space: nowrap;
+  position: sticky; top: 0; z-index: 1;
+  font-family: var(--display);
+  border-bottom: 1px solid var(--border2);
+}
+td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(59,130,246,.03); color: var(--text); }
+.vt-more {
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface2);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.load-btn {
+  background: none;
+  border: 1px solid var(--border2);
+  color: var(--accent2);
+  padding: 4px 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--sans);
+  transition: all .12s;
+}
+.load-btn:hover { background: rgba(59,130,246,.1); border-color: var(--accent); }
+
+/* ── Alert boxes ── */
+.alert-box {
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.alert-red { background: rgba(239,68,68,.06); border-color: rgba(239,68,68,.25); color: #fca5a5; }
+.alert-blue { background: rgba(59,130,246,.06); border-color: rgba(59,130,246,.2); color: var(--accent2); }
+
+/* ── Info banners ── */
+.info-banner {
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  border: 1px solid;
+}
+.info-red { background: rgba(239,68,68,.06); border-color: rgba(239,68,68,.2); color: #fca5a5; }
+.info-orange { background: rgba(249,115,22,.06); border-color: rgba(249,115,22,.2); color: #fdba74; }
+.info-yellow { background: rgba(234,179,8,.06); border-color: rgba(234,179,8,.2); color: #fde047; }
+
+/* ── Category desc ── */
+.cat-desc {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border-radius: 6px;
+  border-left: 3px solid var(--border2);
+}
+
+/* ── Subsection label ── */
+.subsection-label {
+  font-family: var(--display);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  margin-bottom: 10px;
+}
+
+/* ── Empty state ── */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 40px;
+  background: var(--surface2);
+  border-radius: var(--radius);
+  border: 1px dashed var(--border2);
+}
+.empty-icon { font-size: 20px; opacity: .4; }
+
+/* ── Probe card ── */
+.probe-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.probe-row {
+  display: flex;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+  gap: 14px;
+}
+.probe-row:last-child { border-bottom: none; }
+.probe-row span { color: var(--muted); font-size: 12px; width: 130px; flex-shrink: 0; font-weight: 500; }
+.probe-row b { font-family: var(--mono); font-size: 12px; color: var(--text); font-weight: 500; }
+
+/* ── XSS PoC ── */
+.poc-table-wrap { max-height: 600px; overflow-y: auto; border-radius: var(--radius); }
+.poc-table-wrap::-webkit-scrollbar { width: 6px; }
+.poc-table-wrap::-webkit-scrollbar-thumb { background: rgba(239,68,68,.3); border-radius: 3px; }
+.poc-tr td { white-space: normal; word-break: break-all; max-width: none; }
+.poc-link {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #fca5a5;
+  text-decoration: none;
+  flex: 1; min-width: 0;
+  word-break: break-all;
+  line-height: 1.5;
+  transition: color .12s;
+  padding: 2px 0;
+}
+.poc-link:hover { color: #f87171; text-decoration: underline; }
+.poc-prefix { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+/* ── details/summary ── */
+details summary::-webkit-details-marker { display: none; }
+details summary { transition: background .12s; }
+details[open] summary { border-radius: 8px 8px 0 0; }
+
+/* ── Threat Map ── */
+.tm-wrap {
+  position: relative;
+  background: var(--surface1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  height: 680px;
+  margin-top: 12px;
+}
+#tm-svg { width: 100%; height: 100%; cursor: grab; }
+#tm-svg:active { cursor: grabbing; }
+.tm-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.tm-legend {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  margin-bottom: 12px; padding: 10px 14px;
+  background: var(--surface2); border-radius: 8px; border: 1px solid var(--border);
+}
+.tm-leg-item { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+.tm-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.tm-tooltip {
+  position: absolute; pointer-events: none;
+  background: rgba(10,13,18,.97);
+  border: 1px solid var(--border2);
+  border-radius: 10px; padding: 12px 14px;
+  font-size: 12px; color: var(--text);
+  max-width: 300px; display: none; z-index: 50;
+  box-shadow: 0 12px 40px rgba(0,0,0,.7);
+  line-height: 1.7;
+}
+.tm-tooltip strong {
+  color: var(--accent2); font-family: var(--mono); font-size: 11px;
+  word-break: break-all; display: block; margin-bottom: 5px;
+}
+.tm-tt-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 6px;
+  font-size: 10px; font-weight: 600; margin: 1px 2px;
+}
+
+/* ── Footer ── */
+.footer {
+  margin-top: 56px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+code { font-family: var(--mono); font-size: 12px; color: var(--accent2); }
+
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .main { margin-left: 0; padding: 16px; }
+  .two-col { grid-template-columns: 1fr; }
+}
 """
 
 _JS = r"""
@@ -1398,7 +1885,7 @@ function vtExportCSV(uid) {
   dl([hdr].concat(rows).join('\n'), uid + '.csv', 'text/csv');
 }
 var AP = 150;
-var SC_COL = {'2':'#3fb950','3':'#74c0fc','4':'#e3b341','5':'#f85149'};
+var SC_COL = {'2':'#4ade80','3':'#60a5fa','4':'#facc15','5':'#f87171'};
 function aliveInit() { window._AP = 0; aliveCnt(); aliveRender(); }
 function aliveFilter() {
   var q = document.getElementById('alive-q').value.toLowerCase();
@@ -1413,16 +1900,16 @@ function aliveRender() {
   var slice = data.slice(0, (window._AP + 1) * AP);
   tbody.innerHTML = slice.map(function(r) {
     var url=r[0],sc=r[1],title=r[2],ip=r[3],tech=r[4],sz=r[5],srv=r[6],rt=r[7]||'';
-    var col = SC_COL[String(sc)[0]] || '#6e8098';
+    var col = SC_COL[String(sc)[0]] || '#6b7280';
     return '<tr>'
-      + '<td title="' + esc(url) + '"><a href="' + esc(url) + '" target="_blank" rel="noopener" style="color:#74c0fc;font-family:var(--mono);font-size:11.5px">' + esc(url) + '</a></td>'
-      + '<td><b style="color:' + col + '">' + esc(sc) + '</b></td>'
-      + '<td style="font-family:var(--sans)" title="' + esc(title) + '">' + esc(title) + '</td>'
+      + '<td title="' + esc(url) + '"><a href="' + esc(url) + '" target="_blank" rel="noopener" style="color:#60a5fa;font-family:var(--mono);font-size:11.5px">' + esc(url) + '</a></td>'
+      + '<td><b style="color:' + col + ';font-family:var(--mono)">' + esc(sc) + '</b></td>'
+      + '<td style="font-family:var(--sans);color:var(--text)" title="' + esc(title) + '">' + esc(title) + '</td>'
       + '<td>' + esc(ip) + '</td>'
-      + '<td style="font-size:11px;color:#6e8098" title="' + esc(tech) + '">' + esc(tech) + '</td>'
+      + '<td style="font-size:11px;color:var(--muted)" title="' + esc(tech) + '">' + esc(tech) + '</td>'
       + '<td>' + esc(sz) + '</td>'
-      + '<td style="font-size:11px;color:#6e8098">' + esc(srv) + '</td>'
-      + '<td style="color:var(--mu);font-size:11px">' + esc(rt) + '</td>'
+      + '<td style="font-size:11px;color:var(--muted)">' + esc(srv) + '</td>'
+      + '<td style="color:var(--muted);font-size:11px">' + esc(rt) + '</td>'
       + '</tr>';
   }).join('');
   if (more) {
@@ -1467,9 +1954,10 @@ function toast(msg) {
   var t = document.getElementById('_toast');
   if (!t) {
     t = document.createElement('div'); t.id = '_toast';
-    t.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#1e2a36;color:#cdd9e5;'
-      + 'padding:9px 16px;border-radius:8px;font-size:12px;border:1px solid #243040;z-index:9999;'
-      + 'transition:opacity .3s;font-family:Outfit,sans-serif;pointer-events:none';
+    t.style.cssText = 'position:fixed;bottom:24px;right:24px;background:#1a2338;color:#d4dde8;'
+      + 'padding:10px 18px;border-radius:10px;font-size:12px;border:1px solid #243044;z-index:9999;'
+      + 'transition:opacity .3s;font-family:Inter,sans-serif;pointer-events:none;'
+      + 'box-shadow:0 8px 32px rgba(0,0,0,.5);font-weight:500;letter-spacing:.2px';
     document.body.appendChild(t);
   }
   t.textContent = '\u2713 ' + msg; t.style.opacity = '1';
@@ -1543,11 +2031,11 @@ function renderThreatMap(nodes, links) {
   var zoom = d3.zoom().scaleExtent([0.04, 5]).on('zoom', function(event){ g.attr('transform', event.transform); });
   svg.on('.zoom', null).call(zoom); _TM.zoom = zoom;
   function nodeColor(d) {
-    if (d.type==='root') return '#4fa8e8';
-    if (d.type==='collapsed') return '#4a4a4a';
-    if (d.type==='group') return d.xss ? '#8b1a1a' : ({critical:'#5c1a1a',high:'#5c3a1a',medium:'#4a4a1a',none:'#1e3347'}[d.severity]||'#1e3347');
-    if (d.xss) return '#ff453a';
-    return {critical:'#ff453a',high:'#ff6b35',medium:'#ffa94d',low:'#74c0fc'}[d.severity] || (d.alive?'#34c759':'#3a4d60');
+    if (d.type==='root') return '#3b82f6';
+    if (d.type==='collapsed') return '#374151';
+    if (d.type==='group') return d.xss ? '#7f1d1d' : ({critical:'#4c1d1d',high:'#4a2200',medium:'#3d3000',none:'#1e3347'}[d.severity]||'#1e3347');
+    if (d.xss) return '#ef4444';
+    return {critical:'#ef4444',high:'#f97316',medium:'#eab308',low:'#3b82f6'}[d.severity] || (d.alive?'#22c55e':'#334155');
   }
   function nodeRadius(d) {
     if (d.type==='root') return 22;
@@ -1556,22 +2044,22 @@ function renderThreatMap(nodes, links) {
     return d.alive ? 8 : 5;
   }
   function nodeStroke(d) {
-    return {root:'#74c0fc',group:'#3d6080',collapsed:'#555'}[d.type] || (d.alive?'#27a447':'#2a3d50');
+    return {root:'#60a5fa',group:'#2d5070',collapsed:'#4b5563'}[d.type] || (d.alive?'#16a34a':'#1e293b');
   }
   var nodeById = {};
   nodes.forEach(function(n){ nodeById[n.id] = n; });
   var resolvedLinks = links.filter(function(l){ return nodeById[l.source] && nodeById[l.target]; }).map(function(l){ return {source:l.source,target:l.target,type:l.type}; });
   var defs = svg.append('defs');
-  [['glow-b','#4fa8e8'],['glow-r','#ff453a'],['glow-g','#34c759']].forEach(function(p){
+  [['glow-b','#3b82f6'],['glow-r','#ef4444'],['glow-g','#22c55e']].forEach(function(p){
     var f = defs.append('filter').attr('id',p[0]).attr('x','-30%').attr('y','-30%').attr('width','160%').attr('height','160%');
     f.append('feGaussianBlur').attr('stdDeviation','3').attr('result','blur');
     var m = f.append('feMerge'); m.append('feMergeNode').attr('in','blur'); m.append('feMergeNode').attr('in','SourceGraphic');
   });
   var link = g.append('g').selectAll('line').data(resolvedLinks).join('line')
-    .attr('stroke', function(d){ return d.type==='group'?'#243040':d.type==='collapsed'?'#333':'#1e2a36'; })
+    .attr('stroke', function(d){ return d.type==='group'?'#1e2838':d.type==='collapsed'?'#2a3040':'#151d28'; })
     .attr('stroke-width', function(d){ return d.type==='group'?1.5:1; })
     .attr('stroke-dasharray', function(d){ return d.type==='group'?'6,3':d.type==='collapsed'?'3,3':''; })
-    .attr('opacity', 0.55);
+    .attr('opacity', 0.5);
   var node = g.append('g').selectAll('g').data(nodes).join('g')
     .style('cursor','pointer')
     .call(d3.drag()
@@ -1588,17 +2076,17 @@ function renderThreatMap(nodes, links) {
       return '';
     });
   node.filter(function(d){ return d.type==='group' && d.vuln_count>0; }).append('circle')
-    .attr('r', function(d){ return nodeRadius(d)+4; }).attr('fill','none').attr('stroke','#ff6b6b').attr('stroke-width',1.5).attr('stroke-dasharray','4,2').attr('opacity',0.7);
+    .attr('r', function(d){ return nodeRadius(d)+4; }).attr('fill','none').attr('stroke','#ef4444').attr('stroke-width',1.5).attr('stroke-dasharray','4,2').attr('opacity',0.6);
   node.filter(function(d){ return d.xss&&d.type!=='group'; }).append('circle')
-    .attr('r', function(d){ return nodeRadius(d)+4; }).attr('fill','none').attr('stroke','#ff453a').attr('stroke-width',1).attr('stroke-dasharray','3,2').attr('opacity',0.5);
+    .attr('r', function(d){ return nodeRadius(d)+4; }).attr('fill','none').attr('stroke','#ef4444').attr('stroke-width',1).attr('stroke-dasharray','3,2').attr('opacity',0.5);
   node.filter(function(d){ return (d.type==='group'||d.type==='collapsed')&&(d.count||0)>0; }).append('text')
     .text(function(d){ return d.type==='collapsed'?'+'+d.count:d.count; })
-    .attr('text-anchor','middle').attr('dy','0.35em').attr('fill','#cdd9e5').attr('font-size','9px').attr('font-weight','700').attr('font-family','JetBrains Mono,monospace').style('pointer-events','none');
+    .attr('text-anchor','middle').attr('dy','0.35em').attr('fill','#d4dde8').attr('font-size','9px').attr('font-weight','700').attr('font-family','IBM Plex Mono,monospace').style('pointer-events','none');
   var labels = node.append('text').attr('class','tm-label')
     .attr('dy', function(d){ return nodeRadius(d)+13; }).attr('text-anchor','middle')
-    .attr('fill', function(d){ return {root:'#4fa8e8',group:'#5a7a90',collapsed:'#505050'}[d.type]||(d.alive?'#cdd9e5':'#404d5c'); })
+    .attr('fill', function(d){ return {root:'#60a5fa',group:'#4a7090',collapsed:'#4b5563'}[d.type]||(d.alive?'#d4dde8':'#374151'); })
     .attr('font-size', function(d){ return {root:'12px',group:'10px',collapsed:'9px'}[d.type]||'9px'; })
-    .attr('font-family','JetBrains Mono,monospace').attr('font-weight', function(d){ return d.type==='root'?'700':'400'; })
+    .attr('font-family','IBM Plex Mono,monospace').attr('font-weight', function(d){ return d.type==='root'?'700':'400'; })
     .text(function(d){
       if (d.type==='root'||d.type==='group'||d.type==='collapsed') return d.label;
       var p=d.label.split('.'); return p.length>2?p.slice(0,-2).join('.'):d.label;
@@ -1606,17 +2094,17 @@ function renderThreatMap(nodes, links) {
     .style('display', _TM.showLabels?'':'none').style('pointer-events','none');
   node
     .on('mouseover', function(e,d){
-      var sc={critical:'#ff443a',high:'#ff6b35',medium:'#ffd43b',low:'#74c0fc',info:'#868e96',none:'#868e96'};
+      var sc={critical:'#f87171',high:'#fb923c',medium:'#facc15',low:'#60a5fa',info:'#9ca3af',none:'#9ca3af'};
       var h = '<strong>' + esc(d.label) + '</strong>';
       if (d.type==='group') {
-        h += '<span class="tm-tt-badge" style="background:#1a2d3d;color:#4fa8e8">GROUP \u00b7 '+d.count+' subs</span>';
-        if (d.vuln_count>0) h += '<span class="tm-tt-badge" style="background:#2d0d0d;color:#ff6b6b">'+d.vuln_count+' vuln</span>';
+        h += '<span class="tm-tt-badge" style="background:#0d2237;color:#60a5fa">GROUP · '+d.count+' subs</span>';
+        if (d.vuln_count>0) h += '<span class="tm-tt-badge" style="background:#1f0808;color:#f87171">'+d.vuln_count+' vuln</span>';
       } else if (d.type==='collapsed') {
-        h += '<span class="tm-tt-badge" style="background:#222;color:#6e8098">'+d.count+' hidden</span>';
+        h += '<span class="tm-tt-badge" style="background:#1f2937;color:#6b7280">'+d.count+' hidden</span>';
       } else if (d.type!=='root') {
-        h += '<span class="tm-tt-badge" style="background:'+(d.alive?'#0d2414':'#1a1f26')+';color:'+(d.alive?'#34c759':'#6e8098')+'">'+(d.alive?'\u2713 ALIVE':'\u2717 DEAD')+'</span>';
-        if (d.severity&&d.severity!=='none'&&d.severity!=='info') h+='<span class="tm-tt-badge" style="background:#2d0d0d;color:'+sc[d.severity]+'">'+esc(d.severity.toUpperCase())+' \u00b7 '+d.vuln_count+' finding'+(d.vuln_count>1?'s':'')+'</span>';
-        if (d.xss) h+='<span class="tm-tt-badge" style="background:#2d0d0d;color:#ff453a">\u26a0 XSS</span>';
+        h += '<span class="tm-tt-badge" style="background:'+(d.alive?'#052e14':'#111827')+';color:'+(d.alive?'#22c55e':'#6b7280')+'">'+(d.alive?'✓ ALIVE':'✗ DEAD')+'</span>';
+        if (d.severity&&d.severity!=='none'&&d.severity!=='info') h+='<span class="tm-tt-badge" style="background:#1f0808;color:'+sc[d.severity]+'">'+esc(d.severity.toUpperCase())+' · '+d.vuln_count+' finding'+(d.vuln_count>1?'s':'')+'</span>';
+        if (d.xss) h+='<span class="tm-tt-badge" style="background:#1f0808;color:#f87171">⚠ XSS</span>';
       }
       if (tooltip){ tooltip.innerHTML=h; tooltip.style.display='block'; }
     })
@@ -1629,7 +2117,7 @@ function renderThreatMap(nodes, links) {
     })
     .on('mouseout', function(){ if(tooltip) tooltip.style.display='none'; });
   var infoEl = document.getElementById('tm-info');
-  if (infoEl) infoEl.textContent = nodes.length + ' nodes \u00b7 ' + resolvedLinks.length + ' edges';
+  if (infoEl) infoEl.textContent = nodes.length + ' nodes · ' + resolvedLinks.length + ' edges';
   var nodeCount = nodes.length;
   var alphaDecay = nodeCount > 500 ? 0.06 : nodeCount > 200 ? 0.035 : 0.02;
   var chargeStr  = function(d){ return d.type==='root'?-800:d.type==='group'?-200:-60; };
@@ -1657,8 +2145,8 @@ function tmSearch() {
   _TM.g.selectAll('g').each(function(d){
     if (!d) return;
     var match = d.label && d.label.toLowerCase().indexOf(q)>=0;
-    d3.select(this).selectAll('circle').attr('opacity',match?1:0.08);
-    d3.select(this).selectAll('text').attr('opacity',match?1:0.06);
+    d3.select(this).selectAll('circle').attr('opacity',match?1:0.06);
+    d3.select(this).selectAll('text').attr('opacity',match?1:0.05);
   });
 }
 """
@@ -1685,9 +2173,12 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
                 f'<span class="nav-ico">{icon}</span>{_e(label)}{cnt}</a>')
 
     sidebar = f'''<div class="sb-brand">
-  <h1>&#9889; ReconX</h1>
-  <div class="sb-target">&#127919; {_e(target)}</div>
-  <div class="sb-ts">&#128197; {_e(ts)}</div>
+  <div class="sb-logo">
+    <div class="sb-logo-mark">⚡</div>
+    <h1>Recon<span>X</span></h1>
+  </div>
+  <div class="sb-target">{_e(target)}</div>
+  <div class="sb-ts">📅 {_e(ts)}</div>
 </div>
 <div class="nav-grp"><div class="nav-lbl">Overview</div>
   {_nav("🏠","Dashboard","overview")}
@@ -1700,7 +2191,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 </div>
 <div class="nav-grp"><div class="nav-lbl">Discovery</div>
   {_nav("🔗","All URLs","urls", len(urls.get("_all",[])))}
-  {_nav("🧩","Parameters","params")}
+  {_nav("⚙️","Parameters","params")}
   {_nav("📂","Categorised","categorised")}
 </div>
 <div class="nav-grp"><div class="nav-lbl">Vulnerabilities</div>
@@ -1708,10 +2199,9 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
   {_nav("🎯","Nuclei","nuclei", len(nuclei["all"]))}
 </div>
 <hr class="nav-hr">
-<div style="padding:8px 16px 16px;font-size:10px;color:#2d3f50;line-height:2">
-  <kbd style="background:#1e2a36;padding:1px 5px;border-radius:3px;color:#6e8098">/</kbd> to search<br>
-  Virtual scroll · No truncation<br>
-  v6.6
+<div class="sb-hint">
+  <kbd>/</kbd> to search &nbsp;·&nbsp; Virtual scroll<br>
+  No truncation &nbsp;·&nbsp; v6.7
 </div>'''
 
     sections = "".join([
@@ -1740,7 +2230,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 <main class="main">
 {sections}
 <div class="footer">
-  ReconX v6.6 &middot; {_e(target)} &middot; {_e(ts)}<br>
+  ReconX v6.7 &nbsp;&middot;&nbsp; {_e(target)} &nbsp;&middot;&nbsp; {_e(ts)}<br>
   Use only on authorized targets under a valid bug bounty program.
 </div>
 </main>
