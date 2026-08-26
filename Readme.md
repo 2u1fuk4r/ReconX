@@ -274,7 +274,7 @@ MIT License
 # 👤 Author
 
 Zulfukar Karabulut  
-Security Researcher | Pentester | eWPTX & eCPPT
+Security Researcher | Pentester | eWPTX & eCPPT & eCIR
 
 Linkedin : https://linkedin.com/in/2u1fuk4r
 
