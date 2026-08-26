@@ -285,6 +285,7 @@ T = {
     "gau": 3600, "waybackurls": 3600, "katana": 3600, "hakrawler": 1800,
     "nuclei": 14400,   # v6.5: 4 saat (daha fazla template)
     "dalfox": 7200,    # v6.5: 2 saat
+    "login": 60,
 }
 
 # ── URL Patterns ──────────────────────────────────────────────────────────────
@@ -918,9 +919,294 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AUTH / LOGIN — authenticated session support
+# ══════════════════════════════════════════════════════════════════════════════
+_CSRF_PATTERNS = [
+    re.compile(r'name=["\']csrf[_-]?token["\']\s+[^>]*?value=["\']([^"\']+)["\']', re.I),
+    re.compile(r'name=["\']_token["\']\s+[^>]*?value=["\']([^"\']+)["\']', re.I),
+    re.compile(r'name=["\']authenticity_token["\']\s+[^>]*?value=["\']([^"\']+)["\']', re.I),
+    re.compile(r'name=["\']__RequestVerificationToken["\']\s+[^>]*?value=["\']([^"\']+)["\']', re.I),
+    re.compile(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', re.I),
+]
+
+def _extract_csrf_token(html_body: str) -> str:
+    for pat in _CSRF_PATTERNS:
+        m = pat.search(html_body or "")
+        if m:
+            return m.group(1)
+    return ""
+
+def perform_login(login_url: str, username: str, password: str, cfg: dict,
+                   user_field: str = "username", pass_field: str = "password",
+                   extra_fields: dict = None, method: str = "POST",
+                   success_indicator: str = "", failure_indicator: str = "",
+                   csrf_field: str = "", timeout: int = 30, log=None) -> dict:
+    """
+    Belirlenen login sayfasina verilen kullanici adi/sifre ile oturum acar.
+    - Once login sayfasini GET eder (CSRF token varsa yakalar)
+    - Sonra kimlik bilgilerini POST/GET ile gonderir
+    - Elde edilen session cookie'lerini dondurur
+
+    NOT: Bu fonksiyon yalnizca elinde gecerli/yetkilendirilmis kimlik bilgisi
+    olan kullanici icin tasarlanmistir (yetkili pentest / kendi hesabin).
+    Kaba kuvvet, kimlik bilgisi tahmini veya kimlik dogrulama bypass
+    denemesi YAPMAZ — sadece verilen tek bir kullanici/sifre ciftiyle
+    normal bir form-login akisini otomatiklestirir.
+    """
+    client, is_cffi = _get_http_client(cfg)
+    result = {
+        "ok": False, "status": 0, "cookies": {}, "cookie_header": "",
+        "final_url": "", "error": "", "csrf_used": False,
+    }
+    if client is None:
+        result["error"] = "no_http_client"
+        return result
+
+    settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
+    impersonate = settings.get("curl_cffi_impersonate", "chrome110")
+    proxy = (settings.get("proxy") or "").strip()
+    host = _extract_domain_from_any(login_url) or ""
+    headers = pick_header_strategy(host, cfg)
+
+    try:
+        session = client.Session()
+    except Exception as e:
+        result["error"] = f"session_init_failed: {e}"
+        return result
+
+    kw_common = {}
+    if proxy:
+        kw_common["proxies"] = {"http": proxy, "https": proxy}
+    if is_cffi:
+        kw_common["impersonate"] = impersonate
+
+    # 1) GET login page — CSRF token yakala
+    csrf_val = ""
+    try:
+        r_get = session.get(login_url, headers=headers, timeout=timeout,
+                             allow_redirects=True, **kw_common)
+        body = getattr(r_get, "text", "") or ""
+        csrf_val = _extract_csrf_token(body)
+        if log:
+            log.info(f"[LOGIN] GET {login_url} -> {getattr(r_get, 'status_code', '?')} "
+                     f"csrf_found={bool(csrf_val)}")
+    except Exception as e:
+        if log:
+            log.warning(f"[LOGIN] GET login page failed: {e}")
+
+    # 2) Form verisini hazirla
+    form = {user_field: username, pass_field: password}
+    if extra_fields:
+        form.update(extra_fields)
+    if csrf_val:
+        field_name = csrf_field or "csrf_token"
+        form[field_name] = csrf_val
+        result["csrf_used"] = True
+
+    post_headers = dict(headers)
+    post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    post_headers["Referer"] = login_url
+    post_headers["Origin"] = f"{urlparse(login_url).scheme}://{urlparse(login_url).netloc}"
+
+    try:
+        if method.upper() == "GET":
+            r = session.get(login_url, params=form, headers=post_headers,
+                             timeout=timeout, allow_redirects=True, **kw_common)
+        else:
+            r = session.post(login_url, data=form, headers=post_headers,
+                              timeout=timeout, allow_redirects=True, **kw_common)
+        status = int(getattr(r, "status_code", 0) or 0)
+        body = getattr(r, "text", "") or ""
+        final_url = str(getattr(r, "url", login_url))
+
+        # Cookie jar'i dict'e cevir
+        cookies = {}
+        try:
+            jar = getattr(session, "cookies", None)
+            if jar is not None:
+                items = jar.items() if hasattr(jar, "items") else []
+                for k, v in items:
+                    cookies[k] = v
+        except Exception:
+            pass
+
+        cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+
+        # Basari/basarisizlik tespiti
+        success = status in (200, 301, 302, 303) and bool(cookies)
+        if success_indicator:
+            success = success and (success_indicator.lower() in body.lower()
+                                    or success_indicator.lower() in final_url.lower())
+        if failure_indicator and (failure_indicator.lower() in body.lower()):
+            success = False
+
+        result.update({
+            "ok": success,
+            "status": status,
+            "cookies": cookies,
+            "cookie_header": cookie_header,
+            "final_url": final_url,
+            "session": session,
+        })
+        if log:
+            log.info(f"[LOGIN] {method.upper()} {login_url} -> {status} "
+                     f"cookies={list(cookies.keys())} success={success}")
+    except Exception as e:
+        result["error"] = str(e)
+        if log:
+            log.warning(f"[LOGIN] request failed: {e}")
+
+    return result
+
+
+def parse_request_file(path: str, default_scheme: str = "https") -> dict:
+    """Parse a captured raw HTTP request (Burp/ZAP/sqlmap-style -r format)."""
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"request file not found: {p}")
+
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    head, _, body = raw.partition("\n\n")
+    lines = head.splitlines()
+    if not lines:
+        raise ValueError("empty request file")
+
+    request_line = lines[0].strip()
+    m = re.match(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)(?:\s+HTTP/\d(?:\.\d)?)?$",
+                 request_line, re.I)
+    if not m:
+        raise ValueError(f"invalid HTTP request line: {request_line}")
+
+    method = m.group(1).upper()
+    path_part = m.group(2)
+    headers = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        headers[k.strip()] = v.strip()
+
+    host = headers.get("Host") or headers.get("host") or ""
+    if not host:
+        raise ValueError("request file must contain a Host header")
+
+    if path_part.startswith(("http://", "https://")):
+        url = path_part
+    else:
+        url = f"{default_scheme}://{host}{path_part if path_part.startswith('/') else '/' + path_part}"
+
+    # Let the HTTP client generate transport-specific headers.
+    headers = {
+        k: v for k, v in headers.items()
+        if k.lower() not in {"content-length", "host", "connection"}
+    }
+
+    return {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body,
+        "host": host,
+        "request_line": request_line,
+    }
+
+
+def perform_request_login(request_file: str, cfg: dict, timeout: int = 60, log=None) -> dict:
+    """Replay one explicitly supplied login request and capture its session cookie.
+
+    No brute force, credential guessing, auth bypass, or request fuzzing is done.
+    """
+    client, is_cffi = _get_http_client(cfg)
+    result = {
+        "ok": False, "status": 0, "cookies": {}, "cookie_header": "",
+        "final_url": "", "error": "", "request_url": "", "method": "",
+    }
+    if client is None:
+        result["error"] = "no_http_client"
+        return result
+
+    settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
+    impersonate = settings.get("curl_cffi_impersonate", "chrome110")
+    proxy = (settings.get("proxy") or "").strip()
+
+    try:
+        req = parse_request_file(
+            request_file,
+            default_scheme=(_cfg_get(cfg, "settings", "default_scheme", default="https") or "https")
+        )
+    except Exception as e:
+        result["error"] = f"request_parse_failed: {e}"
+        return result
+
+    result["request_url"] = req["url"]
+    result["method"] = req["method"]
+
+    try:
+        session = client.Session()
+    except Exception as e:
+        result["error"] = f"session_init_failed: {e}"
+        return result
+
+    headers = dict(req["headers"])
+    kw = {"timeout": timeout, "allow_redirects": True, "headers": headers}
+    if proxy:
+        kw["proxies"] = {"http": proxy, "https": proxy}
+    if is_cffi:
+        kw["impersonate"] = impersonate
+
+    try:
+        if req["method"] in {"GET", "HEAD", "OPTIONS"}:
+            r = session.request(req["method"], req["url"], **kw)
+        else:
+            r = session.request(
+                req["method"], req["url"],
+                data=req["body"].encode("utf-8"), **kw
+            )
+
+        status = int(getattr(r, "status_code", 0) or 0)
+        final_url = str(getattr(r, "url", req["url"]))
+
+        cookies = {}
+        jar = getattr(session, "cookies", None)
+        if jar is not None:
+            try:
+                cookies = dict(jar.items())
+            except Exception:
+                pass
+
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        success = status in (200, 201, 202, 204, 301, 302, 303, 307, 308) and bool(cookies)
+
+        result.update({
+            "ok": success,
+            "status": status,
+            "cookies": cookies,
+            "cookie_header": cookie_header,
+            "final_url": final_url,
+            "session": session,
+        })
+        if log:
+            log.info(
+                f"[REQUEST-AUTH] {req['method']} {req['url']} -> {status} "
+                f"cookies={list(cookies.keys())} success={success}"
+            )
+    except Exception as e:
+        result["error"] = str(e)
+        if log:
+            log.warning(f"[REQUEST-AUTH] request failed: {e}")
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 class ReconPipeline:
     def __init__(self, target, cfg, resume=False, auto_nuclei=False, auto_xss=False,
-                 url_targets=None):
+                 url_targets=None, login_url=None, login_user=None, login_pass=None,
+                 login_user_field="username", login_pass_field="password",
+                 login_extra_fields=None, login_method="POST",
+                 login_success_indicator="", login_failure_indicator="",
+                 login_csrf_field="", raw_cookie=None, request_file=None):
         self.target      = target.strip()
         self.cfg         = cfg
         self.ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -931,6 +1217,23 @@ class ReconPipeline:
         self.url_targets = url_targets or []
         self.summary     = {}
         self.log         = None
+
+        # ── Authenticated scan parametreleri ──────────────────────────────
+        self.login_url             = (login_url or "").strip()
+        self.login_user            = login_user or ""
+        self.login_pass            = login_pass or ""
+        self.login_user_field      = login_user_field or "username"
+        self.login_pass_field      = login_pass_field or "password"
+        self.login_extra_fields    = login_extra_fields or {}
+        self.login_method          = (login_method or "POST").upper()
+        self.login_success_indicator = login_success_indicator or ""
+        self.login_failure_indicator = login_failure_indicator or ""
+        self.login_csrf_field      = login_csrf_field or ""
+        self.raw_cookie            = (raw_cookie or "").strip()
+        self.request_file           = (request_file or "").strip()
+        self.auth_cookie_header    = ""   # "k=v; k2=v2" — tum authenticated araclara gecilir
+        self.auth_cookies          = {}
+        self.auth_status           = "not_attempted"
 
         self.katana_needs_sudo = False
         self.katana_available  = tool_exists("katana")
@@ -945,7 +1248,7 @@ class ReconPipeline:
         self._nuclei_tpl_path = None
 
         for d in ["01_recon", "02_subdomains", "03_alive", "04_urls",
-                  "05_categorized", "06_xss", "07_nuclei", "checkpoints"]:
+                  "05_categorized", "06_authenticated", "checkpoints"]:
             (self.out / d).mkdir(parents=True, exist_ok=True)
 
         self.log = setup_logger(self.out / "pipeline.log")
@@ -1016,7 +1319,7 @@ class ReconPipeline:
             return
         floor = float(_cfg_get(self.cfg, "settings", "adaptive_floor_mult", default=0.25))
         before = float(self.adapt_mult)
-        # v6.5: exponential — her çağrıda daha agresif düşüş
+        # v6.5: exponential — her cagrida daha agresif dusus
         decay = 0.65 * float(extra_backoff)
         self.adapt_mult = max(floor, min(self.adapt_mult, 1.0) * decay)
         after = float(self.adapt_mult)
@@ -1058,6 +1361,273 @@ class ReconPipeline:
         if sec > 0:
             sub(f"Cooling down: {sec}s")
             time.sleep(sec)
+
+    # ── Authenticated headers helper ──────────────────────────────────────────
+    def _auth_headers(self, base_headers: dict = None) -> dict:
+        """Login/oturum cookie'si varsa mevcut header setine ekler."""
+        h = dict(base_headers or {})
+        if self.auth_cookie_header:
+            h["Cookie"] = self.auth_cookie_header
+        return h
+
+    def has_auth(self) -> bool:
+        return bool(self.auth_cookie_header)
+
+    # ── Stage L — Login / Authenticated session ────────────────────────────────
+    def stageL_login(self):
+        stage("L", "Authenticated Session (Login)")
+        d = self.out / "06_authenticated"
+
+        # SQLmap/Burp-style raw request file: replay the captured login request.
+        if self.request_file:
+            info(f"Replaying authenticated request: {self.request_file}")
+            res = perform_request_login(
+                request_file=self.request_file,
+                cfg=self.cfg,
+                timeout=T.get("login", 60),
+                log=self.log,
+            )
+            if res.get("ok") and res.get("cookie_header"):
+                self.auth_cookie_header = res["cookie_header"]
+                self.auth_cookies = res.get("cookies", {})
+                self.auth_status = "request_file_success"
+                ok(f"Request login successful — {len(self.auth_cookies)} cookie(s) captured "
+                   f"(status={res.get('status')})")
+            else:
+                self.auth_status = "request_file_failed"
+                warn(f"Request login failed or no session cookie obtained "
+                    f"(status={res.get('status')}, error={res.get('error','')})")
+
+            safe_dump = {
+                "mode": "request_file",
+                "request_file": str(Path(self.request_file).name),
+                "request_url": res.get("request_url"),
+                "method": res.get("method"),
+                "status": res.get("status"),
+                "ok": res.get("ok"),
+                "final_url": res.get("final_url"),
+                "cookie_names": list(self.auth_cookies.keys()),
+                "error": res.get("error", ""),
+            }
+            (d / "auth_info.json").write_text(
+                json.dumps(safe_dump, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            self.summary["stageL"] = {
+                "status": self.auth_status,
+                "mode": "request_file",
+                "cookie_names": list(self.auth_cookies.keys()),
+            }
+            return
+
+        # Ham cookie verilmisse dogrudan kullan (login istegi atlanir)
+        if self.raw_cookie and not self.login_url:
+            self.auth_cookie_header = self.raw_cookie
+            self.auth_status = "cookie_provided"
+            ok("Raw cookie provided — skipping login request")
+            (d / "auth_info.json").write_text(json.dumps({
+                "mode": "raw_cookie", "cookie_header": "***redacted***"
+            }, indent=2), encoding="utf-8")
+            self.summary["stageL"] = {"status": "done", "mode": "raw_cookie"}
+            return
+
+        if not self.login_url:
+            self.summary["stageL"] = {"status": "skipped", "reason": "no_login_url"}
+            return
+
+        if not self.login_user or not self.login_pass:
+            warn("Login URL verildi ama kullanici adi/sifre eksik — login atlaniyor")
+            self.summary["stageL"] = {"status": "skipped", "reason": "missing_credentials"}
+            return
+
+        info(f"Logging in: {self.login_url} (user field={self.login_user_field})")
+        res = perform_login(
+            login_url=self.login_url,
+            username=self.login_user,
+            password=self.login_pass,
+            cfg=self.cfg,
+            user_field=self.login_user_field,
+            pass_field=self.login_pass_field,
+            extra_fields=self.login_extra_fields,
+            method=self.login_method,
+            success_indicator=self.login_success_indicator,
+            failure_indicator=self.login_failure_indicator,
+            csrf_field=self.login_csrf_field,
+            timeout=T.get("login", 60),
+            log=self.log,
+        )
+
+        # Raw cookie ek olarak verilmisse birlestir
+        if self.raw_cookie:
+            extra_pairs = []
+            for part in self.raw_cookie.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    extra_pairs.append(part)
+            if res.get("cookie_header"):
+                res["cookie_header"] = res["cookie_header"] + "; " + "; ".join(extra_pairs)
+            else:
+                res["cookie_header"] = "; ".join(extra_pairs)
+
+        if res.get("ok") and res.get("cookie_header"):
+            self.auth_cookie_header = res["cookie_header"]
+            self.auth_cookies       = res.get("cookies", {})
+            self.auth_status        = "success"
+            ok(f"Login successful — {len(self.auth_cookies)} cookie(s) captured "
+               f"(status={res.get('status')}, csrf_used={res.get('csrf_used')})")
+        else:
+            self.auth_status = "failed"
+            warn(f"Login failed or no session cookie obtained "
+                 f"(status={res.get('status')}, error={res.get('error','')}) "
+                 f"— continuing as unauthenticated scan")
+
+        safe_dump = {
+            "login_url": self.login_url,
+            "status": res.get("status"),
+            "ok": res.get("ok"),
+            "final_url": res.get("final_url"),
+            "csrf_used": res.get("csrf_used"),
+            "cookie_names": list(self.auth_cookies.keys()),
+            "error": res.get("error", ""),
+        }
+        (d / "auth_info.json").write_text(json.dumps(safe_dump, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.summary["stageL"] = {"status": self.auth_status,
+                                   "cookie_names": list(self.auth_cookies.keys())}
+
+    # ── Stage 8 — Authenticated crawl (post-login internal recon) ──────────────
+    def stage8_authenticated_crawl(self):
+        stage(8, "Authenticated Crawl (post-login)")
+        d = self.out / "06_authenticated"
+        if not self.has_auth():
+            warn("No authenticated session available — skipping authenticated crawl")
+            self.summary["stage8"] = {"status": "skipped", "reason": "no_auth_session"}
+            return
+
+        alive_file = self._cp("stage3_alive")
+        seed_hosts = []
+        if alive_file.exists() and alive_file.stat().st_size > 0:
+            seed_hosts = [l.strip() for l in alive_file.read_text(errors="ignore").splitlines() if l.strip()]
+        if not seed_hosts:
+            seed_hosts = [self.login_url or f"https://{self.target}"]
+        # login sonrasi ulasilan (final_url) sayfayi da crawl kokune ekle
+        auth_info_f = d / "auth_info.json"
+        if auth_info_f.exists():
+            try:
+                info_j = json.loads(auth_info_f.read_text(errors="replace"))
+                fu = info_j.get("final_url")
+                if fu and fu not in seed_hosts:
+                    seed_hosts.insert(0, fu)
+            except Exception:
+                pass
+
+        seed_file = d / "authenticated_seed_hosts.txt"
+        write_lines(seed_file, seed_hosts)
+
+        auth_headers = self._auth_headers(pick_header_strategy(self.target, self.cfg))
+        found_files = []
+
+        # 1) httpx — authenticated status/title/tech dogrulamasi
+        if tool_exists("httpx"):
+            base_threads = int(_cfg_get(self.cfg, "settings", "threads", default=50))
+            threads = self._tuned_threads(min(base_threads, 80), 80)
+            httpx_json = d / "httpx_authenticated.json"
+            httpx_cmd = (
+                f"httpx -l {seed_file} -no-color -threads {threads} -timeout 20 -retries 2 "
+                f"-follow-redirects -status-code -title -tech-detect -content-length "
+                + _hdr_args_httpx(auth_headers)
+                + f" -json -o {httpx_json}"
+            )
+            run_cmd(httpx_cmd, timeout=T["httpx"], log=self.log, label="httpx-auth", retries=1, retry_delay=5)
+            found_files.append(httpx_json)
+
+        # 2) katana — authenticated derin crawl (session cookie ile)
+        katana_urls = d / "katana_authenticated.txt"
+        if self.katana_available and not (self.katana_needs_sudo and not self._is_root()):
+            kh = _help_text("katana")
+            conc = self._tuned_threads(10, 20)
+            hdr_flags = " ".join([f'-H "{k}: {v}"' for k, v in auth_headers.items()])
+            flags = " ".join(filter(None, [
+                "-silent",
+                "-jc" if "-jc" in kh else "",
+                "-d 5",
+                f"-concurrency {conc}" if "-concurrency" in kh else "",
+                "-timeout 15" if "-timeout" in kh else "",
+            ]))
+            run_cmd(f"katana -list {seed_file} {flags} {hdr_flags} -o {katana_urls}",
+                    timeout=T["katana"], log=self.log, label="katana-auth", retries=1, retry_delay=8)
+            found_files.append(katana_urls)
+        else:
+            sub("katana not available for authenticated crawl")
+
+        # 3) hakrawler — ek authenticated crawl kaynagi
+        hak_urls = d / "hakrawler_authenticated.txt"
+        if tool_exists("hakrawler"):
+            hh = _help_text("hakrawler")
+            hdr_flags = ""
+            if "-h" in hh:
+                hdr_flags = " ".join([f'-h "{k}: {v}"' for k, v in auth_headers.items()])
+            run_cmd(f"cat {seed_file} | hakrawler -d 3 {hdr_flags} 2>/dev/null",
+                    out_file=hak_urls, timeout=T["hakrawler"], log=self.log,
+                    label="hakrawler-auth", retries=1, retry_delay=5)
+            found_files.append(hak_urls)
+        else:
+            sub("hakrawler not found")
+
+        # Toplanan authenticated URL'leri birlestir + normalize et
+        merged = d / "authenticated_urls.txt"
+        def _url_ok(line):
+            if not line.startswith("http"): return False
+            try:
+                return not _PAT_SKIP.search(urlparse(line).path)
+            except:
+                return False
+        normalize = canonicalize_url if bool(_cfg_get(self.cfg, "settings", "canonicalize_urls", default=True)) else None
+        text_sources = [f for f in found_files if f.suffix == ".txt"]
+        n = dedup_files_normalized(text_sources, merged, filter_fn=_url_ok, normalize_fn=normalize)
+
+        # httpx JSON'dan da url cikar ve merge et
+        httpx_json = d / "httpx_authenticated.json"
+        extra_urls = []
+        if httpx_json.exists() and httpx_json.stat().st_size > 0:
+            with httpx_json.open(errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        u = rec.get("url") or ""
+                        if u.startswith("http"):
+                            extra_urls.append(u)
+                    except Exception:
+                        continue
+        if extra_urls:
+            existing = set(l.strip() for l in merged.read_text(errors="ignore").splitlines() if l.strip()) if merged.exists() else set()
+            with merged.open("a", encoding="utf-8") as fo:
+                for u in extra_urls:
+                    uu = canonicalize_url(u) if normalize else u
+                    if uu not in existing:
+                        existing.add(uu)
+                        fo.write(uu + "\n")
+            n = len(existing)
+
+        checkpoint(self._cp("stage8_authenticated_urls"),
+                   [l.strip() for l in merged.read_text(errors="ignore").splitlines() if l.strip()] if merged.exists() else [],
+                   "authenticated-urls")
+
+        # Authenticated alanda basit kategori ayrimi (sensitive/admin/api vb.)
+        if merged.exists() and merged.stat().st_size > 0:
+            cat_dir = d / "categorized"
+            counts = categorise_streaming(merged, cat_dir)
+            self.summary["stage8"] = {
+                "status": "done",
+                "count": _count_lines(merged),
+                "categories": {k: v for k, v in counts.items() if v > 0},
+            }
+            ok(f"Authenticated crawl complete — {_count_lines(merged):,} URLs behind login")
+        else:
+            self.summary["stage8"] = {"status": "done", "count": 0, "note": "no_urls_found"}
+            warn("Authenticated crawl produced no URLs — check login success / seed hosts")
 
     # ── Stage 1 ───────────────────────────────────────────────────────────────
     def stage1_recon(self):
@@ -1231,6 +1801,11 @@ class ReconPipeline:
         threads = self._tuned_threads(min(base_threads, 120), 120)
         json_out = d / "httpx_full.json"
         headers = pick_header_strategy(self.target, self.cfg)
+        # v6.7: login basariliysa session cookie'sini de bu asamada kullan
+        # (boylece -u ile tek URL taramasinda ana kesif zaten authenticated olur)
+        if self.has_auth():
+            headers = self._auth_headers(headers)
+            sub("Using authenticated session for httpx (alive check)")
         # v6.5: -favicon, -hash eklendi
         httpx_cmd = (
             f"httpx -l {sub_file} -no-color "
@@ -1346,10 +1921,16 @@ class ReconPipeline:
                     f"-concurrency {conc}" if "-concurrency" in kh else "",
                     "-timeout 15" if "-timeout" in kh else "",
                 ]))
-                run_cmd(f"katana -list {kin} -d 5 {flags} -o {f_kat}",
+                # v6.7: login basariliysa katana da authenticated session ile taransin
+                kat_hdr_flags = ""
+                if self.has_auth():
+                    auth_h = self._auth_headers({})
+                    kat_hdr_flags = " ".join([f'-H "{k}: {v}"' for k, v in auth_h.items()])
+                    sub("Using authenticated session for katana (URL discovery)")
+                run_cmd(f"katana -list {kin} -d 5 {flags} {kat_hdr_flags} -o {f_kat}",
                         timeout=T["katana"], log=self.log, label="katana", retries=2, retry_delay=8)
                 if not f_kat.exists() or f_kat.stat().st_size == 0:
-                    run_cmd(f"katana -list {kin} -d 3 -silent -o {f_kat}",
+                    run_cmd(f"katana -list {kin} -d 3 -silent {kat_hdr_flags} -o {f_kat}",
                             timeout=T["katana"], log=self.log, label="katana-min", retries=0)
                 url_files.append(f_kat)
         else:
@@ -1364,10 +1945,16 @@ class ReconPipeline:
                 "-insecure" if "-insecure" in hh else "",
                 "-timeout 10" if "-timeout" in hh else "",
             ]))
-            ok1, _ = run_cmd(f"cat {hin} | hakrawler {flags} 2>/dev/null",
+            # v6.7: login basariliysa hakrawler da authenticated session ile taransin
+            hak_hdr_flags = ""
+            if self.has_auth() and "-h" in hh:
+                auth_h = self._auth_headers({})
+                hak_hdr_flags = " ".join([f'-h "{k}: {v}"' for k, v in auth_h.items()])
+                sub("Using authenticated session for hakrawler (URL discovery)")
+            ok1, _ = run_cmd(f"cat {hin} | hakrawler {flags} {hak_hdr_flags} 2>/dev/null",
                              out_file=f_hak, timeout=T["hakrawler"], log=self.log, label="hakrawler", retries=2, retry_delay=5)
             if not ok1 or not f_hak.exists() or f_hak.stat().st_size == 0:
-                run_cmd(f"cat {hin} | hakrawler -d 2 2>/dev/null",
+                run_cmd(f"cat {hin} | hakrawler -d 2 {hak_hdr_flags} 2>/dev/null",
                         out_file=f_hak, timeout=T["hakrawler"], log=self.log, label="hakrawler-min", retries=0)
             if f_hak.exists():
                 clean = d / "hakrawler_clean.txt"
@@ -1416,656 +2003,69 @@ class ReconPipeline:
             return
         counts = categorise_streaming(url_file, d)
 
-        # Checkpoint her kategoriyi ayrı kaydet
+        # Checkpoint her kategoriyi ayri kaydet
         for name in ["reflection", "xss_targets", "params", "forms"]:
             p = d / f"{name}.txt"
             if p.exists() and p.stat().st_size > 0:
                 shutil.copy2(p, self._cp(f"stage5_{name}"))
 
-        normalize = canonicalize_url if bool(_cfg_get(self.cfg, "settings", "canonicalize_urls", default=True)) else None
-
-        def _xss_ok(u: str) -> bool:
-            if not u.startswith("http"): return False
-            if len(u) > 3000: return False
-            # Parametre olmayan URL'leri XSS listesine alma
-            try:
-                parsed = urlparse(u)
-                if not parsed.query:
-                    # Form endpoint'leri (.php, .asp vb.) yine de kabul et
-                    if not _PAT_FORM.search(parsed.path):
-                        return False
-                if _PAT_SKIP.search(parsed.path):
-                    return False
-            except:
-                pass
-            return True
-
-        # ── v6.6: 3 ayrı öncelikli XSS dosyası oluştur ─────────────────────
-        #  Tier-1: reflection.txt  → sunucuya yansıyan parametreler (en değerli)
-        #  Tier-2: params.txt      → herhangi bir query parametresi olan URL'ler
-        #  Tier-3: forms.txt       → .php/.asp gibi form endpoint'leri (parametresiz)
-
-        tier1_src = d / "reflection.txt"
-        tier2_src = d / "params.txt"
-        tier3_src = d / "forms.txt"
-
-        tier1_out = d / "xss_tier1_reflected.txt"
-        tier2_out = d / "xss_tier2_params.txt"
-        tier3_out = d / "xss_tier3_forms.txt"
-        xss_all   = d / "xss-targets-all.txt"
-
-        # Tier-1: reflected (parametre değeri response'a yansıyanlar)
-        n1 = 0
-        if tier1_src.exists() and tier1_src.stat().st_size > 0:
-            n1 = dedup_files_normalized([tier1_src], tier1_out,
-                                        filter_fn=_xss_ok, normalize_fn=normalize)
-        ok(f"XSS Tier-1 (reflected):  {n1:,} URLs → {tier1_out.name}")
-
-        # Tier-2: params (query string var ama reflection teyidi yok)
-        #   reflection ile overlap'i çıkar
-        tier1_seen = set()
-        if tier1_out.exists():
-            for ln in tier1_out.read_text(errors="replace").splitlines():
-                ln = ln.strip()
-                if ln: tier1_seen.add(ln)
-
-        n2 = 0
-        if tier2_src.exists() and tier2_src.stat().st_size > 0:
-            tmp2 = d / "_tmp_params_raw.txt"
-            dedup_files_normalized([tier2_src], tmp2, filter_fn=_xss_ok, normalize_fn=normalize)
-            # tier1'de olanları çıkar
-            with tmp2.open(errors="replace") as fi, tier2_out.open("w") as fo:
-                for ln in fi:
-                    ln = ln.strip()
-                    if ln and ln not in tier1_seen:
-                        fo.write(ln + "\n")
-                        n2 += 1
-            try: tmp2.unlink()
-            except: pass
-        ok(f"XSS Tier-2 (params):     {n2:,} URLs → {tier2_out.name}")
-
-        # Tier-3: form endpoints (parametresiz ama XSS'e açık olabilir)
-        tier12_seen = tier1_seen.copy()
-        if tier2_out.exists():
-            for ln in tier2_out.read_text(errors="replace").splitlines():
-                ln = ln.strip()
-                if ln: tier12_seen.add(ln)
-
-        n3 = 0
-        if tier3_src.exists() and tier3_src.stat().st_size > 0:
-            tmp3 = d / "_tmp_forms_raw.txt"
-            # forms için _xss_ok'u biraz gevşet (parametresiz olabilir)
-            def _form_ok(u):
-                if not u.startswith("http"): return False
-                if len(u) > 3000: return False
-                try:
-                    if _PAT_SKIP.search(urlparse(u).path): return False
-                except: pass
-                return True
-            dedup_files_normalized([tier3_src], tmp3, filter_fn=_form_ok, normalize_fn=normalize)
-            with tmp3.open(errors="replace") as fi, tier3_out.open("w") as fo:
-                for ln in fi:
-                    ln = ln.strip()
-                    if ln and ln not in tier12_seen:
-                        fo.write(ln + "\n")
-                        n3 += 1
-            try: tmp3.unlink()
-            except: pass
-        ok(f"XSS Tier-3 (forms):      {n3:,} URLs → {tier3_out.name}")
-
-        # Hepsinin birleşimi (öncelik sırasıyla: tier1 → tier2 → tier3)
-        all_sources = [f for f in [tier1_out, tier2_out, tier3_out]
-                       if f.exists() and f.stat().st_size > 0]
-        if not all_sources:
-            # Son çare: tüm URL'leri dene
-            warn("No categorised XSS targets — falling back to all URLs with params")
-            all_sources = [url_file]
-
-        n_all = dedup_files_normalized(all_sources, xss_all,
-                                       filter_fn=_xss_ok if all_sources != [url_file] else None,
-                                       normalize_fn=normalize)
-
-        # Checkpoint'lere yaz (stage6 bunları okuyacak)
-        shutil.copy2(tier1_out if tier1_out.exists() and n1 > 0 else
-                     (tier2_out if tier2_out.exists() and n2 > 0 else xss_all),
-                     self._cp("stage5_xss_tier1"))
-        if tier2_out.exists() and n2 > 0:
-            shutil.copy2(tier2_out, self._cp("stage5_xss_tier2"))
-        if tier3_out.exists() and n3 > 0:
-            shutil.copy2(tier3_out, self._cp("stage5_xss_tier3"))
-        shutil.copy2(xss_all, self._cp("stage5_xss_targets_all"))
-
-        ok(f"Categorisation complete — {sum(counts.values()):,} URLs processed")
-        info(f"XSS tiers: T1(reflected)={n1:,}  T2(params)={n2:,}  T3(forms)={n3:,}  total={n_all:,}")
+        # Bu surumde XSS hedefleri olusturulmuyor; sadece kategorilendirme yapiliyor.
         self.summary["stage5"] = {
             "status": "done",
-            "xss_tier1_reflected": {"count": n1, "file": str(tier1_out)},
-            "xss_tier2_params":    {"count": n2, "file": str(tier2_out)},
-            "xss_tier3_forms":     {"count": n3, "file": str(tier3_out)},
-            "xss_targets_all":     {"count": n_all, "file": str(xss_all)},
             "categories":          {cat: {"count": cnt, "file": str(d / f"{cat}.txt")}
                                     for cat, cnt in counts.items()},
         }
+        ok(f"Categorisation complete — {sum(counts.values()):,} URLs processed")
+
+    # ══════════════════════════════════════════════════════════════════
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Stage 6 — Dalfox XSS  (v6.5: agresif mod + BXSS)
+    # Stage 6 — XSS disabled
     # ══════════════════════════════════════════════════════════════════════════
     def _run_dalfox_once(self, xss_file: Path, d: Path, run_tag: str) -> dict:
-        base_rate    = int(_cfg_get(self.cfg, "settings", "rate_limit", default=8))
-        base_workers = int(_cfg_get(self.cfg, "settings", "threads", default=15))
-        timeout_req  = int(_cfg_get(self.cfg, "settings", "timeout", default=20))
-        workers  = self._tuned_threads(min(base_workers, 20), 20)  # v6.5: 15→20
-        delay_ms = self._tuned_delay_ms(base_rate)
-        delay_ms = max(200, delay_ms)  # min 200ms
-        ua    = _pick_ua()
-        proxy = (_cfg_get(self.cfg, "settings", "proxy", default="") or "").strip()
-
-        blind_cb     = (_cfg_get(self.cfg, "tools", "blind_xss_callback", default="") or "").strip()
-        custom_pl    = (_cfg_get(self.cfg, "tools", "dalfox_custom_payload", default="") or "").strip()
-
-        out_all = d / f"dalfox_findings{run_tag}.txt"
-
-        dalfox_args = [
-            "dalfox", "file", str(xss_file),
-            "--no-color",
-            "--follow-redirects",
-            "--deep-domxss",           # v6.5: kept
-            "--mining-dom",            # v6.5: DOM parametre madenciliği
-            "--mining-dict",           # v6.5: dict ile parametre keşfi
-            "--delay",   str(delay_ms),
-            "--worker",  str(workers),
-            "--timeout", str(timeout_req),
-            "--user-agent", ua,
-            "--format", "plain",
-            "--output", str(out_all),
-        ]
-
-        # v6.5: BXSS (blind XSS) callback
-        if blind_cb:
-            dalfox_args += ["--blind", blind_cb]
-            info(f"  BXSS callback: {blind_cb}")
-
-        # v6.5: custom payload dosyası
-        if custom_pl and Path(custom_pl).exists():
-            dalfox_args += ["--custom-payload", custom_pl]
-            info(f"  Custom payloads: {custom_pl}")
-
-        # v6.5: WAF bypass headerlar
-        headers = pick_header_strategy(self.target, self.cfg)
-        dalfox_args += _hdr_args_dalfox(headers)
-
-        if proxy:
-            dalfox_args += ["--proxy", proxy]
-
-        info(f"Dalfox XSS{run_tag or ''} [workers={workers} delay={delay_ms}ms timeout={timeout_req}s | "
-             f"targets={_count_lines(xss_file):,}]")
-        print(f"  {C.DIM}{'─'*58}{C.RESET}", flush=True)
-
-        if self.log:
-            self.log.info(f"[DALFOX CMD] {dalfox_args}")
-
-        block_hits  = [0]
-        http_reqs   = [0]
-        poc_found   = [0]
-
-        def _on_line(line: str):
-            lo = line.lower()
-            if re.search(r'https?://', lo):
-                http_reqs[0] += 1
-            if "403" in lo or "429" in lo or "forbidden" in lo or "too many requests" in lo:
-                block_hits[0] += 1
-            if "[poc]" in lo or "[vuln]" in lo or "[G]" in line or "[R]" in line:
-                poc_found[0] += 1
-                if sys.stdout.isatty():
-                    sys.stdout.write(f"\r{' ' * 72}\r")
-                print(f"  {C.RED}{C.BOLD}[XSS FOUND]{C.RESET} {line}", flush=True)
-
-        rc, total_lines, killed = _stream_tool(
-            dalfox_args,
-            timeout=T["dalfox"],
-            log=self.log,
-            label="dalfox",
-            line_cb=_on_line,
-        )
-        print(f"  {C.DIM}{'─'*58}{C.RESET}", flush=True)
-        findings = _count_lines(out_all)
-        ratio    = (block_hits[0] / max(1, http_reqs[0])) if http_reqs[0] > 0 else 0.0
-        info(f"Dalfox{run_tag or ''}: {findings} XSS findings | {total_lines:,} lines | "
-             f"block={block_hits[0]} ({ratio:.1%}) | PoC live={poc_found[0]}")
         return {
-            "workers":      workers,
-            "delay_ms":     delay_ms,
-            "blocked_hits": block_hits[0],
-            "total_lines":  total_lines,
-            "block_ratio":  round(ratio, 4),
-            "findings":     findings,
-            "poc_live":     poc_found[0],
-            "file_txt":     str(out_all),
+            "workers": 0,
+            "delay_ms": 0,
+            "blocked_hits": 0,
+            "total_lines": 0,
+            "block_ratio": 0.0,
+            "findings": 0,
+            "poc_live": 0,
+            "file_txt": "",
         }
 
     def stage6_xss(self):
-        if _INT.hard():
-            return
-        stage(6, "XSS Testing — Dalfox (Tiered)")
-
-        if not tool_exists("dalfox"):
-            warn("dalfox not found — skipping XSS")
-            self.summary["stage6"] = {"status": "skipped", "reason": "not_found"}
-            return
-
-        # ── Tier dosyalarını topla ────────────────────────────────────────────
-        tier1 = self._cp("stage5_xss_tier1")   # reflected (öncelik 1)
-        tier2 = self._cp("stage5_xss_tier2")   # params    (öncelik 2)
-        tier3 = self._cp("stage5_xss_tier3")   # forms     (öncelik 3)
-        all_f = self._cp("stage5_xss_targets_all")
-
-        def _tier_count(p):
-            return _count_lines(p) if (p and p.exists() and p.stat().st_size > 0) else 0
-
-        n1 = _tier_count(tier1)
-        n2 = _tier_count(tier2)
-        n3 = _tier_count(tier3)
-        n_all = _tier_count(all_f)
-
-        # Kullanılabilir tier'ları belirle
-        tiers = []
-        if n1 > 0: tiers.append(("Tier-1 reflected", tier1, n1))
-        if n2 > 0: tiers.append(("Tier-2 params",    tier2, n2))
-        if n3 > 0: tiers.append(("Tier-3 forms",     tier3, n3))
-
-        # Hiçbir tier yoksa all_f'e düş
-        if not tiers:
-            if n_all > 0:
-                tiers = [("All URLs (fallback)", all_f, n_all)]
-            else:
-                warn("No XSS target files found — skipping XSS")
-                self.summary["stage6"] = {"status": "skipped", "reason": "no_xss_targets"}
-                return
-
-        # ── Kullanıcıya özet göster ───────────────────────────────────────────
-        print(f"\n  {C.CYAN}XSS Target Breakdown:{C.RESET}")
-        for label, _, cnt in tiers:
-            print(f"    {C.DIM}→{C.RESET} {label}: {C.BOLD}{cnt:,}{C.RESET} URLs")
-        total_xss_targets = sum(cnt for _, _, cnt in tiers)
-        print(f"    {C.DIM}→{C.RESET} Total: {C.BOLD}{total_xss_targets:,}{C.RESET}")
-
-        if not self.auto_xss:
-            if not ask_yes_no(f"Run Dalfox XSS test? ({total_xss_targets:,} targets, {len(tiers)} tiers)"):
-                warn("XSS skipped")
-                self.summary["stage6"] = {"status": "skipped", "reason": "user_choice"}
-                return
-        else:
-            info("Dalfox starting (auto mode)")
-
-        d = self.out / "06_xss"
-        d.mkdir(parents=True, exist_ok=True)
-
-        all_results   = []
-        total_findings = 0
-        last_out_file  = None
-
-        # ── Her tier'ı sırayla tara ───────────────────────────────────────────
-        for tier_label, tier_file, tier_count in tiers:
-            if _INT.hard():
-                warn("Hard interrupt — stopping XSS tiers")
-                break
-
-            info(f"{'─'*50}")
-            info(f"Dalfox → {tier_label} ({tier_count:,} URLs)")
-
-            # tier tag: "tier1", "tier2", "tier3" veya "fallback"
-            run_tag = "_" + tier_label.split()[0].lower().replace("-", "")
-
-            r = self._run_dalfox_once(tier_file, d, run_tag=run_tag)
-            all_results.append({"tier": tier_label, "count": tier_count, **r})
-            total_findings += r["findings"]
-            last_out_file = r["file_txt"]
-
-            # Adaptive: bu tier'da çok bloklandıysak sonraki tier'ı yavaşlat
-            thr = float(_cfg_get(self.cfg, "settings", "adaptive_threshold", default=0.18))
-            if r["total_lines"] > 0 and r["block_ratio"] >= thr:
-                self._apply_adaptive(f"dalfox {tier_label} block {r['block_ratio']:.2%}")
-                if _INT.hard():
-                    break
-                # tier2 ve tier3 varsa devam etmeden önce bekle
-                remaining = [t for t in tiers if t[0] != tier_label]
-                if remaining:
-                    self._pause_before_rerun()
-
-        # ── Tüm tier bulguları birleştir ──────────────────────────────────────
-        merged_out = d / "dalfox_all_findings.txt"
-        tier_files = [Path(r["file_txt"]) for r in all_results if r.get("file_txt")]
-        if tier_files:
-            merge_unique_lines(merged_out, tier_files)
-            total_findings = _count_lines(merged_out)
-            shutil.copy2(merged_out, self._cp("stage6_xss"))
-            last_out_file = str(merged_out)
-
-        print(f"\n  {C.DIM}{'─'*58}{C.RESET}")
-        if total_findings:
-            ok(f"XSS findings total: {total_findings} → {merged_out.name}")
-        else:
-            ok("No XSS findings across all tiers")
-
-        # ── Tier bazlı özet ───────────────────────────────────────────────────
-        print(f"\n  {C.CYAN}XSS Results by Tier:{C.RESET}")
-        for r in all_results:
-            cnt = r.get("findings", 0)
-            col = C.RED + C.BOLD if cnt > 0 else C.DIM
-            print(f"    {col}→ {r['tier']}: {cnt} findings "
-                  f"(block={r.get('block_ratio',0):.1%}){C.RESET}")
-
-        self.summary["stage6"] = {
-            "status":          "done",
-            "tiers_run":       len(all_results),
-            "total_targets":   total_xss_targets,
-            "total_findings":  total_findings,
-            "file":            last_out_file or "",
-            "tier_results":    all_results,
-        }
+        stage(6, "XSS Testing — Disabled")
+        warn("Stage 6 (XSS) is disabled in this build")
+        self.summary["stage6"] = {"status": "disabled", "reason": "xss-removed"}
+        return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Stage 7 — Nuclei  (v6.5: template discovery + severity + exclude tags)
+    # Stage 7 — Nuclei  (removed)
     # ══════════════════════════════════════════════════════════════════════════
     def _get_nuclei_template_path(self) -> str:
-        """Lazy-init nuclei template path."""
-        if self._nuclei_tpl_path is None:
-            cfg_tpl = (_cfg_get(self.cfg, "tools", "nuclei_templates", default="") or "").strip()
-            self._nuclei_tpl_path = discover_nuclei_templates(cfg_override=cfg_tpl)
-        return self._nuclei_tpl_path
+        return ""
 
     def _run_nuclei_once(self, targets: Path, d: Path, run_tag: str) -> dict:
-        threads     = self._tuned_threads(min(int(_cfg_get(self.cfg,"settings","threads",default=15)), 25), 25)
-        rate        = self._tuned_rate(min(int(_cfg_get(self.cfg,"settings","rate_limit",default=8)), 20), 20)
-        timeout_req = min(int(_cfg_get(self.cfg,"settings","timeout",default=20)), 30)
-        proxy       = (_cfg_get(self.cfg,"settings","proxy",default="") or "").strip()
-        ua          = _pick_ua()
-
-        # v6.5: severity + template path + exclude tags
-        severity    = (_cfg_get(self.cfg,"tools","nuclei_severity",default="critical,high,medium") or "").strip()
-        excl_tags   = (_cfg_get(self.cfg,"tools","nuclei_excluded_tags",default="intrusive,dos") or "").strip()
-        tpl_path    = self._get_nuclei_template_path()
-
-        nout  = d / f"nuclei_results{run_tag}.txt"
-        njson = d / f"nuclei_results{run_tag}.json"
-        target_count = _count_lines(targets)
-
-        nuc_args = ["nuclei"]
-        if target_count == 1:
-            single = targets.read_text(errors="replace").strip().splitlines()[0].strip()
-            nuc_args += ["-u", single]
-        else:
-            nuc_args += ["-l", str(targets)]
-
-        # v6.5: template path
-        if tpl_path:
-            nuc_args += ["-t", tpl_path]
-            sub(f"Nuclei templates: {tpl_path}")
-        else:
-            sub("Nuclei: using built-in/default templates")
-
-        # v6.5: auto-scan mode (technology-based template selection)
-        nuc_args += ["-as"]
-
-        nuc_help = ""
-        try:
-            r = subprocess.run(["nuclei", "-h"], capture_output=True, timeout=5)
-            nuc_help = (r.stdout + r.stderr).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-
-        _nl = "\n"
-        flag_c  = "-c"  if ("-c "  in nuc_help or ("-c" + _nl)  in nuc_help) else "-concurrency"
-        flag_rl = "-rl" if ("-rl " in nuc_help or ("-rl" + _nl) in nuc_help) else "-rate-limit"
-
-        nuc_args += [
-            flag_c,  str(threads),
-            flag_rl, str(rate),
-            "-timeout",  str(timeout_req),
-            "-retries",  "2",
-            "-follow-redirects",
-            "-no-color",
-            "-H", f"User-Agent: {ua}",
-        ]
-
-        # v6.5: bypass headers
-        bypass_hdrs = _bypass_headers_extra()
-        for k, v in list(bypass_hdrs.items())[:3]:  # sadece IP spoof headers
-            nuc_args += ["-H", f"{k}: {v}"]
-
-        # v6.5: severity filter
-        if severity:
-            nuc_args += ["-severity", severity]
-            sub(f"Nuclei severity filter: {severity}")
-        else:
-            sub("Nuclei: no severity filter (all severities)")
-
-        # v6.5: exclude noisy/dangerous tags
-        if excl_tags:
-            nuc_args += ["-etags", excl_tags]
-            sub(f"Nuclei excluded tags: {excl_tags}")
-
-        nuc_args += ["-o", str(nout)]
-
-        # v6.5: JSON export
-        if "-je " in nuc_help or ("-je" + _nl) in nuc_help:
-            nuc_args += ["-je", str(njson)]
-        elif "-json-export" in nuc_help:
-            nuc_args += ["-json-export", str(njson)]
-
-        if proxy:
-            nuc_args += ["-proxy", proxy]
-
-        info(f"Nuclei{run_tag or ''} [c={threads} rl={rate} sev={severity or 'all'} | {target_count:,} targets]")
-        print(f"  {C.DIM}{'─'*58}{C.RESET}", flush=True)
-        if self.log:
-            self.log.info(f"[NUCLEI CMD] {nuc_args}")
-
-        findings_live = [0]
-        sev_counts    = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-        stop_spin     = threading.Event()
-        start_t       = time.time()
-        frames        = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-
-        def _spin():
-            if not sys.stdout.isatty():
-                return
-            i = 0
-            while not stop_spin.is_set():
-                elapsed = int(time.time() - start_t)
-                crit = sev_counts["critical"]
-                high = sev_counts["high"]
-                sys.stdout.write(
-                    f"\r  {C.CYAN}{frames[i%10]}{C.RESET} "
-                    f"{C.DIM}nuclei{C.RESET} "
-                    f"{C.RED if crit else C.DIM}{findings_live[0]} findings"
-                    f"{'  CRIT:'+str(crit) if crit else ''}"
-                    f"{'  HIGH:'+str(high) if high else ''}{C.RESET} "
-                    f"{C.DIM}{elapsed}s{C.RESET}   "
-                )
-                sys.stdout.flush()
-                i += 1
-                time.sleep(0.12)
-            sys.stdout.write(f"\r{chr(32)*80}\r")
-            sys.stdout.flush()
-
-        spin_t = threading.Thread(target=_spin, daemon=True)
-        spin_t.start()
-
-        blocked_hits   = 0
-        http_responses = 0
-        total_lines    = 0
-        proc           = None
-
-        try:
-            proc = subprocess.Popen(
-                nuc_args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                env={**os.environ},
-            )
-            for raw in proc.stderr:
-                line = strip_ansi(raw.decode("utf-8", errors="replace").rstrip())
-                if not line:
-                    continue
-                total_lines += 1
-                if _INT.hard() or _INT.interrupted():
-                    proc.kill(); proc.wait(3); break
-                lo = line.lower()
-                if re.search(r'https?://', line):
-                    http_responses += 1
-                if "[403]" in lo or "[429]" in lo or "forbidden" in lo:
-                    blocked_hits += 1
-
-                # v6.5: daha iyi severity parsing
-                msev = re.search(r'\[(critical|high|medium|low|info)\]', line, re.I)
-                if msev:
-                    s = msev.group(1).lower()
-                    sev_counts[s] = sev_counts.get(s, 0) + 1
-                    findings_live[0] += 1
-                    col = {
-                        "critical": C.RED + C.BOLD,
-                        "high":     C.RED,
-                        "medium":   C.YELLOW,
-                        "low":      C.BLUE,
-                        "info":     C.DIM,
-                    }.get(s, C.DIM)
-                    if sys.stdout.isatty():
-                        sys.stdout.write(f"\r{chr(32)*80}\r")
-                    print(f"  {col}[{s.upper()}]{C.RESET} {line}", flush=True)
-                    if self.log:
-                        self.log.info(f"[FINDING] [{s}] {line}")
-                elif "[ERR]" in line or "error" in lo:
-                    if sys.stdout.isatty():
-                        sys.stdout.write(f"\r{chr(32)*80}\r")
-                    warn(f"nuclei: {line}")
-                    if self.log:
-                        self.log.warning(f"[NUCLEI-ERR] {line}")
-                elif self.log and ("[INF]" in line or "[WRN]" in line):
-                    self.log.debug(f"[NUCLEI] {line}")
-            proc.wait()
-        except Exception as ex:
-            warn(f"Nuclei error: {ex}")
-            if self.log:
-                self.log.exception("nuclei exception")
-        finally:
-            stop_spin.set()
-            spin_t.join(1)
-            if proc and proc.poll() is None:
-                try: proc.kill(); proc.wait(2)
-                except: pass
-
-        print(f"  {C.DIM}{'─'*58}{C.RESET}", flush=True)
-        findings = _count_lines(nout)
-        ratio    = (blocked_hits / max(1, http_responses)) if http_responses > 0 else 0.0
-
-        # v6.5: severity summary
-        sev_str = " | ".join([f"{k}={v}" for k, v in sev_counts.items() if v > 0])
-        info(f"Nuclei{run_tag or ''}: {findings} findings | {total_lines:,} lines | "
-             f"block={blocked_hits} ({ratio:.1%})")
-        if sev_str:
-            sub(f"Severity breakdown: {sev_str}")
-
         return {
-            "threads": threads, "rate": rate,
-            "blocked_hits": blocked_hits, "total_lines": total_lines,
-            "http_responses": http_responses, "block_ratio": round(ratio, 4),
-            "findings": findings, "file_txt": str(nout), "file_json": str(njson),
-            "severity_counts": sev_counts,
-            "template_path": tpl_path or "built-in",
+            "threads": 0,
+            "rate": 0,
+            "blocked_hits": 0,
+            "total_lines": 0,
+            "http_responses": 0,
+            "block_ratio": 0.0,
+            "findings": 0,
+            "file_txt": "",
+            "file_json": "",
+            "severity_counts": {},
+            "template_path": "disabled",
         }
 
     def stage7_nuclei(self):
-        if _INT.hard():
-            return
-        if not self.auto_nuclei:
-            if not ask_yes_no("Run Nuclei vulnerability scan?"):
-                warn("Nuclei skipped")
-                self.summary["stage7"] = {"status": "skipped", "reason": "user_choice"}
-                return
-        else:
-            info("Nuclei starting (auto mode)")
-        if not tool_exists("nuclei"):
-            warn("nuclei not found")
-            self.summary["stage7"] = {"status": "skipped", "reason": "not_found"}
-            return
-
-        stage(7, "Nuclei Vulnerability Scanning")
-        d          = self.out / "07_nuclei"
-        alive_file = self._cp("stage3_alive")
-        urls_file  = self._cp("stage4_urls")
-        targets    = d / "nuclei_targets.txt"
-
-        src_files = [p for p in [alive_file, urls_file] if p and Path(p).exists() and p.stat().st_size > 0]
-        for sf in src_files:
-            sub(f"Nuclei source: {sf.name} ({_count_lines(sf):,} lines)")
-
-        merged_count = dedup_files_normalized(
-            src_files, targets,
-            filter_fn=lambda u: u.startswith("http"),
-            normalize_fn=(canonicalize_url if bool(_cfg_get(self.cfg, "settings", "canonicalize_urls", default=True)) else None)
-        )
-
-        if merged_count == 0 and alive_file.exists() and alive_file.stat().st_size > 0:
-            shutil.copy2(alive_file, targets)
-            merged_count = _count_lines(targets)
-
-        if merged_count == 0:
-            warn("Nuclei target list empty — skipping")
-            self.summary["stage7"] = {"status": "skipped", "reason": "empty_targets"}
-            return
-
-        ok(f"Nuclei targets: {targets.name} — {merged_count:,} URLs")
-
-        # v6.5: template update (optional, silently fail)
-        sub("Updating nuclei templates (optional)...")
-        try:
-            subprocess.run(
-                ["nuclei", "-update-templates", "-silent"],
-                timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            ok("Templates updated")
-        except Exception:
-            sub("Template update skipped")
-
-        r1 = self._run_nuclei_once(targets, d, run_tag="")
-        thr = float(_cfg_get(self.cfg, "settings", "adaptive_threshold", default=0.18))
-
-        did_rerun = False
-        if r1["total_lines"] > 0 and r1["block_ratio"] >= thr:
-            self._apply_adaptive(f"nuclei block ratio {r1['block_ratio']:.2%}")
-            if self._should_rerun("nuclei") and not _INT.hard():
-                self.reruns["nuclei"] += 1
-                did_rerun = True
-                backoff = float(_cfg_get(self.cfg, "settings", "rerun_backoff", default=0.65))
-                self._apply_adaptive("nuclei rerun backoff", extra_backoff=backoff)
-                self._pause_before_rerun()
-                r2 = self._run_nuclei_once(targets, d, run_tag="_rerun")
-                main_txt = Path(r1["file_txt"])
-                merge_unique_lines(main_txt, [Path(r2["file_txt"])])
-                r1["findings"] = _count_lines(main_txt)
-                r1["rerun"] = r2
-                ok(f"Nuclei rerun merged → {main_txt.name} (total: {r1['findings']})")
-
-        checkpoint(self._cp("stage7_done"),
-                   [f"targets:{merged_count}", f"findings:{r1['findings']}"], "nuclei")
-        info(f"Nuclei targets: {merged_count:,}  | findings: {r1['findings']}")
-
-        self.summary["stage7"] = {
-            "status":          "done",
-            "targets":         merged_count,
-            "findings":        r1["findings"],
-            "file":            r1["file_txt"],
-            "file_json":       r1["file_json"],
-            "threads":         r1["threads"],
-            "rate":            r1["rate"],
-            "block_ratio":     r1["block_ratio"],
-            "severity_counts": r1.get("severity_counts", {}),
-            "template_path":   r1.get("template_path", "?"),
-            "did_rerun":       did_rerun,
-        }
-        if did_rerun:
-            self.summary["stage7"]["rerun"] = r1.get("rerun", {})
+        stage(7, "Nuclei Vulnerability Scan — Disabled")
+        warn("Stage 7 (Nuclei) is disabled in this build")
+        self.summary["stage7"] = {"status": "disabled", "reason": "nuclei-removed"}
+        return
 
     # ── HTML Report ───────────────────────────────────────────────────────────
     def _read_text_safe(self, p: Path, limit_bytes: int = 50_000_000) -> str:
@@ -2078,120 +2078,12 @@ class ReconPipeline:
         except Exception as e:
             return f"[ERROR reading {p}: {e}]\n"
 
-    def _parse_nuclei_by_severity(self, txt: str) -> dict:
-        """
-        Nuclei çıktısını severity'e göre grupla.
-        Her satırı yapısal dict'e çevir: {sev, template, host, line_raw}
-        """
-        groups = {"critical": [], "high": [], "medium": [], "low": [], "info": [], "other": []}
-        for raw_line in txt.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            m = re.search(r'\[(critical|high|medium|low|info)\]', line, re.I)
-            sev = m.group(1).lower() if m else "other"
-            # template adını çıkar: [template-name]
-            tpl_m = re.search(r'^\[([^\]]+)\]', line)
-            tpl   = tpl_m.group(1) if tpl_m else ""
-            # URL çıkar
-            url_m = re.search(r'https?://\S+', line)
-            url   = url_m.group(0).rstrip("[]()") if url_m else ""
-            groups[sev].append({"line": line, "template": tpl, "url": url})
-        return groups
-
-    def _parse_dalfox_findings(self, txt: str) -> list:
-        """
-        Dalfox çıktısını parse et.
-        Her bulgu için: {line_raw, poc_url, param, payload_type}
-        PoC URL'yi payload'dan arındırarak güvenli gösterim URL'si üret.
-        """
-        findings = []
-        for raw_line in txt.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            # Dalfox çıktı formatları:
-            # [POC][G] GET http://... / [POC][R] Reflected ...
-            # [V] Verified ... http://...
-            poc_type = ""
-            if "[POC]" in line:
-                if "[G]" in line:  poc_type = "GET"
-                elif "[R]" in line: poc_type = "Reflected"
-                elif "[V]" in line: poc_type = "Verified"
-                else:               poc_type = "POC"
-            elif line.startswith("[V]") or "[Verified]" in line:
-                poc_type = "Verified"
-
-            # Ham URL (payload içerebilir)
-            url_m = re.search(r'https?://\S+', line)
-            raw_url = url_m.group(0).rstrip("[](),") if url_m else ""
-
-            # Güvenli görüntüleme URL'si: payload kısmını temizle
-            # query param'daki XSS payload değerlerini "<PAYLOAD>" ile değiştir
-            safe_url = raw_url
-            if raw_url:
-                try:
-                    p = urlparse(raw_url)
-                    qs = parse_qsl(p.query, keep_blank_values=True)
-                    # XSS belirteçlerini içeren param değerlerini maskele
-                    _xss_indicators = re.compile(
-                        r'<|>|script|alert|onerror|onload|javascript|svg|img|'
-                        r'&#|%3c|%3e|prompt|confirm|eval|document\.', re.I)
-                    clean_qs = []
-                    for k, v in qs:
-                        if _xss_indicators.search(v):
-                            clean_qs.append((k, "[XSS_PAYLOAD]"))
-                        else:
-                            clean_qs.append((k, v))
-                    safe_url = urlunparse((
-                        p.scheme, p.netloc, p.path, p.params,
-                        urlencode(clean_qs), ""
-                    ))
-                except Exception:
-                    safe_url = raw_url
-
-            # Parametre adını çıkar
-            param_m = re.search(r'(?:param|parameter)[=:\s]+([a-zA-Z0-9_\-]+)', line, re.I)
-            if not param_m:
-                # URL'den ilk değişen param'ı bul
-                try:
-                    p2 = urlparse(raw_url)
-                    qs2 = parse_qsl(p2.query, keep_blank_values=True)
-                    _xss_ind2 = re.compile(r'<|>|script|alert|onerror', re.I)
-                    for k2, v2 in qs2:
-                        if _xss_ind2.search(v2):
-                            param_m = type("m", (), {"group": lambda self, n: k2})()
-                            break
-                except Exception:
-                    pass
-            param = param_m.group(1) if param_m and hasattr(param_m, "group") else ""
-
-            findings.append({
-                "line":     line,
-                "poc_type": poc_type,
-                "raw_url":  raw_url,
-                "safe_url": safe_url,
-                "param":    param,
-            })
-        return findings
-
     def build_full_report(self) -> Path:
         rp = self.out / "reconx_full_report.html"
 
-        xss_file    = Path(self.summary.get("stage6", {}).get("file", "")) if isinstance(self.summary.get("stage6", {}), dict) else None
-        nuclei_file = Path(self.summary.get("stage7", {}).get("file", "")) if isinstance(self.summary.get("stage7", {}), dict) else None
-
-        xss_raw_txt  = self._read_text_safe(xss_file)    if xss_file    else ""
-        nuclei_txt   = self._read_text_safe(nuclei_file) if nuclei_file else ""
-
-        # Parse
-        nuc_groups   = self._parse_nuclei_by_severity(nuclei_txt)
-        nuc_severity = self.summary.get("stage7", {}).get("severity_counts", {})
-        xss_findings = self._parse_dalfox_findings(xss_raw_txt)
-
         stage4   = self._cp("stage4_urls")
         urls_txt = self._read_text_safe(stage4)
+        auth_urls_txt = self._read_text_safe(self._cp("stage8_authenticated_urls"))
 
         def esc(s): return html.escape(str(s) or "")
 
@@ -2203,9 +2095,8 @@ class ReconPipeline:
 
         _s3_count    = esc(str((self.summary.get("stage3") or {}).get("count", "?")))
         _s4_count    = esc(str((self.summary.get("stage4") or {}).get("count", "?")))
-        _s6_findings = esc(str((self.summary.get("stage6") or {}).get("total_findings", "?")))
-        _s7_findings = esc(str((self.summary.get("stage7") or {}).get("findings", "?")))
-        _tpl_path    = esc(str((self.summary.get("stage7") or {}).get("template_path", "?")))
+        _s8_count    = esc(str((self.summary.get("stage8") or {}).get("count", "?")))
+        _auth_status = esc(self.auth_status)
 
         meta = {
             "target":               self.target,
@@ -2214,194 +2105,10 @@ class ReconPipeline:
             "block_ratio_httpx":    self.block_ratio,
             "waf_fingerprint":      self.waf_fingerprint,
             "adaptive_events":      self.adaptive_events,
+            "auth_status":          self.auth_status,
+            "auth_cookie_names":    list(self.auth_cookies.keys()),
             "stages":               self.summary,
         }
-
-        sev_colors = {
-            "critical": "#ff4444", "high": "#ff7700",
-            "medium":   "#ffcc00", "low":  "#4499ff",
-            "info":     "#666e7a", "other": "#555e6a",
-        }
-
-        def _sev_badge(sev: str, cnt: int) -> str:
-            if cnt == 0:
-                return ""
-            col = sev_colors.get(sev, "#888")
-            return (f'<span style="background:{col};color:#fff;padding:3px 10px;'
-                    f'border-radius:999px;font-size:11px;font-weight:bold;margin:2px">'
-                    f'{sev.upper()} {cnt}</span>')
-
-        # Sadece critical/high/medium/low göster — info default gizli
-        sev_badges = "".join([
-            _sev_badge(s, nuc_severity.get(s, 0))
-            for s in ["critical", "high", "medium", "low"]
-        ])
-        info_cnt = nuc_severity.get("info", 0)
-        if info_cnt > 0:
-            sev_badges += (
-                f'<span style="background:#2a2a3a;color:#666e7a;padding:3px 10px;'
-                f'border-radius:999px;font-size:11px;margin:2px" title="info findings hidden by default">'
-                f'INFO {info_cnt} (hidden)</span>'
-            )
-
-        # ── Nuclei bölümü: info kapalı, diğerleri açık ───────────────────────
-        def _nuclei_section_html() -> str:
-            parts = []
-            # Önemli severity'ler önce
-            for sev in ["critical", "high", "medium", "low"]:
-                items = nuc_groups.get(sev, [])
-                if not items:
-                    continue
-                col      = sev_colors[sev]
-                is_open  = "open" if sev in ("critical", "high", "medium") else ""
-                rows = []
-                for it in items:
-                    tpl  = esc(it.get("template", ""))
-                    url  = it.get("url", "")
-                    line = esc(it.get("line", ""))
-                    url_html = (
-                        f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer" '
-                        f'style="color:#7dd3fc;word-break:break-all">{esc(url)}</a>'
-                    ) if url else ""
-                    rows.append(
-                        f'<tr>'
-                        f'<td style="padding:4px 8px;color:{col};font-weight:bold;white-space:nowrap">'
-                        f'[{sev.upper()}]</td>'
-                        f'<td style="padding:4px 8px;color:#a8b4c4">{tpl}</td>'
-                        f'<td style="padding:4px 8px">{url_html if url_html else f"<code>{line}</code>"}</td>'
-                        f'</tr>'
-                    )
-                table = (
-                    '<table style="width:100%;border-collapse:collapse;font-size:12px">'
-                    '<thead><tr>'
-                    '<th style="text-align:left;padding:4px 8px;color:#64748b">Sev</th>'
-                    '<th style="text-align:left;padding:4px 8px;color:#64748b">Template</th>'
-                    '<th style="text-align:left;padding:4px 8px;color:#64748b">URL / Detail</th>'
-                    '</tr></thead><tbody>'
-                    + "".join(rows)
-                    + '</tbody></table>'
-                )
-                parts.append(
-                    f'<details {is_open}>'
-                    f'<summary style="color:{col};font-weight:bold;cursor:pointer;padding:6px 0">'
-                    f'[{sev.upper()}] — {len(items)} findings</summary>'
-                    f'<div style="margin-top:6px">{table}</div>'
-                    f'</details>'
-                )
-
-            # info: varsayılan KAPALI, çok fazla gürültü
-            info_items = nuc_groups.get("info", [])
-            if info_items:
-                rows_info = []
-                for it in info_items:
-                    tpl  = esc(it.get("template", ""))
-                    url  = it.get("url", "")
-                    line = esc(it.get("line", ""))
-                    url_html = (
-                        f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer" '
-                        f'style="color:#7dd3fc">{esc(url)}</a>'
-                    ) if url else f"<code>{line}</code>"
-                    rows_info.append(
-                        f'<tr><td style="padding:3px 8px;color:#666e7a">[INFO]</td>'
-                        f'<td style="padding:3px 8px;color:#555e6a">{tpl}</td>'
-                        f'<td style="padding:3px 8px;color:#555e6a">{url_html}</td></tr>'
-                    )
-                table_info = (
-                    '<table style="width:100%;border-collapse:collapse;font-size:11px">'
-                    '<thead><tr>'
-                    '<th style="text-align:left;padding:3px 8px;color:#3a3a4a">Sev</th>'
-                    '<th style="text-align:left;padding:3px 8px;color:#3a3a4a">Template</th>'
-                    '<th style="text-align:left;padding:3px 8px;color:#3a3a4a">URL</th>'
-                    '</tr></thead><tbody>'
-                    + "".join(rows_info)
-                    + '</tbody></table>'
-                )
-                parts.append(
-                    f'<details>'  # kapalı başlıyor
-                    f'<summary style="color:#555e6a;cursor:pointer;padding:6px 0;font-size:12px">'
-                    f'[INFO] — {len(info_items)} findings (click to expand, usually noise)</summary>'
-                    f'<div style="margin-top:4px">{table_info}</div>'
-                    f'</details>'
-                )
-
-            return "\n".join(parts) if parts else '<p style="color:#555e6a">(no findings)</p>'
-
-        # ── XSS bölümü ───────────────────────────────────────────────────────
-        _UNSAFE_PROTO = re.compile(r'^(javascript|data|vbscript)\s*:', re.I)
-
-        def _safe_href(url: str) -> str:
-            """
-            URL'yi href'e koymak güvenli mi?
-            - https:// veya http:// ile başlıyorsa → doğrudan tıklanabilir link.
-              Payload query string içinde olsa da href attribute'unda çalışmaz,
-              browser URL'yi hedef siteye GETler — rapor içinde execute etmez.
-            - javascript: / data: / vbscript: → href'e girmesin, sadece metin göster.
-            """
-            stripped = url.strip()
-            if _UNSAFE_PROTO.match(stripped):
-                return ""   # tıklanabilir yapma
-            if stripped.startswith(("https://", "http://")):
-                return stripped
-            return ""
-
-        def _xss_section_html() -> str:
-            if not xss_findings:
-                return '<p style="color:#555e6a">(no XSS findings)</p>'
-
-            rows = []
-            for idx, f in enumerate(xss_findings):
-                poc_type = esc(f.get("poc_type", ""))
-                param    = esc(f.get("param", ""))
-                raw_url  = f.get("raw_url", "")
-                line_raw = esc(f.get("line", ""))
-
-                row_col = (
-                    "#ff4444" if f.get("poc_type") == "Verified" else
-                    "#ff7700" if f.get("poc_type") in ("GET", "Reflected") else
-                    "#ffcc00"
-                )
-
-                # Ham PoC URL'yi doğrudan link yap — sadece javascript:/data: engelle
-                clickable_href = _safe_href(raw_url)
-
-                if clickable_href:
-                    url_cell = (
-                        f'<a href="{esc(clickable_href)}" target="_blank" '
-                        f'rel="noopener noreferrer" '
-                        f'style="color:#7dd3fc;word-break:break-all;font-size:11px">'
-                        f'{esc(raw_url)}'
-                        f'</a>'
-                    )
-                elif raw_url:
-                    # javascript: veya data: payload — tıklanamaz metin olarak göster
-                    url_cell = (
-                        f'<code style="font-size:10px;color:#e06c75;word-break:break-all;'
-                        f'user-select:all">{esc(raw_url)}</code>'
-                        f'<span style="color:#555;font-size:10px;margin-left:6px">'
-                        f'[javascript:/data: — copy manually]</span>'
-                    )
-                else:
-                    url_cell = f'<code style="color:#555">{line_raw}</code>'
-
-                rows.append(
-                    f'<tr style="border-bottom:1px solid #1a2030">'
-                    f'<td style="padding:8px;color:{row_col};font-weight:bold;'
-                    f'white-space:nowrap;vertical-align:top">#{idx+1} {poc_type}</td>'
-                    f'<td style="padding:8px;color:#a8b4c4;vertical-align:top">{param or "?"}</td>'
-                    f'<td style="padding:8px;vertical-align:top">{url_cell}</td>'
-                    f'</tr>'
-                )
-
-            return (
-                '<table style="width:100%;border-collapse:collapse;font-size:12px">'
-                '<thead style="background:#0b1220"><tr>'
-                '<th style="text-align:left;padding:8px;color:#64748b">Type</th>'
-                '<th style="text-align:left;padding:8px;color:#64748b">Param</th>'
-                '<th style="text-align:left;padding:8px;color:#64748b">PoC URL</th>'
-                '</tr></thead><tbody>'
-                + "".join(rows)
-                + '</tbody></table>'
-            )
 
         html_doc = f"""<!doctype html>
 <html lang="en">
@@ -2411,7 +2118,7 @@ class ReconPipeline:
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none';
                img-src data:; connect-src 'none'; form-action 'none';" />
-<title>ReconX v6.6 Report — {esc(self.target)}</title>
+<title>ReconX v6.8 Report — {esc(self.target)}</title>
 <style>
   * {{ box-sizing: border-box; }}
   body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
@@ -2431,27 +2138,17 @@ class ReconPipeline:
   .stat .label {{ font-size: 11px; color: #4a5568; text-transform: uppercase;
                   letter-spacing: .08em; margin-bottom: 4px; }}
   .stat .value {{ font-size: 28px; font-weight: 700; color: #e2e8f0; }}
-  .pill   {{ display: inline-block; padding: 3px 10px; border-radius: 999px;
-             background: #111b2a; border: 1px solid #1f2a37;
-             font-size: 11px; color: #94a3b8; }}
-  details summary {{ padding: 6px 0; user-select: none; }}
-  details + details {{ margin-top: 4px; }}
-  table   {{ border-spacing: 0; }}
-  tr:hover td {{ background: rgba(255,255,255,.02); }}
-  a {{ text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
   code {{ background: #0b1220; padding: 2px 5px; border-radius: 4px; }}
-  .xss-badge {{ display:inline-block; padding:2px 8px; border-radius:6px;
-                font-size:10px; font-weight:bold; margin-right:4px; }}
 </style>
 </head>
 <body>
 
-<h1>ReconX v6.6 — Security Report</h1>
+<h1>ReconX v6.7 — Security Report</h1>
 <div class="muted">
   Target: <strong style="color:#e2e8f0">{esc(self.target)}</strong>
   &nbsp;·&nbsp; {esc(self.ts)}
   &nbsp;·&nbsp; WAF: {esc(", ".join(self.waf_fingerprint) or "none detected")}
+  &nbsp;·&nbsp; Auth session: <strong>{_auth_status}</strong>
 </div>
 
 <!-- Stats -->
@@ -2465,42 +2162,20 @@ class ReconPipeline:
     <div class="value">{_s4_count}</div>
   </div>
   <div class="stat">
-    <div class="value" style="color:{'#ff4444' if int((self.summary.get('stage6') or {{}}).get('total_findings') or 0) > 0 else '#e2e8f0'}">{_s6_findings}</div>
-    <div class="label">XSS Findings</div>
+    <div class="label">Authenticated URLs</div>
+    <div class="value">{_s8_count}</div>
   </div>
   <div class="stat">
-    <div class="value" style="color:{'#ff4444' if int((self.summary.get('stage7') or {{}}).get('findings') or 0) > 0 else '#e2e8f0'}">{_s7_findings}</div>
-    <div class="label">Nuclei Findings</div>
+    <div class="label">Security Scans</div>
+    <div class="value">Disabled</div>
   </div>
 </div>
 
-<!-- Nuclei severity overview -->
+<!-- Authenticated URLs -->
 <div class="card">
-  <h2>Nuclei — Severity Overview</h2>
-  <div style="margin: 4px 0 10px">{sev_badges if sev_badges else '<span class="muted">No findings</span>'}</div>
-  <div class="muted">Templates: {_tpl_path} &nbsp;·&nbsp; Source: {esc(str(nuclei_file))}</div>
-</div>
-
-<!-- Nuclei findings (info collapsed) -->
-<div class="card">
-  <h2>Nuclei — Findings</h2>
-  <div class="scroll">
-    {_nuclei_section_html()}
-  </div>
-</div>
-
-<!-- XSS findings — safe table, no live payloads -->
-<div class="card">
-  <h2>XSS — Dalfox Findings</h2>
-  <div style="background:#1a0a0a;border:1px solid #3a1a1a;border-radius:8px;
-              padding:8px 12px;margin-bottom:12px;font-size:12px;color:#f87171">
-    ⚠ PoC URL'leri doğrudan tıklanabilir — yeni sekmede hedef siteye açılır.
-    <code>javascript:</code> / <code>data:</code> payload'ları tıklanamaz metin olarak gösterilir.
-    Rapor kendi içinde hiçbir payload execute etmez (CSP: script-src 'none').
-  </div>
-  <div class="scroll">
-    {_xss_section_html()}
-  </div>
+  <h2>Authenticated (Post-Login) URLs</h2>
+  <div class="muted">Login status: {_auth_status} — cookies: {esc(", ".join(self.auth_cookies.keys()) or "none")}</div>
+  <div class="scroll"><pre style="font-size:11px">{esc(auth_urls_txt) or "(no authenticated URLs collected)"}</pre></div>
 </div>
 
 <!-- URLs -->
@@ -2540,6 +2215,8 @@ class ReconPipeline:
                 "block_ratio_httpx":   self.block_ratio,
                 "waf_fingerprint":     self.waf_fingerprint,
                 "adaptive_events":     self.adaptive_events,
+                "auth_status":         self.auth_status,
+                "auth_cookie_names":   list(self.auth_cookies.keys()),
                 "stages":              self.summary,
                 "output_dir":          str(self.out)
             }
@@ -2583,19 +2260,6 @@ class ReconPipeline:
             print(f"  {C.BLUE}FULL Report : {full_report}{C.RESET}")
         print(f"  {C.BLUE}Log         : {self.out}/pipeline.log{C.RESET}\n")
 
-        # v6.5: findings özeti
-        xss_cnt = (self.summary.get("stage6") or {}).get("total_findings", 0)
-        nuc_cnt = (self.summary.get("stage7") or {}).get("findings", 0)
-        nuc_sev = (self.summary.get("stage7") or {}).get("severity_counts", {})
-        if xss_cnt or nuc_cnt:
-            print(f"\n{C.RED}{C.BOLD}  ⚠  FINDINGS SUMMARY{C.RESET}")
-            if xss_cnt:
-                print(f"  {C.RED}XSS (Dalfox)  : {xss_cnt}{C.RESET}")
-            if nuc_cnt:
-                sev_str = " | ".join([f"{k.upper()}:{v}" for k, v in nuc_sev.items() if v > 0])
-                print(f"  {C.RED}Nuclei        : {nuc_cnt}  [{sev_str}]{C.RESET}")
-            print()
-
     # ── Stage 0 — URL seed ────────────────────────────────────────────────────
     def stage0_seed_urls(self):
         stage(0, "URL Seed Mode (-u/--single)")
@@ -2638,17 +2302,30 @@ class ReconPipeline:
         all_s = {
             1: self.stage1_recon,      2: self.stage2_subdomains,
             3: self.stage3_alive,      4: self.stage4_urls,
-            5: self.stage5_categorise, 6: self.stage6_xss,
-            7: self.stage7_nuclei,
+            5: self.stage5_categorise, 8: self.stage8_authenticated_crawl,
         }
+
+        # Login her zaman en basta calisir (istenirse) — diger stage'ler
+        # authenticated cookie'yi kullanabilsin diye.
+        wants_login = bool(self.login_url or self.raw_cookie or self.request_file)
+        if wants_login:
+            self.stageL_login()
+
         if self.url_targets:
             if (not self.resume or not self._cp_ok("stage1_done")) and (not stages or 1 in stages):
                 self.stage1_recon()
             if not self.resume or not self._cp_ok("stage3_alive"):
                 self.stage0_seed_urls()
-            run_stages = stages or [4, 5, 6, 7]
+            run_stages = stages or [4, 5]
         else:
-            run_stages = stages or list(range(1, 8))
+            run_stages = stages or list(range(1, 6))
+
+        # authenticated crawl istegi varsa ve stage listesi kullanici tarafindan
+        # daraltilmadiysa otomatik olarak sona eklenir.
+        if wants_login and self.has_auth() and (stages is None or 8 in stages):
+            if 8 not in run_stages:
+                run_stages = list(run_stages) + [8]
+
         try:
             for n in run_stages:
                 if _INT.hard():
@@ -2678,6 +2355,9 @@ def legal_warning():
   {'─'*56}
   This tool may only be used on AUTHORIZED targets under
   a valid bug bounty program. Unauthorized use is illegal.
+  Login/authenticated scanning requires that you own the
+  account or have explicit written authorization to test
+  with the provided credentials.
   {'─'*56}{C.RESET}""")
     try:
         ans = input(f"  {C.BOLD}I confirm I have authorization (yes/no): {C.RESET}").strip().lower()
@@ -2700,23 +2380,22 @@ def main():
     ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║██╔╝ ██╗                                                                                                                                      
     ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝ 
   ╔══════════════════════════════════════════════════════╗
-  ║  ReconX Sequential Scanner v6.0                      ║
-  ║  Recon → Subs → Alive → URLs → Cats → XSS → Nuclei   ║
-  ║  +template-discovery · +severity-filter · +BXSS      ║
+  ║  ReconX Sequential Scanner v6.8                      ║
+  ║  Recon → Subs → Alive → URLs → Cats → Auth-Crawl       ║
+  ║  (XSS/Nuclei removed · Login/session support added)    ║
   ╚══════════════════════════════════════════════════════╝{C.RESET}""")
 
-    p = argparse.ArgumentParser(description="ReconX Bug Bounty Scanner v6.5")
+    p = argparse.ArgumentParser(description="ReconX Bug Bounty Scanner v6.8")
     p.add_argument("-d", "--domain",    required=False, default=None)
     p.add_argument("-u", "--url",       nargs="+", dest="urls", metavar="URL")
     p.add_argument("-U", "--url-file",  dest="url_file", metavar="FILE")
     p.add_argument("--single",          dest="single", metavar="TARGET")
     p.add_argument("-s", "--stages",    nargs="+", type=int)
-    for i in range(1, 8):
+    for i in range(1, 6):
         p.add_argument(f"--stage{i}", action="store_true", help=f"Run only stage {i}")
+    p.add_argument("--stage8",          action="store_true", help="Run only stage 8 (authenticated crawl)")
     p.add_argument("--resume",          action="store_true")
     p.add_argument("--no-legal",        action="store_true")
-    p.add_argument("--auto-nuclei",     action="store_true")
-    p.add_argument("--auto-xss",        action="store_true")
     p.add_argument("--config",          default=str(CFG_FILE))
     # v6.5: CLI overrides
     p.add_argument("--nuclei-templates", dest="nuclei_templates", default=None,
@@ -2725,18 +2404,40 @@ def main():
                    help="Nuclei severity filter (e.g. critical,high,medium)")
     p.add_argument("--blind",           dest="blind_cb", default=None,
                    help="Blind XSS callback URL for Dalfox")
+
+    # ── v6.7: Login / authenticated session parametreleri ──────────────────
+    auth_grp = p.add_argument_group("Authenticated scanning")
+    auth_grp.add_argument("--login-url", dest="login_url", default=None,
+                           help="Login form URL (e.g. https://target.com/login)")
+    auth_grp.add_argument("--login-user", dest="login_user", default=None,
+                           help="Username/email for login")
+    auth_grp.add_argument("--login-pass", dest="login_pass", default=None,
+                           help="Password for login")
+    auth_grp.add_argument("--login-user-field", dest="login_user_field", default="username",
+                           help="Form field name for username (default: username)")
+    auth_grp.add_argument("--login-pass-field", dest="login_pass_field", default="password",
+                           help="Form field name for password (default: password)")
+    auth_grp.add_argument("--login-method", dest="login_method", default="POST",
+                           choices=["POST", "GET", "post", "get"],
+                           help="HTTP method used to submit the login form")
+    auth_grp.add_argument("--login-extra-field", dest="login_extra_fields", action="append",
+                           default=[], metavar="KEY=VALUE",
+                           help="Additional static form field, repeatable (e.g. --login-extra-field remember=1)")
+    auth_grp.add_argument("--login-success-indicator", dest="login_success_indicator", default=None,
+                           help="String expected in response body/URL on successful login (e.g. 'Logout' or '/dashboard')")
+    auth_grp.add_argument("--login-failure-indicator", dest="login_failure_indicator", default=None,
+                           help="String indicating failed login (e.g. 'Invalid credentials')")
+    auth_grp.add_argument("--login-csrf-field", dest="login_csrf_field", default=None,
+                           help="Override CSRF token field name if auto-detection guesses wrong")
+    auth_grp.add_argument("--cookie", dest="raw_cookie", default=None,
+                           help="Use a raw 'k=v; k2=v2' cookie header directly instead of/in addition to login")
+    auth_grp.add_argument("-r", "--request", dest="request_file", default=None, metavar="FILE",
+                           help="Replay a captured raw HTTP login request (Burp/ZAP/sqlmap-style -r file)")
+
     args = p.parse_args()
 
     cfg = load_config(Path(args.config))
     default_scheme = (_cfg_get(cfg, "settings", "default_scheme", default="https") or "https").strip()
-
-    # v6.5: CLI → config override
-    if args.nuclei_templates:
-        cfg.setdefault("tools", {})["nuclei_templates"] = args.nuclei_templates
-    if args.severity:
-        cfg.setdefault("tools", {})["nuclei_severity"] = args.severity
-    if args.blind_cb:
-        cfg.setdefault("tools", {})["blind_xss_callback"] = args.blind_cb
 
     url_targets = []
     if args.single:
@@ -2756,7 +2457,9 @@ def main():
     url_targets = [u for u in url_targets if u]
     url_targets = list(dict.fromkeys(url_targets))
 
-    stage_flags = [i for i in range(1, 8) if getattr(args, f"stage{i}")]
+    stage_flags = [i for i in range(1, 6) if getattr(args, f"stage{i}")]
+    if getattr(args, "stage8", False):
+        stage_flags.append(8)
     if stage_flags and args.stages:
         stages = sorted(set(stage_flags + list(args.stages)))
     elif stage_flags:
@@ -2772,18 +2475,51 @@ def main():
                 info(f"Domain auto-detected: {domain}")
             else:
                 err("Domain could not be detected — use -d"); sys.exit(1)
+        elif args.login_url:
+            domain = _extract_domain_from_any(args.login_url)
+            if domain:
+                info(f"Domain auto-detected from login URL: {domain}")
+            else:
+                err("Domain could not be detected — use -d"); sys.exit(1)
+        elif args.request_file:
+            try:
+                _req_meta = parse_request_file(args.request_file, default_scheme=default_scheme)
+                domain = _extract_domain_from_any(_req_meta.get("url", ""))
+                if domain:
+                    info(f"Domain auto-detected from request file: {domain}")
+                else:
+                    err("Domain could not be detected from request file — use -d"); sys.exit(1)
+            except Exception as e:
+                err(f"--request parse failed: {e}"); sys.exit(1)
         else:
             err("-d / --domain required (or -u/--single with a URL)"); sys.exit(1)
 
     if not args.no_legal:
         legal_warning()
 
+    # --login-extra-field KEY=VALUE listesini dict'e cevir
+    extra_fields = {}
+    for kv in (args.login_extra_fields or []):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            extra_fields[k.strip()] = v.strip()
+
     ReconPipeline(
         domain, cfg,
         resume=args.resume,
-        auto_nuclei=args.auto_nuclei,
-        auto_xss=args.auto_xss,
         url_targets=url_targets if url_targets else None,
+        login_url=args.login_url,
+        login_user=args.login_user,
+        login_pass=args.login_pass,
+        login_user_field=args.login_user_field,
+        login_pass_field=args.login_pass_field,
+        login_extra_fields=extra_fields,
+        login_method=args.login_method,
+        login_success_indicator=args.login_success_indicator or "",
+        login_failure_indicator=args.login_failure_indicator or "",
+        login_csrf_field=args.login_csrf_field or "",
+        raw_cookie=args.raw_cookie,
+        request_file=args.request_file,
     ).run(stages=stages)
 
 if __name__ == "__main__":
