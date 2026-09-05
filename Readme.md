@@ -1,283 +1,202 @@
+# 🔍 ReconX v8.6
 
-# 🔍 ReconX v6.0  
-### Sequential Bug Bounty Reconnaissance Pipeline
+### Sequential Bug-Bounty Reconnaissance & Vulnerability Pipeline
 
-ReconX is a stage-based, automation-first reconnaissance framework designed for authorized bug bounty and penetration testing engagements.
+ReconX is a stage-based, automation-first recon and scanning framework for
+**authorized** bug-bounty and penetration-testing engagements. One command
+takes a domain from zero to an interactive HTML report: subdomains, live
+hosts, URL corpus, parameter discovery, XSS, nuclei (templates **+ DAST
+fuzzing**), SQL injection, JS-secret mining, tech fingerprinting and API
+discovery.
 
-Pipeline:
-Recon → Subdomains → Alive → URLs → Categorize → Nuclei → XSS
-
----
-
-## ⚠️ Legal Disclaimer
-
-This tool must only be used on targets you are explicitly authorized to test.  
-Unauthorized scanning is illegal.
-
-Use `--no-legal` only in CI or fully authorized automated environments.
-
-
-![s0](https://github.com/user-attachments/assets/3e2bbcc1-75c2-4e75-9aaa-16e367a808f4)
-
-
-
-==== The Proccess will working for each tools and steages ====
-
-![process](https://github.com/user-attachments/assets/36e22773-8408-451d-a4d7-568f11b68dae)
-
-
-=== Founds Xss ===
-<img width="1289" height="748" alt="3" src="https://github.com/user-attachments/assets/1f27ac99-8d51-431a-bc81-f707f1b125db" />
-
-
-====== The Last Report Will create and showing on browser =====
-
-![dashboard](https://github.com/user-attachments/assets/8598948a-5633-4875-95bb-a17197ea949e)
-
-
-===== Thread Map for all subdoamins ======
-![s2](https://github.com/user-attachments/assets/9c92fbad-fb9c-43de-aa18-a6e7e4fc1469)
-
-
-
-
-==== Alive Hosts ====
-![s5](https://github.com/user-attachments/assets/c03bac8a-ae72-4370-882a-2290b040fc1d)
-
-
-
-==== All Urls =====
-
-![s6](https://github.com/user-attachments/assets/3d19b0c4-4075-4b3a-a699-26ce5e77052b)
-
-
-==== Parameters ====
-![s7](https://github.com/user-attachments/assets/214d418e-a28e-4a57-ab87-5fec514f498d)
-
-
-
-==== Categorised =====
-![s8](https://github.com/user-attachments/assets/36856679-894e-4cb7-99b5-96f6d48d2bda)
-
-=====  Founds Xss && Poc =====
-
-![s9](https://github.com/user-attachments/assets/51c48778-211a-46ed-8953-27aff252c2f7)
-<img width="1603" height="746" alt="image" src="https://github.com/user-attachments/assets/97177540-00e7-4632-bbf6-31e1d615b7f1" />
-
-
-==== Nuclei Vulns =====
-
-![s10](https://github.com/user-attachments/assets/ea43bd00-41ef-49fa-a976-aab867bb4f08)
-
-
+```
+Recon → Subdomains → Alive → URLs → Params → Categorise →
+XSS/Dalfox → Nuclei + DAST → Auth-Crawl → JS-Secrets →
+Tech-Priority → Extra-Checks → API-Discovery → SQLi/sqlmap
+```
 
 ---
 
-# ✨ Features
+## ⚠️ Legal
 
-- Stage-based automated recon workflow
-- Resume support via checkpoints
-- RAM-safe streaming URL processing
-- Integrated Nuclei scanning
-- Integrated Dalfox (3 XSS modes)
-- Automatic SUMMARY.json generation
-- Optional HTML report builder
-- Clean structured output
-- Safe Ctrl+C handling
+Use only on targets you are **explicitly authorized** to test (a live bug
+bounty program scope, or written pentest authorization). Unauthorized
+scanning is illegal. `--auto` / `--no-legal` skip the interactive
+confirmation — by passing them you assert you already have authorization.
 
 ---
 
-# 🧱 Pipeline Stages
+## ✨ What's new in v8.x
 
-| Stage | Name | Description |
-|-------|------|-------------|
-| 1 | Initial Recon | Whois, WhatWeb, WAF detection, Nmap, TheHarvester, Shodan |
-| 2 | Subdomain Enumeration | Subfinder, Assetfinder, Amass, etc |
-| 3 | Alive Detection | httpx probing & fingerprinting |
-| 4 | URL Discovery | gau, waybackurls, katana |
-| 5 | Categorization | Reflection detection & XSS prioritization |
-| 6 | Nuclei Scan | Template-based vulnerability scanning |
-| 7 | XSS Scan | Dalfox standard + DOM + redirect modes |
+- **Nuclei DAST pass** (`-dast`) — after the normal template scan, every
+  parameterised URL is fuzzed for reflected/stored XSS, error- and time-based
+  SQLi, SSTI, LFI, OS-command injection, CRLF and open redirect. This is the
+  pass that produces findings on bespoke, vulnerable-by-design targets that
+  match no CVE template.
+- **Stage 14 — SQL injection (sqlmap)** — active injection testing on the
+  deduped parameterised-URL set; DBMS fingerprint + technique per confirmed
+  point. Interactive-gated, auto-runs under `--auto`.
+- **Stage 13 — API discovery now probes** — GraphQL / Swagger / OpenAPI
+  well-known paths are actually requested; a live introspectable GraphQL
+  endpoint or exposed schema is reported as a concrete hit, not a guess.
+- **DNS resilience** — on networks that block outbound UDP/53 (labs, VPNs,
+  cloud sandboxes) ReconX detects the broken resolver and transparently
+  routes lookups through a bundled DoH forwarder (`reconx_dns.py`), so tools
+  stop silently failing with "could not resolve host".
+- Curated `xss-payloads.txt` (WAF-bypass / context-breakout vectors) fed to
+  Dalfox `--custom-payload` on top of its built-in set.
+- Authenticated scanning: `--login-*`, `--cookie`, or replay a raw Burp/ZAP
+  request with `-r`.
 
 ---
 
-# 📦 Installation
+## 🧱 Pipeline stages
+
+| # | Stage | Tools / action |
+|---|-------|----------------|
+| 1 | Initial Recon | whois, whatweb, wafw00f, nmap, TheHarvester, Shodan, HTTP probe |
+| 2 | Subdomain Enumeration | subfinder, assetfinder, amass, crt.sh fallback |
+| 3 | Alive Detection | httpx probe + fingerprint (status/title/tech/IP/CDN) |
+| 4 | URL Discovery | gau, waybackurls, katana (+ dead-URL pruning) |
+| 5 | Categorisation | reflection detection, XSS-target prioritisation, param extraction |
+| 6 | XSS | Dalfox (standard + DOM mining + custom payloads + blind/interactsh) |
+| 7 | Nuclei | template scan (tech fastpass + severity filter) **+ DAST fuzzing pass** |
+| 8 | Authenticated Crawl | re-crawl behind a logged-in session (if `--login`/`--cookie`) |
+| 9 | Param Discovery | paramspider + arjun (hidden parameters) |
+| 10 | JS Secrets | download + scan JS for keys/tokens/endpoints (trufflehog + regex) |
+| 11 | Tech Priority | normalise detected tech → risk-ranked summary |
+| 12 | Extra Checks | CORS misconfig, subdomain takeover, open cloud buckets |
+| 13 | API Discovery | GraphQL / Swagger / OpenAPI pattern match **+ live probe** |
+| 14 | SQL Injection | sqlmap on deduped parameterised URLs (interactive-gated) |
+
+---
+
+## 📦 Installation
 
 ```bash
 git clone https://github.com/2u1fuk4r/ReconX
 cd ReconX
-sudo bash install.sh
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+sudo bash install.sh          # installs every external tool, idempotent
+python3 -m pip install --break-system-packages -r requirements.txt
+cp config.example.yaml config.yaml     # then add your API keys (or use env vars)
 ```
 
-Ensure required external tools are installed and available in `$PATH`:
-httpx, nuclei, dalfox, subfinder, assetfinder, amass, gau, waybackurls, katana
+`config.yaml` is git-ignored (it holds keys); ReconX also auto-generates a
+default one on first run if it's missing.
 
----
+External tools used (installed by `install.sh`): `httpx`, `subfinder`,
+`nuclei` (+ templates), `katana`, `gau`, `waybackurls`, `dalfox`, `sqlmap`,
+`arjun`, `paramspider`, `interactsh-client`, `trufflehog`, `nmap`, `whatweb`,
+`wafw00f`.
 
-# ⚙️ Configuration (config.yaml)
-
-ReconX loads `config.yaml` from the project root by default.  
-You can override it with:
+Optional — XSS `alert()` verification screenshots:
 
 ```bash
-sudo python reconx.py -d example.com
-sudo python reconx.py -d example.com --single
-python3 reconx.py -d example.com --config ./custom_config.yaml
+python3 -m pip install --break-system-packages playwright && playwright install chromium
 ```
 
 ---
 
-## 🔧 settings
+## 🚀 Usage
+
+```bash
+# Full 14-stage pipeline (interactive confirmations for XSS / Nuclei / SQLi)
+sudo python3 reconX.py -d example.com
+
+# Fully unattended — no prompts (CI / scheduled / background)
+sudo python3 reconX.py -d example.com --auto
+
+# Single URL / URL list (skips subdomain enum, seeds from the URL)
+python3 reconX.py --single https://example.com/
+python3 reconX.py -U targets.txt
+
+# Specific stages only
+python3 reconX.py -d example.com -s 4 5 6 7
+
+# Resume an interrupted scan
+python3 reconX.py -d example.com --resume
+
+# Authenticated scan
+python3 reconX.py -d example.com \
+  --login-url https://example.com/login \
+  --login-user me@example.com --login-pass 'secret' \
+  --login-success-indicator Logout
+python3 reconX.py -d example.com --cookie 'session=abc; csrf=xyz'
+python3 reconX.py -d example.com -r captured_login.txt
+```
+
+---
+
+## ⚙️ Configuration (`config.yaml`)
+
+Loaded from the project root; override with `--config`. Every secret can also
+come from the environment (`RECONX_SHODAN_KEY`, …) — **do not commit real
+keys**.
 
 ```yaml
 settings:
-  threads: 50
-  rate_limit: 5
-  timeout: 10
-```
+  threads: 25
+  rate_limit: 10
+  timeout: 20
+  use_curl_cffi: true          # Cloudflare-friendly TLS fingerprint
+  adaptive_rate: true          # back off automatically on 403/429 spikes
+  prune_dead_urls: true
 
-### threads
-- Controls worker/thread count for httpx, nuclei and dalfox.
-- Higher = faster scans, more CPU/RAM usage.
-- Recommended:
-  - VPS: 80–150
-  - Local machine: 30–80
-  - Stealth mode: 10–30
-
-### rate_limit
-- Controls request rate limiting for nuclei and dalfox.
-- Lower values reduce detection risk.
-- Example:
-  - 1–3 → stealth
-  - 5–10 → balanced
-  - 20+ → aggressive
-
-### timeout
-- HTTP timeout in seconds (used mainly by Dalfox).
-- Increase if scanning slow endpoints.
-- Default 10 is usually safe.
-
----
-
-## 🛠 tools
-
-```yaml
 tools:
-  nuclei_severity: "critical,high,medium"
+  nuclei_severity: critical,high,medium
+  nuclei_dast: true            # Stage 7 DAST fuzzing pass
+  dalfox_custom_payload: "xss-payloads.txt"
+  blind_xss_auto: true         # auto-provision an interactsh OOB callback
+
+  sqli_enabled: true           # Stage 14
+  sqli_max_targets: 25
+  sqli_level: 2                # sqlmap --level
+  sqli_risk: 1                 # sqlmap --risk
+  sqli_timeout_sec: 1800
 ```
 
-### nuclei_severity
-- Defines which severities Nuclei will scan for.
-- Available:
-  - info
-  - low
-  - medium
-  - high
-  - critical
-- Example configurations:
-  - Fast triage: "critical,high"
-  - Deep scan: "critical,high,medium,low"
+### DNS on restricted networks
 
----
+If your box can reach HTTPS but not public DNS (`dig @1.1.1.1` times out),
+ReconX auto-starts `reconx_dns.py`. To make it permanent yourself:
 
-## 🔑 api_keys
-
-```yaml
-api_keys:
-  shodan: "YOUR_SHODAN_KEY"
-```
-
-### shodan
-- Enables Shodan integration in Stage 1 (if binary installed).
-- Leave empty to disable.
-
----
-
-# 🚀 Usage
-
-## Full Pipeline
 ```bash
-sudo python reconx.py -d example.com
-```
-## Sinle Target
-```bash
-sudo python reconx.py -u example.com 
+sudo python3 reconx_dns.py --port 53 &
+sudo chattr -i /etc/resolv.conf 2>/dev/null; echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
 ```
 
-## Run Specific Stages
-```bash
-python3 reconx.py -d example.com -s 1 2 3
-```
+Disable the auto-behaviour with `RECONX_NO_DNS_FIX=1`.
 
-## Resume Scan
-```bash
-python3 reconx.py -d example.com --resume
-```
+---
 
-## Non-Interactive Mode
-```bash
-python3 reconx.py -d example.com --no-legal --auto-nuclei --auto-xss
+## 📁 Output structure
+
+```
+output/<target>_<timestamp>/
+├── 01_recon/        05_categorized/   09_params/       13_api/
+├── 02_subdomains/   06_authenticated/ 10_js_secrets/   14_sqli/
+├── 03_alive/        07_nuclei/        11_tech/         checkpoints/
+├── 04_urls/         07_xss/           12_extra/        pipeline.log
+├── report.html      ← interactive dashboard (opens automatically)
+└── SUMMARY.json     ← machine-readable results
 ```
 
 ---
 
-# 📁 Output Structure
+## ⌨️ Interrupt behaviour
 
-```
-output/<domain>_<timestamp>/
-├── 01_recon/
-├── 02_subdomains/
-├── 03_alive/
-├── 04_urls/
-├── 05_categorized/
-├── 06_nuclei/
-├── 07_xss/
-├── checkpoints/
-├── pipeline.log
-└── SUMMARY.json
-```
-
-- checkpoints → enables resume mode
-- SUMMARY.json → final statistics
-- HTML report generated if report_builder.py exists
+- **First Ctrl+C** → stop the current tool, continue to the next stage.
+- **Rapid second Ctrl+C** → stop everything, still write the report.
 
 ---
 
-# ⌨️ Interrupt Behavior
+## 📄 License
 
-- First Ctrl+C → Stops current tool and continues pipeline
-- Rapid second Ctrl+C → Safe exit + report generation
+MIT
 
----
+## 👤 Author
 
-# 🔒 Security Philosophy
-
-ReconX is designed for:
-
-- Professional bug bounty workflows
-- Reproducible recon methodology
-- Reduced manual tool chaining
-- Clean report-ready output
-
----
-
-# 📄 License
-
-MIT License
-
----
-
-# 👤 Author
-
-Zulfukar Karabulut  
-Security Researcher | Pentester | eWPTX & eCPPT
-
-Linkedin : https://linkedin.com/in/2u1fuk4r
-
----
+**Zulfukar Karabulut** — Security Researcher | Pentester | eWPTX & eCPPT
+[linkedin.com/in/2u1fuk4r](https://linkedin.com/in/2u1fuk4r)
 
 Use responsibly.

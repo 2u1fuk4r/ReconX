@@ -1,0 +1,29 @@
+# Local config (holds API keys) — ship config.example.yaml instead.
+# ReconX auto-generates a fresh config.yaml on first run if missing.
+config.yaml
+
+# ReconX runtime output & scratch
+output/
+results/
+__pycache__/
+*.pyc
+*.log
+install.log
+pipeline.log
+
+# Local tooling / clones
+trufflehog/
+.venv/
+venv/
+
+# Per-engagement artefacts (keep these out of the repo)
+request.txt
+*.oast.*
+/targets*.txt
+/-
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
