@@ -190,17 +190,26 @@ def _tail(alive_fn, proc=None):
 
 
 def _find_orphan_scan():
-    """No marker: look for a live `reconX.py` process."""
+    """No marker: look for a live `python …/reconX.py …` process — matched
+    precisely (argv[0] is a python, argv[1] basename is reconX.py) so a shell
+    that merely mentions reconX.py in a command doesn't count."""
     try:
         import glob
+        me = str(os.getpid())
         for pf in glob.glob("/proc/[0-9]*/cmdline"):
+            pid_s = Path(pf).parent.name
+            if pid_s == me:
+                continue
             try:
-                parts = Path(pf).read_bytes().split(b"\x00")
+                parts = [p for p in Path(pf).read_bytes().split(b"\x00") if p]
             except Exception:
                 continue
-            if any(b"reconX.py" in x for x in parts):
-                pid = int(Path(pf).parent.name)
-                return pid, " ".join(x.decode("utf-8", "replace") for x in parts if x)
+            if len(parts) < 2:
+                continue
+            a0 = os.path.basename(parts[0].decode("utf-8", "replace")).lower()
+            a1 = os.path.basename(parts[1].decode("utf-8", "replace"))
+            if a0.startswith("python") and a1 == "reconX.py":
+                return int(pid_s), " ".join(x.decode("utf-8", "replace") for x in parts)
     except Exception:
         pass
     return None, None
