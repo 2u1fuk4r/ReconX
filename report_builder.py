@@ -390,6 +390,15 @@ def _parse_xss(d) -> dict:
     # v8.2: screenshots of headless-verified ("V" type) XSS findings, replayed
     # and captured by reconx.py's capture_xss_alert_screenshots().
     meta["screenshots"] = st6.get("screenshots") or []
+    # v8.6-fix: also read the on-disk sidecar — survives a partial re-run that
+    # rewrites SUMMARY.json without a stage6 entry.
+    if not meta["screenshots"]:
+        _vf = d / "07_xss" / "xss_verified.json"
+        if _vf.exists():
+            try:
+                meta["screenshots"] = json.loads(_vf.read_text(errors="ignore")) or []
+            except Exception:
+                pass
 
     # v8.5-fix: promote a "Reflected" finding to "Verified (ReconX replay)"
     # when reconx.py's screenshot replay ACTUALLY caught it firing a real
@@ -438,14 +447,28 @@ def _parse_xss(d) -> dict:
         key = _base_key(f.get("url", ""))
         hits_by_base.setdefault(key, []).append(f)
 
+    _V = (_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"])
     tested = []
     for u in tested_urls:
         key = _base_key(u)
         hits = hits_by_base.get(key) or []
+        # one-piece PoC per hit: dalfox's "url" (its "data" field) IS the full
+        # request URL with the payload already substituted into the parameter —
+        # exactly what you paste into a browser. Dedup + keep payload alongside.
+        pocs, seen = [], set()
+        for h in hits:
+            pu = h.get("url", "")
+            if pu and pu not in seen:
+                seen.add(pu)
+                pocs.append({"poc_url": pu, "payload": h.get("payload", ""),
+                             "param": h.get("param", ""), "type": h.get("type", ""),
+                             "confirmed": h.get("type", "") in _V})
         tested.append({
             "url": u,
             "vulnerable": bool(hits),
+            "confirmed": any(p["confirmed"] for p in pocs),
             "payloads": [h.get("payload", "") for h in hits],
+            "pocs": pocs,
             "types": sorted({h.get("type", "") for h in hits if h.get("type")}),
             "severities": sorted({h.get("severity", "") for h in hits if h.get("severity")}),
         })
@@ -1912,32 +1935,48 @@ def _section_xss(xss):
     # findings table alone (which only ever lists hits).
     tested = xss.get("tested") or []
     if tested:
-        vuln_n = sum(1 for t in tested if t["vulnerable"])
-        clean_n = len(tested) - vuln_n
+        vuln = [t for t in tested if t["vulnerable"]]
+        vuln_n, clean_n = len(vuln), len(tested) - len([t for t in tested if t["vulnerable"]])
+
+        # ── VULNERABLE — one row per ready-to-open PoC URL (full, one-piece) ──
+        poc_rows, _seen_poc = [], set()
+        for t in vuln:
+            for p in (t.get("pocs") or []):
+                pu = p.get("poc_url", "")
+                if not pu or pu in _seen_poc:
+                    continue
+                _seen_poc.add(pu)
+                st = ("✅ CONFIRMED (dialog fired)" if p["confirmed"]
+                      else "🔴 reflected — verify context")
+                poc_rows.append([st, p.get("param", ""), p.get("payload", ""), pu, "row-red"])
+        # sort confirmed first
+        poc_rows.sort(key=lambda r: 0 if r[0].startswith("✅") else 1)
+        if poc_rows:
+            body += ('<div class="subsection-label" style="margin-top:22px;margin-bottom:6px">'
+                     f'🔴 Vulnerable — ready-to-open PoC URLs '
+                     f'<span style="color:var(--muted);font-weight:400">({len(poc_rows)} — '
+                     f'each row is a full URL with the payload already in it; click ⧉ to copy the '
+                     f'whole thing, or open it in a browser)</span></div>'
+                     + _vtable(["Status", "Param", "Payload", "Full PoC URL — click ⧉ to copy"],
+                               poc_rows, "vt-xss-poc", row_class=True, copy_cols=[2, 3]))
+
+        # ── all tested (was it even scanned?) ──
         rows_t = []
         for t in tested:
             status = "🔴 VULNERABLE" if t["vulnerable"] else "🟢 clean"
-            # v8.5-fix: same double-truncation issue as the findings table
-            # above — dropped the [:160]/[:200] here so the copy button (and
-            # CSV export) always has the real, complete URL/payload.
-            payloads_s = "; ".join(p for p in t["payloads"] if p)
-            types_s = ", ".join(t["types"])
-            sev_s = ", ".join(t["severities"])
-            cls = "row-red" if t["vulnerable"] else "row-green"
-            rows_t.append([t["url"], status, payloads_s, types_s, sev_s, cls])
+            rows_t.append([t["url"], status, "; ".join(p for p in t["payloads"] if p),
+                           ", ".join(t["types"]), ", ".join(t["severities"]),
+                           "row-red" if t["vulnerable"] else "row-green"])
         body += (f'<div class="subsection-label" style="margin-top:20px;margin-bottom:8px">'
-                 f'All Tested URLs &amp; Payloads <span style="color:var(--muted);font-weight:400">'
-                 f'({len(tested):,} URL(s) sent to dalfox — '
+                 f'All tested URLs <span style="color:var(--muted);font-weight:400">'
+                 f'({len(tested):,} sent to dalfox — '
                  f'<span style="color:var(--red)">{vuln_n:,} vulnerable</span> / '
                  f'<span style="color:var(--green)">{clean_n:,} clean</span>)</span></div>'
-                 f'<div class="cat-desc" style="margin-bottom:10px">Every URL dalfox actually scanned, '
-                 f'not just the ones it flagged. Red rows are confirmed/reflected findings above; '
-                 f'green rows were tested with dalfox\'s full payload set (built-in + custom list) and '
-                 f'came back clean. "Payload(s)" is only populated for vulnerable rows — dalfox does not '
-                 f'report which of the hundreds of clean payloads it tried per parameter, only the ones '
-                 f'that hit.</div>')
-        body += _vtable(["URL", "Status", "Payload(s) that hit", "Type", "Severity"],
-                         rows_t, "vt-xss-all", row_class=True, copy_cols=[0, 2])
+                 f'<div class="cat-desc" style="margin-bottom:10px">Every URL dalfox scanned, so you '
+                 f'can see what was covered. The copyable per-payload PoC URLs are in the red table '
+                 f'above.</div>')
+        body += _vtable(["Base URL", "Status", "Payload(s) that hit", "Type", "Severity"],
+                        rows_t, "vt-xss-all", row_class=True, copy_cols=[0, 2])
 
     raw_txt = (xss.get("raw_txt") or "").strip()
     if raw_txt:

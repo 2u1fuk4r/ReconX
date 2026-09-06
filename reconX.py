@@ -1787,6 +1787,15 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
             pass
     _HEADLESS_CACHE["profiles"] = []
 
+    # v8.6-fix: persist verification results to a file too, not only into
+    # SUMMARY.json's stage6 entry — a later partial run (--resume -s 7) that
+    # rewrites SUMMARY would otherwise erase which findings were confirmed.
+    try:
+        (out_dir / "xss_verified.json").write_text(
+            json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
     confirmed_n = sum(1 for r in results if r["dialog_confirmed"])
     if confirmed_n:
         ok(f"XSS VERIFIED: {confirmed_n:,} finding(s) fired a real dialog in headless Chromium "
@@ -4755,9 +4764,24 @@ class ReconPipeline:
         info(f"Nuclei DAST (fuzzing) {len(param_urls):,} parametreli URL üzerinde — "
              f"XSS/SQLi/SSTI/LFI/cmdi/redirect fuzzing")
         _t0 = time.time()
-        rc, lines, killed, stalled = _stream_tool(
-            cmd, timeout=T.get("nuclei_dast", 7200), log=self.log, label="nuclei-dast",
-            line_cb=None, stall_timeout=600)
+        rc = lines = killed = stalled = None
+        # v8.6-fix: the DAST pass runs right after dalfox has hammered the same
+        # host for minutes — the target's edge (CDN/WAF/ALB) sometimes throttles
+        # it just long enough that nuclei loads templates, gets blocked on the
+        # first requests and exits in <10s with 0 findings, even though the same
+        # command works fine a minute later. Detect that (fast exit + empty
+        # output file) and retry once after a short cooldown.
+        for _try in (1, 2):
+            rc, lines, killed, stalled = _stream_tool(
+                cmd, timeout=T.get("nuclei_dast", 7200), log=self.log, label=f"nuclei-dast{'' if _try == 1 else '-retry'}",
+                line_cb=None, stall_timeout=600)
+            _elapsed = time.time() - _t0
+            _empty = not (json_f.exists() and json_f.stat().st_size > 0)
+            if killed or not _empty or _elapsed > 25 or _try == 2:
+                break
+            warn(f"Nuclei DAST bitti çok hızlı ({_elapsed:.0f}s) ve boş — hedef muhtemelen "
+                 f"kısa süreli rate-limit uyguladı (dalfox'tan hemen sonra). 15s bekleyip 1 kez tekrar deniyorum.")
+            time.sleep(15)
         res["duration_sec"] = round(time.time() - _t0, 1)
         if not killed and rc not in (0, None):
             res["tool_failed"] = True
@@ -6108,6 +6132,22 @@ class ReconPipeline:
         stage("✦", "Generating Report")
         sf = self.out / "SUMMARY.json"
         try:
+            # v8.6-fix: a partial run (--resume, -s 7, --stageN) only populated
+            # self.summary for the stages it actually ran. Overwriting
+            # SUMMARY.json wholesale then WIPED every earlier stage's data —
+            # e.g. re-running just stage 7 erased stage 6's XSS findings +
+            # screenshot metadata from the report. Merge onto whatever is
+            # already on disk instead: stages this run touched win, the rest
+            # are kept.
+            prior_stages = {}
+            if sf.exists():
+                try:
+                    prev = json.loads(sf.read_text(errors="ignore"))
+                    if isinstance(prev.get("stages"), dict):
+                        prior_stages = prev["stages"]
+                except Exception:
+                    pass
+            merged_stages = {**prior_stages, **self.summary}
             summary_obj = {
                 "target":              self.target,
                 "timestamp":           self.ts,
@@ -6117,7 +6157,7 @@ class ReconPipeline:
                 "adaptive_events":     self.adaptive_events,
                 "auth_status":         self.auth_status,
                 "auth_cookie_names":   list(self.auth_cookies.keys()),
-                "stages":              self.summary,
+                "stages":              merged_stages,
                 "output_dir":          str(self.out)
             }
             sf.write_text(
