@@ -133,6 +133,7 @@ def _tail(alive_fn, proc=None):
     goes False, then finalise."""
     fh = None
     pos = 0
+    _last_resolve = 0.0
     while True:
         try:
             if fh is None and STDOUT_LOG.exists():
@@ -145,6 +146,11 @@ def _tail(alive_fn, proc=None):
                     _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
         except Exception:
             pass
+        # keep the output dir resolved while the scan runs (so the Report
+        # button works the moment it appears, not only at the end)
+        if time.time() - _last_resolve > 8:
+            _resolve_outdir()
+            _last_resolve = time.time()
         if not alive_fn():
             time.sleep(1.0)
             try:
@@ -726,18 +732,19 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
     </div>
 
     <div class="card" id="live-card">
-      <div class="row" style="align-items:center;margin-bottom:12px">
+      <div class="row" style="align-items:center;margin-bottom:6px">
         <span class="dot" id="livedot" style="background:var(--mut);box-shadow:none"></span>
         <b id="live-target">idle</b>
         <span class="badge b-blue" id="live-stage">–</span>
-        <span class="hint" id="live-elapsed"></span>
+        <span id="live-elapsed" style="font-family:var(--mono);font-size:13px;color:var(--acc2)"></span>
         <div style="margin-left:auto;display:flex;gap:8px">
           <button class="org sm" id="btn-pause" disabled>⏸ Pause</button>
           <button class="grn sm" id="btn-rp" style="display:none">▶ Resume</button>
           <button class="red sm" id="btn-stop" disabled>⏹ Stop</button>
-          <button class="gray sm" id="btn-open" disabled>📄 Report</button>
+          <button class="gray sm" id="btn-open" disabled>📊 Report</button>
         </div>
       </div>
+      <div class="hint" id="live-note" style="margin-bottom:10px"></div>
       <div class="log" id="log"></div>
       <div class="hint" id="cmdline" style="margin-top:8px;word-break:break-all"></div>
     </div>
@@ -878,14 +885,30 @@ function fmtLine(t){
   const e=t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   return cls?`<span class="${cls}">${e}</span>`:e;
 }
+let _srvElapsed=0, _srvAt=0, _lastSeq=0, _lastSeqAt=0;
+function _elapsedStr(){
+  const e = _srvElapsed + (Date.now()-_srvAt)/1000;
+  return `${Math.floor(e/60)}m ${String(Math.floor(e%60)).padStart(2,'0')}s`;
+}
+setInterval(()=>{ if(_srvAt) $('#live-elapsed').textContent='⏱ '+_elapsedStr(); }, 1000);
+
 async function tick(){
   const st=await api('/api/state');
   const dot=$('#livedot');
   $('#live-target').textContent=st.target||'idle';
   $('#live-stage').textContent=st.stage||'–';
-  $('#live-elapsed').textContent=st.elapsed?`${Math.floor(st.elapsed/60)}m ${st.elapsed%60}s`:'';
   $('#cmdline').textContent=st.cmd||'';
   const run=st.running;
+  if(run){ _srvElapsed=st.elapsed; _srvAt=Date.now(); }
+  else { _srvAt=0; $('#live-elapsed').textContent = st.elapsed?`⏱ ${Math.floor(st.elapsed/60)}m ${st.elapsed%60}s`:''; }
+  // "is it stuck?" hint — if the log hasn't moved for a while during a run
+  if(run){
+    if(st.log_seq!==_lastSeq){ _lastSeq=st.log_seq; _lastSeqAt=Date.now(); }
+    const quiet=(Date.now()-_lastSeqAt)/1000;
+    $('#live-note').textContent = quiet>25
+      ? `Working — "${st.stage}" has been quiet for ${Math.floor(quiet)}s. Some tools (subfinder, nmap, dalfox) run for minutes with no output; the timer above keeps ticking while it's alive.`
+      : `Running — live output below.`;
+  } else { $('#live-note').textContent=''; }
   dot.style.background=run?(st.paused?'var(--org)':'var(--grn)'):'var(--mut)';
   dot.style.boxShadow=run?'0 0 8px currentColor':'none';
   dot.className='dot'+(run&&!st.paused?' pulse':'');

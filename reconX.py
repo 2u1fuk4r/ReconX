@@ -2058,7 +2058,13 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
         file_lines = _count_lines(out_file) if (out_file and Path(out_file).exists() and Path(out_file).stat().st_size > 0) else 0
         stdout_lines = len([l for l in (_txt or "").splitlines() if l.strip()])
         lc = file_lines or stdout_lines
-        if lc > 0 or _attempt >= retries:
+        # v8.6-fix: a tool that exited cleanly (rc==0) with 0 lines gave a
+        # VALID empty answer — subfinder finding no subdomains, gau finding no
+        # archived URLs, dnsx validating nothing. Retrying it 2-3× (68s each
+        # for subfinder) just burns minutes and, in the web UI, looks like a
+        # hang. Only retry on 0 lines when the tool actually FAILED (rc!=0 /
+        # timed out) — a real transient error.
+        if lc > 0 or _attempt >= retries or _ok:
             return _ok, _txt
         _attempt += 1
         if label:
