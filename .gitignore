@@ -27,3 +27,6 @@ request.txt
 *.swp
 .idea/
 .vscode/
+
+# web panel log
+reconx_web.log

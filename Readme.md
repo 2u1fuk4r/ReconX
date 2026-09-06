@@ -101,6 +101,8 @@ python3 -m pip install --break-system-packages playwright && playwright install 
 
 ```bash
 python3 reconx_web.py            # http://127.0.0.1:8711
+# or, keep it running in the background:
+./start-web.sh                   # sudo ./start-web.sh for SYN nmap scans
 ```
 
 Start / Stop / Pause / Resume scans from the browser, watch the log live,
