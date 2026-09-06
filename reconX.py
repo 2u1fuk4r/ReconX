@@ -488,6 +488,8 @@ tools:
   dalfox_test_path_only: {str(t.get('dalfox_test_path_only', True)).lower()}
   dalfox_path_only_max: {t.get('dalfox_path_only_max', 100)}
   dalfox_dedup_query_params: {str(t.get('dalfox_dedup_query_params', True)).lower()}
+  dalfox_max_targets: {t.get('dalfox_max_targets', 40)}
+  dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 1500)}
   dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
   dalfox_workers: {t.get('dalfox_workers', 25)}
@@ -4090,9 +4092,15 @@ class ReconPipeline:
         # normal "clean scan, 0 findings" result instead of being reported
         # as a tool failure.
         _dalfox_ok_codes = (0, 1, None) if _dalfox_caps()["is_v3"] else (0, None)
+        # v8.6: real wall-clock budget. dalfox writes findings to the -o file
+        # incrementally, so a run cut off at the budget still keeps everything
+        # found so far — far better than a 2h open-ended run that the user
+        # ends up Ctrl+C-ing anyway.
+        _dfx_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=1500) or 1500)
+        _dfx_budget = min(_dfx_budget, T["dalfox"]) if _dfx_budget > 0 else T["dalfox"]
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
-            cmd, timeout=T["dalfox"], log=self.log, label=f"dalfox-{run_tag}",
+            cmd, timeout=_dfx_budget, log=self.log, label=f"dalfox-{run_tag}",
             line_cb=_dalfox_line_cb, stall_timeout=_dalfox_stall_sec,
             ok_exit_codes=_dalfox_ok_codes
         )
@@ -4358,18 +4366,46 @@ class ReconPipeline:
 
         d = self.out / "07_xss"
         d.mkdir(parents=True, exist_ok=True)
-        # v8.3: copy whichever candidate file actually got selected above into a
-        # fixed, predictable filename INSIDE 07_xss — report_builder needs to
-        # know the exact full list of URLs dalfox was actually pointed at (not
-        # just the "hit" findings) to build the "all tested URLs & payloads"
-        # table the user asked for (every tested URL listed, red if dalfox
-        # flagged it, green if it came back clean). Which of the 6 candidate
-        # files above wins can vary run to run, so this fixed copy is what the
-        # report always reads from.
+
+        # v8.6: clean + hard-cap the target list. dalfox v2 scans one URL at a
+        # time — 126 targets (seen on demo.testfire.net) is ~1h and often
+        # doesn't finish. Drop malformed URLs (literal \n, control chars,
+        # crawler junk), dedup by (host, path, sorted-param-names), rank
+        # param'd URLs above path-only, and keep the top N.
+        _dfx_max = int(_cfg_get(self.cfg, "tools", "dalfox_max_targets", default=40) or 40)
         try:
-            shutil.copy2(xss_file, d / "xss_targets_tested.txt")
+            raw = [l.strip() for l in xss_file.read_text(errors="ignore").splitlines() if l.strip()]
         except Exception:
-            pass
+            raw = []
+        clean, seen_shape = [], set()
+        for u in raw:
+            if not u.startswith(("http://", "https://")):
+                continue
+            if any(c in u for c in ("\\n", "\\t", "\n", "\t", " ", "<", ">", "{", "}", "|", "^")):
+                continue
+            try:
+                pr = urlparse(u)
+                if not pr.hostname or not self._is_in_scope_url(u):
+                    continue
+                params = tuple(sorted(k for k, _ in parse_qsl(pr.query)))
+            except Exception:
+                continue
+            shape = (pr.hostname, pr.path.rstrip("/"), params)
+            if shape in seen_shape:
+                continue
+            seen_shape.add(shape)
+            clean.append((u, len(params)))
+        # params first, then by shorter URL (less likely to be junk)
+        clean.sort(key=lambda t: (0 if t[1] else 1, len(t[0])))
+        final = [u for u, _ in clean[:_dfx_max]]
+        if not final:
+            final = [u for u in raw if u.startswith(("http://", "https://"))][:_dfx_max]
+        tested_f = d / "xss_targets_tested.txt"
+        write_lines(tested_f, final)
+        xss_file = tested_f
+        if len(raw) > len(final):
+            sub(f"Dalfox hedefleri {len(raw)} → {len(final)} (temizlik + benzersiz injection "
+                f"noktası + tools.dalfox_max_targets={_dfx_max} kapağı)")
 
         # v8.2: auto-provision a blind XSS OOB callback (interactsh) if the user
         # hasn't manually configured one. A manually-set config.blind_xss_callback
