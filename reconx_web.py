@@ -46,6 +46,7 @@ app = Flask(__name__)
 # ── running-scan state ────────────────────────────────────────────────────────
 SCAN = {
     "proc": None,          # subprocess.Popen
+    "ext_pid": None,       # pid of a re-attached (post-restart) scan
     "pgid": None,
     "cmd": "",
     "target": "",
@@ -63,6 +64,18 @@ SCAN = {
 
 _STAGE_RE = re.compile(r"STAGE\s+([0-9A-Za-z✦]+)\s*:\s*(.+?)\s*$")
 _COMPLETE_RE = re.compile(r"SCAN COMPLETE")
+# pipeline.log (re-attach path) has no STAGE headers — infer from tool names
+_STAGE_HINTS = [
+    ("whois", "1 — Recon"), ("whatweb", "1 — Recon"), ("nmap", "1 — Recon"),
+    ("subfinder", "2 — Subdomains"), ("dnsx", "3 — Alive"),
+    ("gau", "4 — URL discovery"), ("katana", "4 — URL discovery"),
+    ("httpx-url-prune", "4 — URL discovery"),
+    ("dalfox", "6 — XSS / Dalfox"), ("interactsh", "6 — XSS / Dalfox"),
+    ("nuclei-dast", "7 — Nuclei DAST"), ("nuclei", "7 — Nuclei"),
+    ("paramspider", "9 — Params"), ("arjun", "9 — Params"),
+    ("trufflehog", "10 — JS secrets"),
+    ("sqlmap", "14 — SQLi"),
+]
 
 
 def _push_log(line):
@@ -74,6 +87,33 @@ def _push_log(line):
             SCAN["stage"] = f"{m.group(1)} — {m.group(2)[:48]}"
         elif _COMPLETE_RE.search(line):
             SCAN["stage"] = "complete"
+        elif SCAN["proc"] is None and ("CMD:" in line or "[START]" in line):
+            for tok, label in _STAGE_HINTS:
+                if tok in line:
+                    SCAN["stage"] = label
+                    break
+
+
+MARKER = OUTPUT_DIR / ".reconx_web_running.json"
+
+
+def _write_marker():
+    try:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        MARKER.write_text(json.dumps({
+            "pid": SCAN["proc"].pid if SCAN["proc"] else SCAN.get("ext_pid"),
+            "pgid": SCAN["pgid"], "cmd": SCAN["cmd"], "target": SCAN["target"],
+            "hint": SCAN["outdir_hint"], "started": SCAN["started"],
+        }))
+    except Exception:
+        pass
+
+
+def _clear_marker():
+    try:
+        MARKER.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _reader(proc):
@@ -82,7 +122,6 @@ def _reader(proc):
             line = raw.decode("utf-8", "replace").rstrip("\n")
         except Exception:
             line = repr(raw)
-        # strip ANSI
         line = re.sub(r"\x1b\[[0-9;]*m", "", line)
         _push_log(line)
     proc.stdout.close()
@@ -90,8 +129,108 @@ def _reader(proc):
     SCAN["returncode"] = proc.returncode
     SCAN["ended"] = time.time()
     _push_log(f"[reconx-web] process exited (code {proc.returncode})")
-    # resolve the output dir now (dir name = <target>_<timestamp>)
     _resolve_outdir()
+    _clear_marker()
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _logtail_reader(pid):
+    """Re-attached scan: no pipe, so follow the output dir's pipeline.log and
+    watch the pid for liveness. Used after a web-server restart."""
+    logf = None
+    fh = None
+    pos = 0
+    while True:
+        if logf is None:
+            _resolve_outdir()
+            if SCAN["outdir"] and (SCAN["outdir"] / "pipeline.log").exists():
+                logf = SCAN["outdir"] / "pipeline.log"
+        if logf:
+            try:
+                fh = fh or logf.open("r", errors="replace")
+                fh.seek(pos)
+                for line in fh:
+                    _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n")))
+                pos = fh.tell()
+            except Exception:
+                pass
+        if not _pid_alive(pid):
+            time.sleep(1)
+            if logf:
+                try:
+                    fh.seek(pos)
+                    for line in fh:
+                        _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n")))
+                except Exception:
+                    pass
+            SCAN["returncode"] = 0
+            SCAN["ended"] = time.time()
+            SCAN["stage"] = "complete"
+            _push_log("[reconx-web] re-attached scan finished")
+            _resolve_outdir()
+            _clear_marker()
+            return
+        time.sleep(1.5)
+
+
+def _find_orphan_scan():
+    """No marker (scan predates this feature / different launcher): look for a
+    live `reconX.py` process and the output dir it's writing to."""
+    try:
+        import glob
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                parts = Path(p).read_bytes().split(b"\x00")
+            except Exception:
+                continue
+            if any(b"reconX.py" in x for x in parts):
+                pid = int(Path(p).parent.name)
+                cmd = " ".join(x.decode("utf-8", "replace") for x in parts if x)
+                return pid, cmd
+    except Exception:
+        pass
+    return None, None
+
+
+def _reattach():
+    m = None
+    if MARKER.exists():
+        try:
+            m = json.loads(MARKER.read_text())
+        except Exception:
+            _clear_marker()
+    if not (m and _pid_alive(m.get("pid"))):
+        pid, cmd = _find_orphan_scan()
+        if not pid:
+            _clear_marker()
+            return
+        # newest output dir with no SUMMARY.json = the one it's writing
+        newest = None
+        if OUTPUT_DIR.exists():
+            for d in sorted((x for x in OUTPUT_DIR.iterdir() if x.is_dir()),
+                            key=lambda x: x.stat().st_mtime, reverse=True):
+                if not (d / "SUMMARY.json").exists():
+                    newest = d; break
+        m = {"pid": pid, "cmd": cmd, "target": (newest.name.rsplit("_", 2)[0] if newest else "scan"),
+             "hint": (newest.name.rsplit("_", 2)[0] if newest else ""), "started": time.time()}
+    with SCAN["lock"]:
+        SCAN.update({
+            "proc": None, "ext_pid": m["pid"], "pgid": m.get("pgid"),
+            "cmd": m.get("cmd", ""), "target": m.get("target", ""),
+            "outdir": None, "outdir_hint": m.get("hint", ""),
+            "started": m.get("started", time.time()), "ended": 0.0,
+            "returncode": None, "stage": "re-attached", "paused": False,
+        })
+        SCAN["log"].clear(); SCAN["log_seq"] = 0
+    _push_log(f"[reconx-web] re-attached to running scan (pid {m['pid']}) — following pipeline.log")
+    threading.Thread(target=_logtail_reader, args=(m["pid"],), daemon=True).start()
 
 
 def _resolve_outdir():
@@ -107,7 +246,11 @@ def _resolve_outdir():
 
 def _is_running():
     p = SCAN["proc"]
-    return bool(p and p.poll() is None)
+    if p is not None:
+        return p.poll() is None
+    if SCAN.get("ext_pid"):
+        return _pid_alive(SCAN["ext_pid"])
+    return False
 
 
 # ── scan discovery (past + current) ──────────────────────────────────────────
@@ -293,7 +436,9 @@ def api_scan_start():
                      "stage": "starting", "paused": False})
         SCAN["log"].clear()
         SCAN["log_seq"] = 0
+    SCAN["ext_pid"] = None
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
+    _write_marker()
     threading.Thread(target=_reader, args=(proc,), daemon=True).start()
     return jsonify({"ok": True, "cmd": SCAN["cmd"]})
 
@@ -387,7 +532,9 @@ def api_scan_resume():
                      "started": time.time(), "ended": 0.0, "returncode": None,
                      "stage": "resuming", "paused": False})
         SCAN["log"].clear(); SCAN["log_seq"] = 0
+    SCAN["ext_pid"] = None
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
+    _write_marker()
     threading.Thread(target=_reader, args=(proc,), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -492,6 +639,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
   <div class="nav">
     <a data-p="run" class="on">▶  Run / Live</a>
     <a data-p="scans">🗂  Scans</a>
+    <a data-p="report">📊  Report</a>
     <a data-p="config">⚙  Config</a>
     <a data-p="tools">🧰  Tools</a>
   </div>
@@ -590,6 +738,23 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
     <div id="scanlist"></div>
   </section>
 
+  <!-- REPORT (embedded) -->
+  <section class="pg" id="pg-report">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <h2 style="margin:0">Report</h2>
+      <select id="report-pick" style="max-width:340px"></select>
+      <span class="hint" id="report-name" style="font-family:var(--mono)"></span>
+      <div style="margin-left:auto;display:flex;gap:8px">
+        <button class="gray sm" id="report-refresh">↻ Refresh</button>
+        <button class="gray sm" id="report-newtab">↗ New tab</button>
+      </div>
+    </div>
+    <div id="report-empty" class="card"><div class="hint">
+      No report selected. Finish a scan, or pick one above / from the Scans tab.</div></div>
+    <iframe id="report-frame" title="ReconX report" style="display:none;width:100%;
+      height:calc(100vh - 130px);border:1px solid var(--bd);border-radius:12px;background:#060a14"></iframe>
+  </section>
+
   <!-- CONFIG -->
   <section class="pg" id="pg-config">
     <h2>config.yaml</h2><div class="sub">Edited live. Validated as YAML before save.</div>
@@ -613,13 +778,38 @@ const api=(u,o)=>fetch(u,o).then(r=>r.json());
 let logSeq=0, poll=null;
 
 // nav
-$$('.nav a').forEach(a=>a.onclick=()=>{
-  $$('.nav a').forEach(x=>x.classList.remove('on')); a.classList.add('on');
-  $$('.pg').forEach(p=>p.classList.remove('on')); $('#pg-'+a.dataset.p).classList.add('on');
-  if(a.dataset.p==='scans') loadScans();
-  if(a.dataset.p==='config') loadCfg();
-  if(a.dataset.p==='tools') loadTools();
-});
+function go(p){
+  $$('.nav a').forEach(x=>x.classList.toggle('on', x.dataset.p===p));
+  $$('.pg').forEach(x=>x.classList.toggle('on', x.id==='pg-'+p));
+  document.querySelector('main').style.maxWidth = (p==='report'?'none':'1200px');
+  if(p==='scans') loadScans();
+  if(p==='config') loadCfg();
+  if(p==='tools') loadTools();
+  if(p==='report') loadReportPicker();
+}
+$$('.nav a').forEach(a=>a.onclick=()=>go(a.dataset.p));
+
+let curReport='';
+async function loadReportPicker(sel){
+  const rows=(await api('/api/scans')).filter(r=>r.has_report);
+  const pk=$('#report-pick');
+  pk.innerHTML='<option value="">— pick a report —</option>'+
+    rows.map(r=>`<option value="${r.name}">${r.target} · ${r.mtime}</option>`).join('');
+  const want=sel||curReport||(rows[0]&&rows[0].name)||'';
+  if(want){ pk.value=want; showReport(want); }
+}
+function showReport(name){
+  curReport=name;
+  if(!name){ $('#report-frame').style.display='none'; $('#report-empty').style.display='block'; $('#report-name').textContent=''; return; }
+  $('#report-empty').style.display='none';
+  const f=$('#report-frame'); f.style.display='block'; f.src='/report/'+name+'?t='+Date.now();
+  $('#report-name').textContent=name;
+}
+function openReport(name){ go('report'); setTimeout(()=>loadReportPicker(name),50); }
+document.addEventListener('DOMContentLoaded',()=>{});
+$('#report-pick').onchange=e=>showReport(e.target.value);
+$('#report-refresh').onclick=()=>showReport(curReport);
+$('#report-newtab').onclick=()=>{ if(curReport) window.open('/report/'+curReport,'_blank'); };
 
 // stage checkboxes
 const STG=[[1,'Recon'],[2,'Subdomains'],[3,'Alive'],[4,'URLs'],[5,'Categorise'],[6,'XSS'],
@@ -666,7 +856,7 @@ $('#btn-start').onclick=async()=>{
 $('#btn-stop').onclick=()=>api('/api/scan/stop',{method:'POST'});
 $('#btn-pause').onclick=()=>api('/api/scan/pause',{method:'POST'});
 $('#btn-rp').onclick=()=>api('/api/scan/resume-paused',{method:'POST'});
-$('#btn-open').onclick=()=>{ const n=$('#btn-open').dataset.name; if(n) window.open('/report/'+n,'_blank'); };
+$('#btn-open').onclick=()=>{ const n=$('#btn-open').dataset.name; if(n) openReport(n); };
 
 function fmtLine(t){
   let cls='';
@@ -701,8 +891,18 @@ async function tick(){
     logSeq=lg.seq;
     if(near) box.scrollTop=box.scrollHeight;
   }
-  if(!run && st.returncode!==null && poll){ /* keep polling a bit for late log */ }
+  // scan just finished -> surface the report and (once) offer to open it inline
+  if(!run && st.stage==='complete' && st.outdir && !wasComplete){
+    wasComplete=true;
+    const b=document.createElement('div');
+    b.style.cssText='margin-top:10px;padding:10px 14px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.35);border-radius:8px';
+    b.innerHTML=`<b style="color:#4ade80">Scan complete.</b>
+      <button class="grn sm" style="margin-left:10px" onclick="openReport('${st.outdir}')">📊 View report here</button>`;
+    $('#live-card').appendChild(b);
+  }
+  if(run) wasComplete=false;
 }
+let wasComplete=false;
 function startPoll(){ if(poll) clearInterval(poll); tick(); poll=setInterval(tick,1200); }
 
 async function loadScans(){
@@ -721,7 +921,8 @@ async function loadScans(){
       <div><div class="t">${r.target}</div><div class="d">${r.mtime} · ${r.name}</div></div>
       <div class="badges">${B.join('')}</div>
       <div style="display:flex;gap:6px">
-        ${r.has_report?`<button class="sm gray" onclick="window.open('/report/${r.name}','_blank')">📄 Report</button>`:''}
+        ${r.has_report?`<button class="sm grn" onclick="openReport('${r.name}')">📊 View</button>`:''}
+        ${r.has_report?`<button class="sm gray" onclick="window.open('/report/${r.name}','_blank')">↗</button>`:''}
         <button class="sm" onclick="resumeScan('${r.name}')" ${r.running?'disabled':''}>↻ Resume</button>
         <button class="sm red" onclick="delScan('${r.name}')" ${r.running?'disabled':''}>🗑</button>
       </div></div>`;
@@ -763,6 +964,10 @@ def main():
         print(f"[reconx-web] reconX.py not found at {RECONX}", file=sys.stderr)
         sys.exit(1)
     print(f"[reconx-web] http://{a.host}:{a.port}  (reconX: {RECONX})", flush=True)
+    try:
+        _reattach()
+    except Exception as e:
+        print(f"[reconx-web] re-attach check failed: {e}", file=sys.stderr)
     app.run(host=a.host, port=a.port, debug=a.debug, threaded=True)
 
 
