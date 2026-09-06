@@ -156,7 +156,13 @@ tools:
   # etc.) — each one gets tested against every parameter in 4 encodings
   # (plain/URL/double-URL/HTML-entity), which adds real scan time. Set to ""
   # to disable and rely on dalfox's own payload set alone.
-  dalfox_custom_payload: "xss-payloads.txt"
+  # NOTE: measured on demo.testfire.net — dalfox's OWN built-in payload set
+  # confirms a real reflected XSS on search.jsp?query= in ~32s per URL.
+  # Adding this 65-line custom list on top (× ~38 DOM-mining points × 4
+  # encodings × every param) turned a 15-min scan into a >1h one that got
+  # SIGKILLed before writing a single finding. Leave "" unless a specific
+  # target needs exotic WAF-bypass vectors, then re-enable for that run only.
+  dalfox_custom_payload: ""
   dalfox_blind: false
   dalfox_mining_dict: ""
   # Whether to also send query-string-less (path-only, e.g. /blog/123) URLs to
@@ -166,7 +172,7 @@ tools:
   # this enabled, path-based XSS opportunities get tested too. Only ONE example
   # per unique route "shape" is sent (e.g. /product/1, /product/2 -> /product/{id}),
   # so the target count doesn't explode even on sites with thousands of pages.
-  dalfox_test_path_only: true
+  dalfox_test_path_only: false
   # Maximum number of unique path-only routes added to the scan when
   # dalfox_test_path_only is enabled (extra ones beyond this are skipped, to
   # keep scan duration under control). Lowered from 300 to 100 in v8.2: each
@@ -185,6 +191,14 @@ tools:
   # coverage. This only trims dalfox's own target list — the full URL list
   # (params.txt, the report's "All URLs"/"Parameters" tabs) is unaffected.
   dalfox_dedup_query_params: true
+  # HARD cap on how many URLs dalfox is pointed at. dalfox v2 scans one URL at
+  # a time — a big site can produce 100+ candidate URLs (~1h, often unfinished).
+  # The list is cleaned (malformed URLs dropped) and deduped by injection point
+  # first, then the top N kept (param'd URLs before path-only).
+  dalfox_max_targets: 40
+  # Wall-clock budget for the whole dalfox run. Hit = dalfox stops, findings
+  # collected so far are kept (dalfox writes them out incrementally).
+  dalfox_time_budget_sec: 2400
   # dalfox v2 scans a target file strictly one URL at a time. ReconX CAN split
   # the list into N chunks and run N dalfox processes at once — but against a
   # SINGLE host that just multiplies the request rate and trips the target's
@@ -202,8 +216,11 @@ tools:
   # spends real time but reports 0 findings on a live target).
   dalfox_workers: 25
   # milliseconds between dalfox requests (0 = none). Raise alongside lowering
-  # workers if a target is throttling.
-  dalfox_delay_ms: 100
+  # workers ONLY if a target is throttling (symptom: dalfox runs long, finds 0
+  # on a live target). At 100ms this alone can 5-10x the total run time, so it
+  # stays off by default and the report's "suspicious empty" note tells you
+  # when to turn it on.
+  dalfox_delay_ms: 0
   # How long (seconds) dalfox can go with ZERO new output lines before ReconX
   # assumes it's genuinely stuck and force-stops it. Was a hardcoded 240s,
   # then a configurable 480s in v8.2 — both still fired on real scans that
@@ -260,7 +277,7 @@ tools:
 
 # ── ReconX auto-generated runtime state — DO NOT EDIT BY HAND, overwritten every run ──
 auto_state:
-  blind_callback_last_used: "daeikefqeopul0nhkf1gjjfosgtmxq7zd.oast.pro"
-  blind_callback_last_target: "ginandjuice.shop"
-  blind_callback_last_used_at: "2026-09-06 05:00:30"
+  blind_callback_last_used: "daejsenqeopqpou26jq0n4jqa94fzuf76.oast.site"
+  blind_callback_last_target: "demo.testfire.net"
+  blind_callback_last_used_at: "2026-09-06 06:46:10"
   blind_callback_interactions_confirmed: 0
