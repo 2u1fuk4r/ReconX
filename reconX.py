@@ -4520,6 +4520,48 @@ class ReconPipeline:
             override = self._nuclei_tpl_override
         return discover_nuclei_templates(override)
 
+    def _get_nuclei_dast_dir(self) -> str:
+        """v8.6-fix: the fuzzing pass needs a `dast/` template dir that is
+        actually POPULATED. `discover_nuclei_templates()` picks the first root
+        with any *.yaml — but on this box `/root/nuclei-templates` wins that
+        race while its `dast/` subdir is empty/stale, so nuclei -dast loads 0
+        fuzz templates and silently reports "0 findings" on a target with a
+        blatant reflected XSS. Scan every known root for a dast/ subdir with a
+        real template count and take the richest one."""
+        cands = []
+        primary = self._get_nuclei_template_path()
+        if primary:
+            cands.append(Path(primary) / "dast")
+        for c in _NUCLEI_TEMPLATE_CANDIDATES:
+            cands.append(Path(c) / "dast")
+        # running as root, root can read every user's checkout too
+        try:
+            for home in Path("/home").iterdir():
+                cands.append(home / "nuclei-templates" / "dast")
+        except Exception:
+            pass
+        best, best_n = "", 0
+        seen = set()
+        for p in cands:
+            sp = str(p)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            try:
+                if not p.is_dir():
+                    continue
+                n = sum(1 for _ in p.rglob("*.yaml"))
+            except Exception:
+                continue
+            if n > best_n:
+                best, best_n = sp, n
+        if best_n >= 10:
+            ok(f"Nuclei DAST templates: {best} ({best_n} fuzzing templates)")
+            return best
+        warn(f"Nuclei DAST: no populated dast/ template dir found (best={best or 'none'}, "
+             f"{best_n} templates) — fuzzing pass will be unreliable")
+        return best
+
     def _nuclei_tech_tags(self) -> str:
         """v6.13: stage11'de tespit edilen teknolojilerden nuclei -tags degeri uretir."""
         techs = set()
@@ -4850,10 +4892,12 @@ class ReconPipeline:
         cmd = ["nuclei", "-l", str(tgt), "-dast", "-nc", "-duc", "-jsonl", "-o", str(json_f),
                "-stats", "-stats-interval", "10", "-c", str(threads), "-rl", str(rate),
                "-timeout", str(int(_cfg_get(self.cfg, "settings", "timeout", default=20)))]
-        tpl = self._get_nuclei_template_path()
-        dast_dir = Path(tpl) / "dast" if tpl else None
-        if dast_dir and dast_dir.exists():
-            cmd += ["-t", str(dast_dir)]
+        dast_dir = self._get_nuclei_dast_dir()
+        if dast_dir:
+            cmd += ["-t", dast_dir]
+            res["dast_template_dir"] = dast_dir
+        else:
+            res["tool_error"] = "no populated dast/ template dir"
         hdr_set = pick_header_strategy(self.target, self.cfg)
         if self.has_auth():
             hdr_set = self._auth_headers(hdr_set)
