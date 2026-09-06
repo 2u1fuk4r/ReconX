@@ -6809,6 +6809,13 @@ def main():
         stages = args.stages
 
     domain = args.domain
+    if domain:
+        # accept "*.example.com", "https://sub.example.com/path", "host:8080" —
+        # normalise to the bare registrable host used for scope + output dir.
+        _norm = _extract_domain_from_any(domain)
+        if _norm and _norm != domain:
+            info(f"Domain normalised: {domain} → {_norm}")
+            domain = _norm
     if not domain:
         if url_targets:
             domain = _extract_domain_from_any(url_targets[0])

@@ -515,8 +515,9 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
         </div>
         <div style="flex:2;min-width:260px">
           <label id="tgt-label">Domain</label>
-          <input type="text" id="target_val" placeholder="example.com">
+          <input type="text" id="target_val" placeholder="example.com  ·  *.example.com  ·  https://sub.example.com">
           <textarea id="target_urls" style="display:none" placeholder="https://a.example.com/&#10;https://b.example.com/?x=1"></textarea>
+          <div class="hint" id="tgt-hint">Bare domain → full pipeline (subdomain enum runs in stage 2). <code>*.</code> and URLs are normalised automatically.</div>
         </div>
       </div>
 
