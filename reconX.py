@@ -29,6 +29,19 @@ try:
 except Exception:
     _py_requests = None
 
+# recon scanner: TLS certs on targets are routinely expired / self-signed —
+# every HTTP call below is made with verify=False, so silence the noise.
+try:
+    import urllib3
+    urllib3.disable_warnings()
+except Exception:
+    pass
+try:
+    import warnings
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+except Exception:
+    pass
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 class C:
     RED     = "\033[91m"
@@ -1229,7 +1242,10 @@ def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
     if jitter_max > 0:
         time.sleep(random.random() * jitter_max)
     try:
-        kw = dict(timeout=timeout, allow_redirects=True, headers=headers)
+        # v8.6: a recon scanner must not fail on a target's TLS cert —
+        # expired / self-signed / hostname-mismatch certs are common on
+        # staging + deliberately-vulnerable test sites (demo.testfire.net).
+        kw = dict(timeout=timeout, allow_redirects=True, headers=headers, verify=False)
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
         if is_cffi:
@@ -1296,6 +1312,7 @@ def send_webhook_notification(cfg: dict, target: str, summary: dict) -> bool:
         text = "\n".join(lines)
         payload = {"text": text, "content": text}  # Slack uses "text", Discord uses "content"
         kw = dict(timeout=10, json=payload)
+        kw["verify"] = False
         if is_cffi:
             kw["impersonate"] = (_cfg_get(cfg, "settings", "curl_cffi_impersonate", default="chrome120") or "chrome120")
         r = client.post(url, **kw)
@@ -2586,6 +2603,7 @@ def perform_request_login(request_file: str, cfg: dict, timeout: int = 60, log=N
 
     headers = dict(req["headers"])
     kw = {"timeout": timeout, "allow_redirects": True, "headers": headers}
+    kw["verify"] = False
     if proxy:
         kw["proxies"] = {"http": proxy, "https": proxy}
     if is_cffi:
@@ -2652,6 +2670,7 @@ def check_cors_misconfig(url: str, cfg: dict, log=None) -> dict:
     headers["Origin"] = test_origin
     try:
         kw = dict(timeout=12, allow_redirects=True, headers=headers)
+        kw["verify"] = False
         proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
@@ -2715,6 +2734,7 @@ def check_subdomain_takeover(host_url: str, cfg: dict, log=None) -> dict:
     try:
         kw = dict(timeout=10, allow_redirects=True,
                   headers=pick_header_strategy(domain, cfg))
+        kw["verify"] = False
         proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
@@ -2777,6 +2797,7 @@ def check_cloud_bucket(bucket_url: str, provider: str, cfg: dict, log=None) -> d
     try:
         kw = dict(timeout=timeout, allow_redirects=True,
                   headers={"User-Agent": _pick_ua()})
+        kw["verify"] = False
         proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
@@ -2818,6 +2839,7 @@ def _crtsh_enum(domain: str, timeout: int = 20) -> list:
             is_cffi = False
         url = f"https://crt.sh/?q=%25.{domain}&output=json"
         kw = dict(timeout=timeout, headers={"User-Agent": _pick_ua()})
+        kw["verify"] = False
         if is_cffi:
             kw["impersonate"] = "chrome120"
         r = client.get(url, **kw)
@@ -5157,6 +5179,7 @@ class ReconPipeline:
             req_timeout = int(_cfg_get(self.cfg, "tools", "js_secrets_request_timeout", default=10))
             kw = dict(timeout=req_timeout, allow_redirects=True,
                       headers=self._auth_headers_for_url(js_url, pick_header_strategy(host, self.cfg)))
+            kw["verify"] = False
             proxy = str(_cfg_get(self.cfg, "settings", "proxy", default="") or "").strip()
             if proxy:
                 kw["proxies"] = {"http": proxy, "https": proxy}
@@ -5293,6 +5316,7 @@ class ReconPipeline:
                     host = urlparse(js_url).hostname or self.target
                     kw = dict(timeout=10, headers=self._auth_headers_for_url(
                         js_url, pick_header_strategy(host, self.cfg)))
+                    kw["verify"] = False
                     proxy = str(_cfg_get(self.cfg, "settings", "proxy", default="") or "").strip()
                     if proxy:
                         kw["proxies"] = {"http": proxy, "https": proxy}
@@ -6360,6 +6384,7 @@ class ReconPipeline:
                     continue
                 try:
                     kw = dict(timeout=10, headers=hdrs, allow_redirects=True)
+                    kw["verify"] = False
                     if is_cffi:
                         kw["impersonate"] = _imp
                     if "graphql" in cand:
