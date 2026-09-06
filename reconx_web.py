@@ -116,23 +116,6 @@ def _clear_marker():
         pass
 
 
-def _reader(proc):
-    for raw in iter(proc.stdout.readline, b""):
-        try:
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-        except Exception:
-            line = repr(raw)
-        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
-        _push_log(line)
-    proc.stdout.close()
-    proc.wait()
-    SCAN["returncode"] = proc.returncode
-    SCAN["ended"] = time.time()
-    _push_log(f"[reconx-web] process exited (code {proc.returncode})")
-    _resolve_outdir()
-    _clear_marker()
-
-
 def _pid_alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -141,59 +124,77 @@ def _pid_alive(pid):
         return False
 
 
-def _logtail_reader(pid):
-    """Re-attached scan: no pipe, so follow the output dir's pipeline.log and
-    watch the pid for liveness. Used after a web-server restart."""
-    logf = None
+STDOUT_LOG = OUTPUT_DIR / ".webui_stdout.log"
+
+
+def _tail(alive_fn, proc=None):
+    """Follow STDOUT_LOG (reconX's stdout+stderr, written to a FILE not a pipe
+    so killing/restarting the web server never breaks the scan) until alive_fn()
+    goes False, then finalise."""
     fh = None
     pos = 0
     while True:
-        if logf is None:
-            _resolve_outdir()
-            if SCAN["outdir"] and (SCAN["outdir"] / "pipeline.log").exists():
-                logf = SCAN["outdir"] / "pipeline.log"
-        if logf:
-            try:
-                fh = fh or logf.open("r", errors="replace")
+        try:
+            if fh is None and STDOUT_LOG.exists():
+                fh = STDOUT_LOG.open("r", errors="replace")
+            if fh:
                 fh.seek(pos)
-                for line in fh:
-                    _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n")))
+                chunk = fh.read()
                 pos = fh.tell()
+                for line in chunk.splitlines():
+                    _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
+        except Exception:
+            pass
+        if not alive_fn():
+            time.sleep(1.0)
+            try:
+                if fh:
+                    fh.seek(pos)
+                    for line in fh.read().splitlines():
+                        _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
             except Exception:
                 pass
-        if not _pid_alive(pid):
-            time.sleep(1)
-            if logf:
+            if proc is not None:
                 try:
-                    fh.seek(pos)
-                    for line in fh:
-                        _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n")))
+                    proc.wait(timeout=3)
+                    SCAN["returncode"] = proc.returncode
                 except Exception:
-                    pass
-            SCAN["returncode"] = 0
+                    SCAN["returncode"] = SCAN["returncode"] if SCAN["returncode"] is not None else 0
+            else:
+                SCAN["returncode"] = 0 if SCAN["returncode"] is None else SCAN["returncode"]
             SCAN["ended"] = time.time()
-            SCAN["stage"] = "complete"
-            _push_log("[reconx-web] re-attached scan finished")
             _resolve_outdir()
+            # reconX writes SUMMARY.json then report.html; if it died in between
+            # (or was killed), rebuild the report from whatever landed on disk.
+            d = SCAN["outdir"]
+            if d and (d / "SUMMARY.json").exists() and not (d / "report.html").exists():
+                try:
+                    sys.path.insert(0, str(BASE_DIR))
+                    from report_builder import build_report
+                    build_report(d, SCAN["target"] or d.name.rsplit("_", 2)[0], {})
+                    _push_log("[reconx-web] report.html was missing — rebuilt from partial data")
+                except Exception as e:  # noqa: BLE001
+                    _push_log(f"[reconx-web] could not rebuild report: {e}")
+            if SCAN["stage"] != "complete":
+                SCAN["stage"] = "finished" if (d and (d / "report.html").exists()) else "stopped"
+            _push_log(f"[reconx-web] scan ended (rc {SCAN['returncode']})")
             _clear_marker()
             return
-        time.sleep(1.5)
+        time.sleep(1.4)
 
 
 def _find_orphan_scan():
-    """No marker (scan predates this feature / different launcher): look for a
-    live `reconX.py` process and the output dir it's writing to."""
+    """No marker: look for a live `reconX.py` process."""
     try:
         import glob
-        for p in glob.glob("/proc/[0-9]*/cmdline"):
+        for pf in glob.glob("/proc/[0-9]*/cmdline"):
             try:
-                parts = Path(p).read_bytes().split(b"\x00")
+                parts = Path(pf).read_bytes().split(b"\x00")
             except Exception:
                 continue
             if any(b"reconX.py" in x for x in parts):
-                pid = int(Path(p).parent.name)
-                cmd = " ".join(x.decode("utf-8", "replace") for x in parts if x)
-                return pid, cmd
+                pid = int(Path(pf).parent.name)
+                return pid, " ".join(x.decode("utf-8", "replace") for x in parts if x)
     except Exception:
         pass
     return None, None
@@ -211,15 +212,17 @@ def _reattach():
         if not pid:
             _clear_marker()
             return
-        # newest output dir with no SUMMARY.json = the one it's writing
         newest = None
         if OUTPUT_DIR.exists():
             for d in sorted((x for x in OUTPUT_DIR.iterdir() if x.is_dir()),
                             key=lambda x: x.stat().st_mtime, reverse=True):
                 if not (d / "SUMMARY.json").exists():
-                    newest = d; break
-        m = {"pid": pid, "cmd": cmd, "target": (newest.name.rsplit("_", 2)[0] if newest else "scan"),
-             "hint": (newest.name.rsplit("_", 2)[0] if newest else ""), "started": time.time()}
+                    newest = d
+                    break
+        m = {"pid": pid, "cmd": cmd,
+             "target": (newest.name.rsplit("_", 2)[0] if newest else "scan"),
+             "hint": (newest.name.rsplit("_", 2)[0] if newest else ""),
+             "started": time.time()}
     with SCAN["lock"]:
         SCAN.update({
             "proc": None, "ext_pid": m["pid"], "pgid": m.get("pgid"),
@@ -228,9 +231,12 @@ def _reattach():
             "started": m.get("started", time.time()), "ended": 0.0,
             "returncode": None, "stage": "re-attached", "paused": False,
         })
-        SCAN["log"].clear(); SCAN["log_seq"] = 0
-    _push_log(f"[reconx-web] re-attached to running scan (pid {m['pid']}) — following pipeline.log")
-    threading.Thread(target=_logtail_reader, args=(m["pid"],), daemon=True).start()
+        SCAN["log"].clear()
+        SCAN["log_seq"] = 0
+    _push_log(f"[reconx-web] re-attached to running scan (pid {m['pid']})")
+    pid = m["pid"]
+    threading.Thread(target=_tail, args=(lambda: _pid_alive(pid),), daemon=True).start()
+
 
 
 def _resolve_outdir():
@@ -426,20 +432,23 @@ def api_scan_start():
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    logfh = STDOUT_LOG.open("wb")            # a FILE, not a pipe — survives web-server restart
     proc = subprocess.Popen(
-        cmd, cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, start_new_session=True, env=env, bufsize=1)
+        cmd, cwd=str(BASE_DIR), stdout=logfh, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    logfh.close()                            # child keeps its own fd
     with SCAN["lock"]:
-        SCAN.update({"proc": proc, "pgid": os.getpgid(proc.pid), "cmd": " ".join(shlex.quote(c) for c in cmd),
+        SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
+                     "cmd": " ".join(shlex.quote(c) for c in cmd),
                      "target": target, "outdir": None, "outdir_hint": hint,
                      "started": time.time(), "ended": 0.0, "returncode": None,
                      "stage": "starting", "paused": False})
         SCAN["log"].clear()
         SCAN["log_seq"] = 0
-    SCAN["ext_pid"] = None
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
     _write_marker()
-    threading.Thread(target=_reader, args=(proc,), daemon=True).start()
+    threading.Thread(target=_tail, args=(lambda: proc.poll() is None, proc), daemon=True).start()
     return jsonify({"ok": True, "cmd": SCAN["cmd"]})
 
 
@@ -521,21 +530,23 @@ def api_scan_resume():
     cmd, err = _build_cmd(f)
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=subprocess.PIPE,
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    logfh = STDOUT_LOG.open("wb")
+    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=logfh,
                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                            start_new_session=True, bufsize=1,
+                            start_new_session=True,
                             env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    logfh.close()
     with SCAN["lock"]:
-        SCAN.update({"proc": proc, "pgid": os.getpgid(proc.pid),
+        SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
                      "cmd": " ".join(shlex.quote(c) for c in cmd), "target": target,
                      "outdir": d, "outdir_hint": d.name.rsplit("_", 2)[0],
                      "started": time.time(), "ended": 0.0, "returncode": None,
                      "stage": "resuming", "paused": False})
         SCAN["log"].clear(); SCAN["log_seq"] = 0
-    SCAN["ext_pid"] = None
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
     _write_marker()
-    threading.Thread(target=_reader, args=(proc,), daemon=True).start()
+    threading.Thread(target=_tail, args=(lambda: proc.poll() is None, proc), daemon=True).start()
     return jsonify({"ok": True})
 
 
