@@ -4109,7 +4109,12 @@ class ReconPipeline:
             ok_exit_codes=_dalfox_ok_codes
         )
         res["duration_sec"] = round(time.time() - _t0, 1)
-        res["interrupted"] = bool(killed)
+        # distinguish "we stopped dalfox at its time budget" (expected, findings
+        # so far are kept) from a real user Ctrl+C — the report wording differs.
+        _budget_hit = bool(killed) and not _INT.interrupted() and \
+            res["duration_sec"] >= max(1, _dfx_budget - 10)
+        res["budget_hit"] = _budget_hit
+        res["interrupted"] = bool(killed) and not _budget_hit
         res["stalled"] = bool(stalled)
         res["total_lines"] = lines
         res["exit_code"] = rc
@@ -4319,6 +4324,7 @@ class ReconPipeline:
                 merged["findings_list"].extend(r.get("findings_list", []) or [])
                 merged["duration_sec"] = max(merged["duration_sec"], r.get("duration_sec", 0.0))
                 merged["interrupted"] = merged["interrupted"] or bool(r.get("interrupted"))
+                merged["budget_hit"] = merged.get("budget_hit", False) or bool(r.get("budget_hit"))
                 merged["stalled"] = merged["stalled"] or bool(r.get("stalled"))
                 if r.get("tool_failed"):
                     merged["tool_failed"] = True
@@ -4492,6 +4498,7 @@ class ReconPipeline:
             "tool_failed": run.get("tool_failed", False),
             "tool_error": run.get("tool_error", ""),
             "interrupted": run.get("interrupted", False),
+            "budget_hit": run.get("budget_hit", False),
             "stalled": run.get("stalled", False),
             "duration_sec": run.get("duration_sec", 0.0),
             "targets_count": run.get("targets_count", 0),
@@ -4503,6 +4510,10 @@ class ReconPipeline:
         if run.get("tool_failed"):
             err(f"Dalfox HATA ILE SONLANDI — {run.get('tool_error','')} "
                 f"('0 finding' burada 'temiz' anlamina GELMEYEBILIR)")
+        elif run.get("budget_hit"):
+            warn(f"Dalfox zaman butcesine ({run.get('duration_sec',0)}s) ulasti ve durduruldu — "
+                 f"o ana kadarki {run['findings']} bulgu kaydedildi, ancak tum hedefler taranmamis olabilir "
+                 f"(tools.dalfox_time_budget_sec ile artir)")
         elif run.get("interrupted"):
             warn(f"Dalfox erken durduruldu ({run.get('duration_sec',0)}s, "
                  f"{run.get('total_lines',0)} satir islendi) — bulgular EKSIK olabilir")

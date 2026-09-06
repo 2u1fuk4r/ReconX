@@ -4,7 +4,7 @@
 import json, re, html
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl
 
 
 # ── File helpers ───────────────────────────────────────────────────────────────
@@ -380,6 +380,7 @@ def _parse_xss(d) -> dict:
     meta["tool_failed"] = bool(st6.get("tool_failed"))
     meta["tool_error"]  = st6.get("tool_error") or ""
     meta["interrupted"] = bool(st6.get("interrupted"))
+    meta["budget_hit"] = bool(st6.get("budget_hit"))
     meta["duration_sec"] = st6.get("duration_sec", 0)
     meta["targets_count"] = st6.get("targets_count", 0)
     meta["ran"] = meta["status"] not in ("", "skipped")
@@ -436,23 +437,35 @@ def _parse_xss(d) -> dict:
     # finding back to the target URL it came from.
     tested_urls = _lines(xdir / "xss_targets_tested.txt")
 
-    def _base_key(u: str) -> str:
+    def _path_key(u: str) -> str:
         try:
             p = urlparse(u)
             return f"{p.scheme}://{p.netloc}{p.path}"
         except Exception:
             return u
 
-    hits_by_base = {}
+    def _params_of(u: str) -> set:
+        try:
+            return {k for k, _ in parse_qsl(urlparse(u).query)}
+        except Exception:
+            return set()
+
+    # index (path -> list of findings on that path). Attribution to a specific
+    # tested URL additionally requires the finding's injected parameter to
+    # actually be present on that URL — otherwise every ?a=1 / ?b=2 variant of
+    # the same .jsp inherited the same hit and got painted red (seen on
+    # demo.testfire.net: index.jsp?uid=123 flagged for a content= XSS).
+    hits_by_path = {}
     for f in findings:
-        key = _base_key(f.get("url", ""))
-        hits_by_base.setdefault(key, []).append(f)
+        hits_by_path.setdefault(_path_key(f.get("url", "")), []).append(f)
 
     _V = (_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"])
     tested = []
     for u in tested_urls:
-        key = _base_key(u)
-        hits = hits_by_base.get(key) or []
+        key = _path_key(u)
+        u_params = _params_of(u)
+        hits = [f for f in hits_by_path.get(key, [])
+                if not f.get("param") or f.get("param") in u_params]
         # one-piece PoC per hit: dalfox's "url" (its "data" field) IS the full
         # request URL with the payload already substituted into the parameter —
         # exactly what you paste into a browser. Dedup + keep payload alongside.
@@ -1755,7 +1768,8 @@ def _section_xss(xss):
     findings = xss.get("findings", [])
     meta = xss.get("meta", {})
     tool_failed = bool(meta.get("tool_failed"))
-    interrupted = bool(meta.get("interrupted")) and not tool_failed
+    budget_hit = bool(meta.get("budget_hit")) and not tool_failed
+    interrupted = bool(meta.get("interrupted")) and not tool_failed and not budget_hit
     ran = bool(meta.get("ran"))
     risk_label, risk_color = ("HIGH", "red") if findings else ("NONE", "green")
 
@@ -1777,6 +1791,13 @@ def _section_xss(xss):
         body += (f'<div class="alert-box alert-red" style="margin-bottom:14px">'
                  f'⚠ <strong>Dalfox exited with an error:</strong>&nbsp;{_e(meta.get("tool_error",""))} '
                  f'— this does NOT necessarily mean the target is clean; the scan may not have completed.</div>')
+    elif budget_hit:
+        body += (f'<div class="alert-box" style="margin-bottom:14px;background:rgba(56,189,248,.08);'
+                 f'border-color:rgba(56,189,248,.3);color:#7dd3fc">'
+                 f'ℹ <strong>Dalfox reached its time budget and was stopped.</strong>&nbsp;'
+                 f'Findings written so far are complete and kept (dalfox streams them to disk), '
+                 f'but not every target was necessarily finished — raise '
+                 f'<code>tools.dalfox_time_budget_sec</code> for full coverage.</div>')
     elif interrupted:
         body += (f'<div class="alert-box" style="margin-bottom:14px;background:rgba(249,115,22,.08);'
                  f'border-color:rgba(249,115,22,.3);color:#fdba74">'
