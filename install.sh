@@ -159,5 +159,6 @@ echo
 info "${B}Ornek kullanim:${N}"
 echo "  python3 reconX.py -d example.com"
 echo "  python3 reconX.py -u https://example.com  (tek URL)"
+echo "  python3 reconx_web.py                    (web arayuz: http://127.0.0.1:8711)"
 echo "  python3 reconX.py -d example.com --auto   (tam otomatik, tum 14 stage)"
 echo "  python3 reconX.py --help                 (tum secenekler)"

@@ -97,7 +97,20 @@ python3 -m pip install --break-system-packages playwright && playwright install 
 
 ---
 
-## 🚀 Usage
+## 🖥️ Web control panel
+
+```bash
+python3 reconx_web.py            # http://127.0.0.1:8711
+```
+
+Start / Stop / Pause / Resume scans from the browser, watch the log live,
+pick individual stages, fill the auth fields, browse past scans and open their
+reports, edit `config.yaml`, check which tools are installed. One scan at a
+time. Flask only.
+
+---
+
+## 🚀 CLI usage
 
 ```bash
 # Full 14-stage pipeline (interactive confirmations for XSS / Nuclei / active SQLi)

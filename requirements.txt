@@ -9,3 +9,6 @@ curl-cffi>=0.6.0       # primary HTTP client (Cloudflare-friendly TLS fingerprin
 # Optional — only needed for XSS alert() verification screenshots (Stage 6):
 #   pip install playwright && playwright install chromium
 # playwright>=1.40.0
+
+# Web control panel (reconx_web.py) — optional
+flask>=3.0
