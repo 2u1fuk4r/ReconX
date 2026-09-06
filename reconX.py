@@ -300,9 +300,13 @@ def load_config(path=None):
             "blind_xss_callback": "",
             "dalfox_custom_payload": "",
             "dalfox_blind": False,
-            "dalfox_test_path_only": True,
+            "dalfox_test_path_only": False,
             "dalfox_path_only_max": 100,
             "dalfox_dedup_query_params": True,
+            "dalfox_max_targets": 40,
+            "dalfox_time_budget_sec": 2400,
+            "dalfox_workers": 25,
+            "dalfox_delay_ms": 0,
             "dalfox_stall_timeout_sec": 0,
             "dalfox_mass_workers": 10,
             "blind_xss_auto": True,
@@ -485,15 +489,15 @@ tools:
   blind_xss_callback: {_yq(t.get('blind_xss_callback', ''))}
   dalfox_custom_payload: {_yq(t.get('dalfox_custom_payload', ''))}
   dalfox_blind: {str(t.get('dalfox_blind', False)).lower()}
-  dalfox_test_path_only: {str(t.get('dalfox_test_path_only', True)).lower()}
+  dalfox_test_path_only: {str(t.get('dalfox_test_path_only', False)).lower()}
   dalfox_path_only_max: {t.get('dalfox_path_only_max', 100)}
   dalfox_dedup_query_params: {str(t.get('dalfox_dedup_query_params', True)).lower()}
   dalfox_max_targets: {t.get('dalfox_max_targets', 40)}
-  dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 1500)}
+  dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 2400)}
   dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
   dalfox_workers: {t.get('dalfox_workers', 25)}
-  dalfox_delay_ms: {t.get('dalfox_delay_ms', 100)}
+  dalfox_delay_ms: {t.get('dalfox_delay_ms', 0)}
   dalfox_stall_timeout_sec: {t.get('dalfox_stall_timeout_sec', 0)}
   dalfox_mass_workers: {t.get('dalfox_mass_workers', 10)}
   blind_xss_auto: {str(t.get('blind_xss_auto', True)).lower()}
@@ -3835,7 +3839,7 @@ class ReconPipeline:
             warn("No URLs from stage 4 — skipping categorisation")
             self.summary["stage5"] = {"status": "skipped", "reason": "no_urls"}
             return
-        test_path_only = bool(_cfg_get(self.cfg, "tools", "dalfox_test_path_only", default=True))
+        test_path_only = bool(_cfg_get(self.cfg, "tools", "dalfox_test_path_only", default=False))
         path_only_max = int(_cfg_get(self.cfg, "tools", "dalfox_path_only_max", default=100) or 100)
         dedup_query = bool(_cfg_get(self.cfg, "tools", "dalfox_dedup_query_params", default=True))
         counts = categorise_streaming(url_file, d, test_path_only=test_path_only, path_only_max=path_only_max,
@@ -3916,7 +3920,7 @@ class ReconPipeline:
         # findings even on a target it flagged fine a minute earlier. Tunable.
         _dfx_workers = int(_cfg_get(self.cfg, "tools", "dalfox_workers",
                                     default=_cfg_get(self.cfg, "settings", "threads", default=25)) or 25)
-        _dfx_delay = int(_cfg_get(self.cfg, "tools", "dalfox_delay_ms", default=100) or 0)
+        _dfx_delay = int(_cfg_get(self.cfg, "tools", "dalfox_delay_ms", default=0) or 0)
         cmd += ["--worker", str(max(1, min(_dfx_workers, 40)))]
         if _dfx_delay > 0:
             cmd += ["--delay", str(_dfx_delay)]
@@ -4096,7 +4100,7 @@ class ReconPipeline:
         # incrementally, so a run cut off at the budget still keeps everything
         # found so far — far better than a 2h open-ended run that the user
         # ends up Ctrl+C-ing anyway.
-        _dfx_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=1500) or 1500)
+        _dfx_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=2400) or 2400)
         _dfx_budget = min(_dfx_budget, T["dalfox"]) if _dfx_budget > 0 else T["dalfox"]
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
@@ -4373,6 +4377,7 @@ class ReconPipeline:
         # crawler junk), dedup by (host, path, sorted-param-names), rank
         # param'd URLs above path-only, and keep the top N.
         _dfx_max = int(_cfg_get(self.cfg, "tools", "dalfox_max_targets", default=40) or 40)
+        _dfx_path_only = bool(_cfg_get(self.cfg, "tools", "dalfox_test_path_only", default=False))
         try:
             raw = [l.strip() for l in xss_file.read_text(errors="ignore").splitlines() if l.strip()]
         except Exception:
@@ -4397,7 +4402,15 @@ class ReconPipeline:
             clean.append((u, len(params)))
         # params first, then by shorter URL (less likely to be junk)
         clean.sort(key=lambda t: (0 if t[1] else 1, len(t[0])))
-        final = [u for u, _ in clean[:_dfx_max]]
+        _param_urls = [u for u, n in clean if n]
+        if _dfx_path_only or len(_param_urls) < 5:
+            # keep path-only URLs too (config opted in, or too few real
+            # injection points to fill a useful run)
+            final = [u for u, _ in clean[:_dfx_max]]
+        else:
+            # every URL dalfox tests without a query param costs ~30s of DOM
+            # mining for near-zero XSS yield — drop them
+            final = _param_urls[:_dfx_max]
         if not final:
             final = [u for u in raw if u.startswith(("http://", "https://"))][:_dfx_max]
         tested_f = d / "xss_targets_tested.txt"
