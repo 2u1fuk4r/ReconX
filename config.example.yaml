@@ -250,10 +250,3 @@ tools:
   report_title: "ReconX Professional Report"
   report_author: ""
   report_include_raw: false
-
-# ── ReconX auto-generated runtime state — DO NOT EDIT BY HAND, overwritten every run ──
-auto_state:
-  blind_callback_last_used: "daefprfqeopui4t64a4gz5io79658u6zz.oast.live"
-  blind_callback_last_target: "ginandjuice.shop"
-  blind_callback_last_used_at: "2026-09-06 01:55:31"
-  blind_callback_interactions_confirmed: 0
