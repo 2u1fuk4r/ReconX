@@ -385,6 +385,7 @@ def _parse_xss(d) -> dict:
     meta["ran"] = meta["status"] not in ("", "skipped")
     # v8.2: auto-provisioned interactsh blind-XSS callback + any confirmed
     # out-of-band interactions (see reconx.py stage6_xss / start_interactsh_session).
+    meta["suspicious_empty"] = bool(st6.get("suspicious_empty"))
     meta["blind_callback_used"] = st6.get("blind_callback_used") or ""
     meta["blind_interactions"] = st6.get("blind_interactions") or []
     # v8.2: screenshots of headless-verified ("V" type) XSS findings, replayed
@@ -1886,7 +1887,16 @@ def _section_xss(xss):
         body += _vtable(["PoC URL (full — copy button →)", "Payload", "Param", "Type", "Severity"],
                         rows, "vt-xss", copy_cols=[0, 1])
     elif ran:
-        body += _empty("Scan completed — 0 findings.")
+        if meta.get("suspicious_empty"):
+            body += ('<div class="alert-box" style="margin-bottom:14px;background:rgba(249,115,22,.1);'
+                     'border-color:rgba(249,115,22,.4);color:#fdba74">⚠ <b>Dalfox found 0 — but the run '
+                     'took real time across several targets.</b> On a target the pre-scan probe confirmed '
+                     'alive, that usually means the site rate-limited the payload burst (a CDN/ALB '
+                     'wrapping the reflections in 403/429 so dalfox can\'t see them). <b>Treat this as '
+                     '"inconclusive", not "clean"</b> — re-run later, from another IP, or lower '
+                     '<code>tools.dalfox_workers</code> / raise <code>tools.dalfox_delay_ms</code>.</div>')
+        else:
+            body += _empty("Dalfox scan completed — 0 reflected/DOM XSS on the tested parameters.")
     else:
         body += _empty("XSS scan not run.")
 

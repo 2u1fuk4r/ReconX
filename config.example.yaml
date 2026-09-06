@@ -197,6 +197,13 @@ tools:
   # Only parallelise when there are at least this many targets — below it the
   # process-spawn overhead isn't worth it.
   dalfox_parallel_min: 8
+  # dalfox's own per-target concurrency (its default is 100). Capped at 40.
+  # Lower this if the target rate-limits the payload burst (symptom: dalfox
+  # spends real time but reports 0 findings on a live target).
+  dalfox_workers: 25
+  # milliseconds between dalfox requests (0 = none). Raise alongside lowering
+  # workers if a target is throttling.
+  dalfox_delay_ms: 100
   # How long (seconds) dalfox can go with ZERO new output lines before ReconX
   # assumes it's genuinely stuck and force-stops it. Was a hardcoded 240s,
   # then a configurable 480s in v8.2 — both still fired on real scans that
@@ -250,3 +257,10 @@ tools:
   report_title: "ReconX Professional Report"
   report_author: ""
   report_include_raw: false
+
+# ── ReconX auto-generated runtime state — DO NOT EDIT BY HAND, overwritten every run ──
+auto_state:
+  blind_callback_last_used: "daeikefqeopul0nhkf1gjjfosgtmxq7zd.oast.pro"
+  blind_callback_last_target: "ginandjuice.shop"
+  blind_callback_last_used_at: "2026-09-06 05:00:30"
+  blind_callback_interactions_confirmed: 0

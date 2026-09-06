@@ -477,6 +477,8 @@ tools:
   dalfox_dedup_query_params: {str(t.get('dalfox_dedup_query_params', True)).lower()}
   dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
+  dalfox_workers: {t.get('dalfox_workers', 25)}
+  dalfox_delay_ms: {t.get('dalfox_delay_ms', 100)}
   dalfox_stall_timeout_sec: {t.get('dalfox_stall_timeout_sec', 0)}
   dalfox_mass_workers: {t.get('dalfox_mass_workers', 10)}
   blind_xss_auto: {str(t.get('blind_xss_auto', True)).lower()}
@@ -3883,6 +3885,17 @@ class ReconPipeline:
         cmd = ["dalfox", "file", str(xss_file),
                "-o", str(json_f), "--format", "jsonl", "--no-color",
                "--timeout", str(_dalfox_req_timeout)]
+        # v8.6: cap dalfox's own concurrency (default 100 workers) and add a
+        # small inter-request delay. dalfox's default burst trips per-IP rate
+        # limiting on CDN/ALB-fronted targets — when that happens the reflected
+        # payloads come back inside 403/429 bodies and dalfox reports 0
+        # findings even on a target it flagged fine a minute earlier. Tunable.
+        _dfx_workers = int(_cfg_get(self.cfg, "tools", "dalfox_workers",
+                                    default=_cfg_get(self.cfg, "settings", "threads", default=25)) or 25)
+        _dfx_delay = int(_cfg_get(self.cfg, "tools", "dalfox_delay_ms", default=100) or 0)
+        cmd += ["--worker", str(max(1, min(_dfx_workers, 40)))]
+        if _dfx_delay > 0:
+            cmd += ["--delay", str(_dfx_delay)]
 
         # v8.4-fix: dalfox v3.x (Rust rewrite) adds --state-file — it records
         # which targets FULLY finished and skips them on a re-run with the
@@ -4168,6 +4181,19 @@ class ReconPipeline:
         if lines:
             res["block_ratio"] = round(blocked / max(1, lines), 4)
 
+        # v8.6: dalfox finished cleanly, spent real time on several targets, and
+        # still found nothing — on a target the pre-scan HTTP probe confirmed
+        # alive this is often the CDN/ALB rate-limiting the payload burst
+        # (reflections come back wrapped in 403/429 so dalfox can't see them).
+        # Flag it so the report doesn't present a throttled run as "clean".
+        res["suspicious_empty"] = bool(
+            not findings and not killed and not res["tool_failed"]
+            and res["duration_sec"] > 45 and (res.get("targets_count", 0) or 0) >= 3)
+        if res["suspicious_empty"]:
+            warn("Dalfox 0 bulgu ile bitti ama gerçek süre harcadı — hedef muhtemelen "
+                 "payload akışını rate-limit'ledi (aynı IP'den çok tarama, CDN/ALB). "
+                 "Farklı bir zamanda / config'de tools.dalfox_workers'ı düşürerek tekrar dene.")
+
         # v8.1: dalfox artik dogrudan --format jsonl ile TEK dosyaya (json_f) yaziyor;
         # okunabilir .txt ozetini nuclei'deki ayni desenle biz kendimiz uretiyoruz.
         try:
@@ -4401,6 +4427,7 @@ class ReconPipeline:
             "blind_callback_used": run["blind_callback_used"],
             "blind_interactions": blind_interactions,
             "screenshots": xss_screenshots,
+            "suspicious_empty": run.get("suspicious_empty", False),
         }
         if run.get("tool_failed"):
             err(f"Dalfox HATA ILE SONLANDI — {run.get('tool_error','')} "
