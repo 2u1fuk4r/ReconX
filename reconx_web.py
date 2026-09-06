@@ -290,6 +290,37 @@ def _parse_summary(d: Path):
     s14 = st.get("stage14", {}) or {}
     out["sqli"] = int(s14.get("findings_confirmed", 0) or 0)
     out["sqli_candidates"] = int(s14.get("candidates", 0) or 0)
+
+    # fall back to the on-disk artefacts when SUMMARY lost a stage to a
+    # partial re-run (--resume / -s N rewrites SUMMARY without those stages)
+    def _jlen(p):
+        try:
+            return len(json.loads((d / p).read_text(errors="ignore")) or [])
+        except Exception:
+            return 0
+
+    def _lines(p):
+        try:
+            return sum(1 for x in (d / p).read_text(errors="ignore").splitlines() if x.strip())
+        except Exception:
+            return 0
+
+    if not out["xss"]:
+        out["xss"] = _lines("07_xss/dalfox_scan.json")
+    if not out["xss_confirmed"]:
+        out["xss_confirmed"] = sum(1 for x in (json.loads((d / "07_xss/xss_verified.json").read_text(errors="ignore"))
+                                               if (d / "07_xss/xss_verified.json").exists() else [])
+                                   if x.get("dialog_confirmed"))
+    if not out["sqli_candidates"]:
+        out["sqli_candidates"] = _jlen("14_sqli/sqli_candidates.json")
+    if not out["sqli"]:
+        out["sqli"] = sum(1 for x in (json.loads((d / "14_sqli/sqli_findings.json").read_text(errors="ignore"))
+                                      if (d / "14_sqli/sqli_findings.json").exists() else [])
+                          if x.get("confirmed", True))
+    if not out["nuclei"]:
+        out["nuclei"] = _lines("07_nuclei/nuclei_scan.json") + _lines("07_nuclei/nuclei_dast.json")
+    if not out["nuclei_dast"]:
+        out["nuclei_dast"] = _lines("07_nuclei/nuclei_dast.json")
     for key, sk in (("subs", "stage2"), ("alive", "stage3"), ("urls", "stage4")):
         out[key] = int((st.get(sk, {}) or {}).get("count", 0) or 0)
     out["js_secrets"] = len(((d / "10_js_secrets" / "secrets.json").exists()
