@@ -1,4 +1,4 @@
-# ReconX v8.6 — Professional Bug Bounty Configuration  (copy to config.yaml, fill keys)
+# ReconX v8.6 — Professional Bug Bounty Configuration
 # Tüm hassas anahtarlar ENV üzerinden de verilebilir: RECONX_SHODAN_KEY, RECONX_CENSYS_KEY vb.
 # Dosyadaki değerler boş bırakılırsa ENV değişkenleri otomatik kullanılır.
 
@@ -114,7 +114,15 @@ tools:
   # interactive confirmation; runs automatically under --auto. A "no findings"
   # result is only meaningful if the stage actually completed (check the
   # report's SQL Injection panel for status).
+  # Master switch for Stage 14. true = the stage runs (candidate listing always;
+  # active sqlmap only per sqli_active below).
   sqli_enabled: true
+  # ACTIVE sqlmap testing. false (default) = Stage 14 only LISTS likely
+  # injection points + any nuclei-DAST SQLi hit, each with a ready-to-run
+  # sqlmap command — fast, no active injection traffic. true = also run sqlmap
+  # to confirm and DBMS-fingerprint (adds 10-30 min). You can also force the
+  # active run for one scan with `--stage14` without touching this.
+  sqli_active: false
   # Hard cap on how many unique parameterised URLs are handed to sqlmap, since
   # sqlmap tests targets sequentially and is slow. URLs are deduped by
   # (host, path, sorted-param-names) first, so this is 25 distinct injection
@@ -128,6 +136,9 @@ tools:
   # Overall wall-clock ceiling (seconds) for the whole sqlmap run across all
   # targets. Hit = stage stops and reports partial results.
   sqli_timeout_sec: 1800
+  # sqlmap --technique. B=boolean E=error U=union S=stacked T=time Q=inline.
+  # Default BEUST (no Q) — detection only, never dump/modify.
+  sqli_technique: "BEUST"
 
   # XSS / Dalfox
   # Manual blind XSS callback URL. Leave empty to let ReconX auto-provision one
@@ -242,7 +253,7 @@ tools:
 
 # ── ReconX auto-generated runtime state — DO NOT EDIT BY HAND, overwritten every run ──
 auto_state:
-  blind_callback_last_used: "dae9ikfqeopo3p51duo0bwqqqxaqnbixu.oast.pro"
+  blind_callback_last_used: "daefprfqeopui4t64a4gz5io79658u6zz.oast.live"
   blind_callback_last_target: "ginandjuice.shop"
-  blind_callback_last_used_at: "2026-09-05 18:47:19"
+  blind_callback_last_used_at: "2026-09-06 01:55:31"
   blind_callback_interactions_confirmed: 0

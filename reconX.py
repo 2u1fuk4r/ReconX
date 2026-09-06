@@ -463,6 +463,7 @@ tools:
   nuclei_dast: {str(t.get('nuclei_dast', True)).lower()}
   nuclei_dast_max_urls: {t.get('nuclei_dast_max_urls', 400)}
   sqli_enabled: {str(t.get('sqli_enabled', True)).lower()}
+  sqli_active: {str(t.get('sqli_active', False)).lower()}
   sqli_max_targets: {t.get('sqli_max_targets', 25)}
   sqli_level: {t.get('sqli_level', 3)}
   sqli_risk: {t.get('sqli_risk', 2)}
@@ -1277,13 +1278,18 @@ def send_webhook_notification(cfg: dict, target: str, summary: dict) -> bool:
         crit = int(sev.get("critical", 0)); high = int(sev.get("high", 0))
         med  = int(sev.get("medium", 0))
         xss_n = int(s6.get("findings", 0) or 0)
-        sqli_n = int(s14.get("findings", 0) or 0)
+        sqli_conf = int(s14.get("findings_confirmed", 0) or 0)
+        sqli_cand = int(s14.get("candidates", 0) or 0)
+        sqli_dast = int(s14.get("dast_hits", 0) or 0)
         dast_n = int(s7.get("findings_dast", 0) or 0)
-        alert = "🔴" if (crit or high or sqli_n) else ("🟡" if (med or xss_n or dast_n) else "🟢")
+        alert = "🔴" if (crit or high or sqli_conf or sqli_dast) else ("🟡" if (med or xss_n or dast_n) else "🟢")
+        sqli_txt = (f"{sqli_conf} confirmed" if sqli_conf
+                    else (f"{sqli_dast} DAST-flagged / {sqli_cand} candidates" if sqli_dast
+                          else f"{sqli_cand} candidates (not tested)"))
         lines = [
             f"{alert} *ReconX scan complete* — `{target}`",
             f"Nuclei: {crit} critical, {high} high, {med} medium ({dast_n} via DAST)  ·  "
-            f"XSS: {xss_n}  ·  SQLi: {sqli_n}",
+            f"XSS: {xss_n}  ·  SQLi: {sqli_txt}",
         ]
         text = "\n".join(lines)
         payload = {"text": text, "content": text}  # Slack uses "text", Discord uses "content"
@@ -6324,50 +6330,145 @@ class ReconPipeline:
             ok(f"API discovery: {total} pattern hits, {len(probe_results)} candidates probed — none live")
 
     # ── Stage 14 — SQL Injection (sqlmap) ─────────────────────────────────────
+    _SQLI_HOT_PARAMS = {
+        "id","uid","pid","cid","sid","gid","tid","aid","eid","nid","rid","mid",
+        "item","itemid","item_id","product","productid","product_id","cat","category",
+        "cat_id","categoryid","page","pageid","p","num","no","order","orderby","sort",
+        "sortby","dir","filter","group","having","limit","offset","start","from","to",
+        "user","userid","user_id","username","account","ref","year","month","day",
+        "view","type","key","query","q","search","s","keyword","name","code","status",
+        "lang","currency","country","region","store","branch","report","invoice",
+    }
+
+    def _sqli_candidates(self, limit=200):
+        """Every parameterised URL, one row per (path, param), ranked by how
+        likely that parameter is a SQL-backed lookup. Plus any error/time-based
+        SQLi that nuclei -dast already flagged (those ARE evidence)."""
+        cands, seen = [], set()
+        for u in self._collect_param_urls(limit=limit * 3):
+            try:
+                pr = urlparse(u)
+                for k, v in parse_qsl(pr.query):
+                    key = (pr.hostname, pr.path, k.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    kl = k.lower()
+                    score = 0
+                    why = []
+                    if kl in self._SQLI_HOT_PARAMS:
+                        score += 5; why.append("common SQL param name")
+                    if v.isdigit():
+                        score += 3; why.append("numeric value")
+                    if re.search(r"(^|_)(id|key|no|num)$", kl):
+                        score += 2; why.append("id-shaped name")
+                    if any(s in pr.path.lower() for s in
+                           ("product", "catalog", "item", "article", "post", "news",
+                            "detail", "view", "profile", "account", "order", "invoice")):
+                        score += 2; why.append("DB-lookup path")
+                    cands.append({
+                        "url": u, "param": k, "value": v[:40], "score": score,
+                        "why": ", ".join(why) or "parameterised",
+                        "sqlmap_cmd": f"sqlmap -u {shlex.quote(u)} -p {shlex.quote(k)} "
+                                      f"--batch --level 3 --risk 2 --dbs",
+                        "source": "heuristic", "dast_template": "",
+                    })
+            except Exception:
+                continue
+        # fold in nuclei DAST SQLi hits
+        dast_j = self.out / "07_nuclei" / "nuclei_dast.json"
+        if dast_j.exists():
+            for line in dast_j.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                tid = (rec.get("template-id") or "").lower()
+                if not any(s in tid for s in ("sqli", "sql-injection", "error-based", "time-based")):
+                    continue
+                murl = rec.get("matched-at") or rec.get("host") or ""
+                cands.insert(0, {
+                    "url": murl, "param": "(see nuclei)", "value": "", "score": 20,
+                    "why": f"nuclei DAST flagged: {rec.get('template-id','')}",
+                    "sqlmap_cmd": f"sqlmap -u {shlex.quote(murl)} --batch --level 3 --risk 2 --dbs",
+                    "source": "nuclei-dast",
+                    "dast_template": rec.get("template-id", ""),
+                })
+        cands.sort(key=lambda c: -c["score"])
+        return cands[:limit]
+
     def stage14_sqli(self):
-        """v8.6: active SQLi testing with sqlmap on every parameterised URL.
-        Nuclei's DAST pass gives a fast error/time-based first look; this stage
-        is the thorough confirmation — sqlmap fingerprints the DBMS and proves
-        the injection. Gated behind an interactive prompt (auto-runs under
-        --auto) because it sends active injection traffic and can be slow."""
-        stage(14, "SQL Injection Testing — sqlmap")
+        """v8.6: SQL injection.
+        By default (tools.sqli_active: false) this stage does NOT run sqlmap —
+        active testing is slow (10-30 min). Instead it lists every likely
+        injection point (ranked heuristic + any nuclei -dast SQLi hit) with a
+        ready-to-paste sqlmap command per row. Set tools.sqli_active: true, or
+        run `--stage14` explicitly, to also run sqlmap and get confirmed
+        DBMS-fingerprinted injections."""
+        stage(14, "SQL Injection — candidates" +
+              (" + active sqlmap" if (bool(_cfg_get(self.cfg, "tools", "sqli_active", default=False))
+                                      or getattr(self, "sqli_chosen", False)) else " (no active test)"))
         d = self.out / "14_sqli"
         d.mkdir(parents=True, exist_ok=True)
-        self.sqli_results = {"findings": [], "targets_count": 0, "file_json": "",
-                             "file_txt": "", "tool_failed": False, "tool_error": "",
-                             "duration_sec": 0.0, "interrupted": False}
+        self.sqli_results = {"findings": [], "candidates": [], "targets_count": 0,
+                             "file_json": "", "file_txt": "", "tool_failed": False,
+                             "tool_error": "", "duration_sec": 0.0, "interrupted": False,
+                             "active_ran": False}
 
-        if not (self.auto_mode or getattr(self, "sqli_chosen", False)):
-            warn("SQLi taraması onaylanmadı — stage atlandı")
-            self.summary["stage14"] = {"status": "skipped", "reason": "not_confirmed"}
-            return
-        if not bool(_cfg_get(self.cfg, "tools", "sqli_enabled", default=True)):
-            self.summary["stage14"] = {"status": "skipped", "reason": "disabled_in_config"}
+        candidates = self._sqli_candidates()
+        (d / "sqli_candidates.json").write_text(
+            json.dumps(candidates, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            with (d / "sqli_candidates.txt").open("w", encoding="utf-8") as fo:
+                for c in candidates:
+                    fo.write("[score %2d] %-16s %s\n           %s\n           %s\n\n"
+                             % (c["score"], c["param"], c["why"], c["url"], c["sqlmap_cmd"]))
+        except Exception:
+            pass
+        self.sqli_results["candidates"] = candidates
+        dast_hits = [c for c in candidates if c["source"] == "nuclei-dast"]
+        if candidates:
+            ok(f"SQLi candidates: {len(candidates)} injection point(s) listed"
+               + (f" ({len(dast_hits)} already flagged by nuclei DAST)" if dast_hits else "")
+               + " — each with a ready sqlmap command in the report")
+        else:
+            sub("SQLi candidates: parametreli URL yok")
+
+        active = (bool(_cfg_get(self.cfg, "tools", "sqli_active", default=False))
+                  or getattr(self, "sqli_chosen", False))
+        if not active:
+            self.summary["stage14"] = {
+                "status": "done", "mode": "candidates_only",
+                "candidates": len(candidates), "dast_hits": len(dast_hits),
+                "findings": 0, "findings_confirmed": 0,
+                "note": "active sqlmap disabled (tools.sqli_active: false) — "
+                        "run with --stage14 or set sqli_active: true to confirm",
+            }
             return
         if not tool_exists("sqlmap"):
-            warn("sqlmap not installed — SQLi stage atlandı (apt install sqlmap)")
-            self.summary["stage14"] = {"status": "skipped", "reason": "not_installed"}
+            warn("sqlmap not installed — sadece aday listesi üretildi (apt install sqlmap)")
+            self.summary["stage14"] = {"status": "done", "mode": "candidates_only",
+                                       "candidates": len(candidates), "dast_hits": len(dast_hits),
+                                       "findings": 0, "findings_confirmed": 0,
+                                       "reason": "not_installed"}
             return
 
         max_t = int(_cfg_get(self.cfg, "tools", "sqli_max_targets", default=25) or 25)
-        param_urls = self._collect_param_urls(limit=max_t * 4)[:max_t]
+        param_urls = list(dict.fromkeys(c["url"] for c in candidates))[:max_t]
         if not param_urls:
-            warn("Parametreli URL yok — SQLi stage atlandı")
-            self.summary["stage14"] = {"status": "skipped", "reason": "no_param_urls"}
+            self.summary["stage14"] = {"status": "done", "mode": "candidates_only",
+                                       "candidates": 0, "findings": 0, "findings_confirmed": 0}
             return
 
         tgt = d / "sqli_targets.txt"
         write_lines(tgt, param_urls)
         self.sqli_results["targets_count"] = len(param_urls)
+        self.sqli_results["active_ran"] = True
         results_csv = d / "sqlmap_results.csv"
         smd = d / "sqlmap_data"
-
-        # v8.6-fix: --smart makes sqlmap skip any target that doesn't trip a
-        # quick error-signature heuristic — on a real, confirmed-injectable
-        # target (ginandjuice.shop ?category=, boolean-blind + UNION, H2) it
-        # skipped everything in 7s and reported "no SQLi". Dropped. Defaults
-        # raised to level 3 / risk 2 — the widely-used bug-bounty baseline
-        # (the confirmed injection above needs exactly that to surface).
         level = str(int(_cfg_get(self.cfg, "tools", "sqli_level", default=3) or 3))
         risk = str(int(_cfg_get(self.cfg, "tools", "sqli_risk", default=2) or 2))
         technique = (_cfg_get(self.cfg, "tools", "sqli_technique", default="BEUST") or "BEUST").strip()
@@ -6381,10 +6482,9 @@ class ReconPipeline:
         if cookie:
             cmd += ["--cookie", cookie]
             sub("Using authenticated session for sqlmap")
-
         timeout_s = int(_cfg_get(self.cfg, "tools", "sqli_timeout_sec", default=1800) or 1800)
-        info(f"sqlmap {len(param_urls):,} parametreli URL üzerinde çalışıyor "
-             f"(level={level}, risk={risk}) — aktif enjeksiyon testi, sabırla bekleyin")
+        info(f"sqlmap {len(param_urls):,} URL üzerinde çalışıyor (level={level}, risk={risk}) "
+             f"— aktif enjeksiyon testi, sabırla bekleyin")
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
             cmd, timeout=timeout_s, log=self.log, label="sqlmap",
@@ -6409,8 +6509,7 @@ class ReconPipeline:
                                     ("false positive", "unexploitable", "not injectable"))
                         findings.append({
                             "url": url, "param": param, "place": row.get("place", ""),
-                            "technique": tech, "note": note,
-                            "confirmed": not shaky,
+                            "technique": tech, "note": note, "confirmed": not shaky,
                             "severity": "high" if not shaky else "medium",
                         })
             except Exception as e:  # noqa: BLE001
@@ -6426,7 +6525,6 @@ class ReconPipeline:
         except Exception:
             pass
         checkpoint(self._cp("stage14_sqli"), [f["url"] for f in findings], "sqli")
-
         self.sqli_results.update({"findings": findings, "file_json": str(json_f), "file_txt": str(txt_f)})
         if killed and rc not in (0, 1, None):
             self.sqli_results["tool_failed"] = True
@@ -6434,28 +6532,26 @@ class ReconPipeline:
         _confirmed = [f for f in findings if f.get("confirmed")]
         self.summary["stage14"] = {
             "status": "done" if not self.sqli_results["tool_failed"] else "tool_error",
-            "findings": len(findings),
-            "findings_confirmed": len(_confirmed),
-            "targets_count": len(param_urls),
-            "file_json": str(json_f),
-            "file_txt": str(txt_f),
+            "mode": "active", "candidates": len(candidates), "dast_hits": len(dast_hits),
+            "findings": len(findings), "findings_confirmed": len(_confirmed),
+            "targets_count": len(param_urls), "file_json": str(json_f), "file_txt": str(txt_f),
             "tool_failed": self.sqli_results["tool_failed"],
             "tool_error": self.sqli_results["tool_error"],
-            "interrupted": bool(killed),
-            "duration_sec": self.sqli_results["duration_sec"],
+            "interrupted": bool(killed), "duration_sec": self.sqli_results["duration_sec"],
         }
         if _confirmed:
             err(f"sqlmap {len(_confirmed)} SQL injection point(s) CONFIRMED — "
                 f"{', '.join(sorted({f['param'] for f in _confirmed}))}"
-                + (f"  (+{len(findings) - len(_confirmed)} flagged but sqlmap marked "
-                   f"possibly-FP)" if len(findings) > len(_confirmed) else ""))
+                + (f"  (+{len(findings) - len(_confirmed)} flagged possibly-FP)"
+                   if len(findings) > len(_confirmed) else ""))
         elif findings:
-            warn(f"sqlmap flagged {len(findings)} point(s) but marked them possibly false-positive "
+            warn(f"sqlmap flagged {len(findings)} point(s) as possibly false-positive "
                  f"— verify by hand: {', '.join(sorted({f['param'] for f in findings}))}")
         elif killed:
             warn("sqlmap erken durduruldu — bulgular EKSIK olabilir")
         else:
-            ok("sqlmap completed — no SQL injection confirmed")
+            ok("sqlmap completed — no SQL injection confirmed (candidates still listed above)")
+
 
     def run(self, stages=None):
         all_s = {
@@ -6533,13 +6629,18 @@ class ReconPipeline:
                             continue
                     self.nuclei_chosen = True
                 if n == 14:
-                    if interactive:
+                    # Active sqlmap only when the user explicitly asked for
+                    # stage 14 (-s 14 / --stage14) or opted in interactively.
+                    # In the default --auto pipeline stage 14 just LISTS
+                    # candidates (fast) unless tools.sqli_active is set.
+                    explicit_14 = stages is not None and 14 in stages
+                    if explicit_14:
+                        self.sqli_chosen = True
+                    elif interactive:
                         self.sqli_asked = True
-                        if not ask_yes_no("Parametreli URL'lerde SQLi (sqlmap) taraması yapmak ister misiniz? "
-                                          "(aktif enjeksiyon testi — yavaş olabilir)", default="n"):
-                            _INT.reset()
-                            continue
-                    self.sqli_chosen = True
+                        if ask_yes_no("Parametreli URL'lerde AKTİF SQLi (sqlmap) taraması da yapılsın mı? "
+                                      "(yavaş — 10-30 dk; hayır dersen sadece aday listesi çıkar)", default="n"):
+                            self.sqli_chosen = True
 
                 try:
                     all_s[n]()
@@ -6633,6 +6734,10 @@ def main():
                    help="Nuclei severity filter (e.g. critical,high,medium)")
     p.add_argument("--blind",           dest="blind_cb", default=None,
                    help="Blind XSS callback URL for Dalfox")
+    p.add_argument("--sqli-active",      dest="sqli_active", action="store_true",
+                   help="Stage 14: also run sqlmap to actively confirm SQLi candidates "
+                        "(slow, 10-30 min). Without this, stage 14 only lists candidates "
+                        "with a ready sqlmap command each.")
 
     auth_grp = p.add_argument_group("Authenticated scanning")
     auth_grp.add_argument("--login-url", dest="login_url", default=None,
@@ -6670,6 +6775,8 @@ def main():
         warn(f"DNS resilience check failed: {_dns_e}")
 
     cfg = load_config(Path(args.config))
+    if getattr(args, "sqli_active", False):
+        cfg.setdefault("tools", {})["sqli_active"] = True
     default_scheme = (_cfg_get(cfg, "settings", "default_scheme", default="https") or "https").strip()
 
     url_targets = []

@@ -67,7 +67,7 @@ confirmation — by passing them you assert you already have authorization.
 | 11 | Tech Priority | normalise detected tech → risk-ranked summary |
 | 12 | Extra Checks | CORS misconfig, subdomain takeover, open cloud buckets |
 | 13 | API Discovery | GraphQL / Swagger / OpenAPI pattern match **+ live probe** |
-| 14 | SQL Injection | sqlmap on deduped parameterised URLs (interactive-gated) |
+| 14 | SQL Injection | ranks likely injection points (+ nuclei-DAST SQLi hits) with a ready sqlmap command each; runs sqlmap itself only with `--stage14` or `sqli_active: true` |
 
 ---
 
@@ -100,8 +100,11 @@ python3 -m pip install --break-system-packages playwright && playwright install 
 ## 🚀 Usage
 
 ```bash
-# Full 14-stage pipeline (interactive confirmations for XSS / Nuclei / SQLi)
+# Full 14-stage pipeline (interactive confirmations for XSS / Nuclei / active SQLi)
 sudo python3 reconX.py -d example.com
+
+# Deep SQLi: also run sqlmap on the candidates (slow)
+sudo python3 reconX.py -d example.com --stage14
 
 # Fully unattended — no prompts (CI / scheduled / background)
 sudo python3 reconX.py -d example.com --auto
@@ -148,11 +151,11 @@ tools:
   dalfox_custom_payload: "xss-payloads.txt"
   blind_xss_auto: true         # auto-provision an interactsh OOB callback
 
-  sqli_enabled: true           # Stage 14
+  sqli_enabled: true           # Stage 14 runs (candidate listing always)
+  sqli_active: false           # also run sqlmap? (slow — 10-30 min). --stage14 forces it
   sqli_max_targets: 25
-  sqli_level: 2                # sqlmap --level
-  sqli_risk: 1                 # sqlmap --risk
-  sqli_timeout_sec: 1800
+  sqli_level: 3                # sqlmap --level  (only when active)
+  sqli_risk: 2                 # sqlmap --risk
 ```
 
 ### DNS on restricted networks

@@ -329,10 +329,11 @@ def _xss_rec(rec):
     typ = _DALFOX_TYPE_LABELS.get(raw_type, raw_type)
     severity = str(rec.get("severity") or "")
     cwe = str(rec.get("cwe") or "")
+    evidence = str(rec.get("evidence") or "").strip()
     if not url and not payload:
         return None
     return {"url": url, "payload": payload, "param": param, "type": typ,
-            "severity": severity, "cwe": cwe}
+            "severity": severity, "cwe": cwe, "evidence": evidence}
 
 
 def _parse_xss(d) -> dict:
@@ -802,7 +803,12 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
     if xss and xss.get("findings"):
         extra_stats.append(_stat(len(xss["findings"]), "XSS Findings", "orange", "💥"))
     if sqli and sqli.get("findings"):
-        extra_stats.append(_stat(len(sqli["findings"]), "SQLi Confirmed", "red", "💉"))
+        _sc = [f for f in sqli["findings"] if f.get("confirmed", True)]
+        extra_stats.append(_stat(len(_sc) or len(sqli["findings"]), "SQLi Confirmed", "red", "💉"))
+    elif sqli and sqli.get("candidates"):
+        _dh = sum(1 for c in sqli["candidates"] if c.get("source") == "nuclei-dast")
+        extra_stats.append(_stat(len(sqli["candidates"]), "SQLi Candidates",
+                                 "red" if _dh else "orange", "🎯"))
     if js and js.get("secrets"):
         extra_stats.append(_stat(len(js["secrets"]), "JS Secrets", "purple", "🔑"))
     if tech:
@@ -941,7 +947,10 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
             pass
     xss_point_n = max(len(_xss_points), 1 if _xf else 0) - xss_verified_n
     xss_n = len(_xf)
-    sqli_n = len((sqli or {}).get("findings", [])) if sqli else 0
+    _sqf = (sqli or {}).get("findings", []) if sqli else []
+    sqli_n = len([f for f in _sqf if f.get("confirmed", True)]) if _sqf else 0
+    # a nuclei-DAST SQLi hit is real evidence even without an active sqlmap run
+    sqli_n += sum(1 for c in (sqli or {}).get("candidates", []) if c.get("source") == "nuclei-dast")
     tech_high_n = sum(1 for t in tech if t.get("risk_label") == "high") if tech else 0
     extra_vuln_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
@@ -1495,7 +1504,7 @@ def _section_api(api_data):
 
 def _parse_sqli(d) -> dict:
     d = Path(d)
-    findings = []
+    findings, candidates = [], []
     jf = d / "14_sqli" / "sqli_findings.json"
     if jf.exists():
         try:
@@ -1504,46 +1513,56 @@ def _parse_sqli(d) -> dict:
                 findings = [x for x in data if isinstance(x, dict)]
         except Exception:
             pass
+    cf = d / "14_sqli" / "sqli_candidates.json"
+    if cf.exists():
+        try:
+            data = json.loads(cf.read_text(errors="ignore")) or []
+            if isinstance(data, list):
+                candidates = [x for x in data if isinstance(x, dict)]
+        except Exception:
+            pass
     sm = _parse_summary_json(d)
     st14 = sm.get("stages", {}).get("stage14") or {}
     meta = {
         "status": st14.get("status", ""),
+        "mode": st14.get("mode", ""),
         "tool_failed": bool(st14.get("tool_failed")),
         "tool_error": st14.get("tool_error", ""),
         "interrupted": bool(st14.get("interrupted")),
         "duration_sec": st14.get("duration_sec", 0),
         "targets_count": st14.get("targets_count", 0),
+        "dast_hits": st14.get("dast_hits", 0),
         "reason": st14.get("reason", ""),
+        "note": st14.get("note", ""),
+        "active_ran": st14.get("mode") == "active",
         "ran": st14.get("status") not in ("", "skipped", "not-run"),
     }
-    return {"findings": findings, "raw_txt": _read(d / "14_sqli" / "sqli_findings.txt"), "meta": meta}
+    return {"findings": findings, "candidates": candidates,
+            "raw_txt": _read(d / "14_sqli" / "sqli_findings.txt"), "meta": meta}
 
 
 def _section_sqli(sq):
     findings = sq.get("findings", [])
+    candidates = sq.get("candidates", [])
     meta = sq.get("meta", {})
+    active = bool(meta.get("active_ran"))
     hdr = ('<div id="s-sqli" class="section">'
            '<div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>SQL Injection</h2>'
-           f'<p class="sec-sub">sqlmap · {meta.get("targets_count",0)} parameterised URL(s) tested'
-           f'{" · " + str(round(meta.get("duration_sec",0)/60,1)) + " min" if meta.get("duration_sec") else ""}</p>'
-           '</div></div></div>')
-    if meta.get("tool_failed"):
-        return hdr + (f'<div class="alert-box alert-red" style="margin-bottom:14px">sqlmap did not finish cleanly — '
-                      f'{_e(meta.get("tool_error") or "unknown error")}. A "no findings" result here '
-                      f'is NOT proof the target is safe.</div></div>')
-    if not meta.get("ran"):
-        why = {"not_confirmed": "not confirmed at the interactive prompt (run with --auto or answer y)",
-               "not_installed": "sqlmap is not installed",
-               "no_param_urls": "no parameterised URLs were discovered",
-               "disabled_in_config": "disabled in config.yaml (tools.sqli_enabled)"}.get(meta.get("reason", ""), meta.get("reason", "stage did not run"))
-        return hdr + _empty(f"SQLi stage did not run — {why}") + "</div>"
-    if not findings:
-        return hdr + _empty("sqlmap completed — no SQL injection confirmed on the tested parameters") + "</div>"
+           f'<p class="sec-sub">{len(candidates)} candidate injection point(s)'
+           + (f' · sqlmap ran on {meta.get("targets_count",0)} URL(s)'
+              + (f' · {round(meta.get("duration_sec",0)/60,1)} min' if meta.get("duration_sec") else '')
+              if active else ' · active sqlmap test NOT run (fast mode)')
+           + '</p></div></div></div>')
 
     _TECH = {"B": "boolean-based blind", "E": "error-based", "U": "UNION query",
              "S": "stacked queries", "T": "time-based blind", "Q": "inline query"}
     def _tech_full(t):
         return ", ".join(_TECH.get(c, c) for c in (t or "")) or "?"
+
+    if meta.get("tool_failed"):
+        return hdr + (f'<div class="alert-box alert-red" style="margin-bottom:14px">sqlmap did not finish cleanly — '
+                      f'{_e(meta.get("tool_error") or "unknown error")}. Candidates below still stand.</div>'
+                      + _sqli_candidates_html(candidates, _tech_full) + "</div>")
 
     confirmed = [f for f in findings if f.get("confirmed", True)]
     shaky = [f for f in findings if not f.get("confirmed", True)]
@@ -1553,11 +1572,20 @@ def _section_sqli(sq):
                  _tech_full(f.get("technique", "")), f.get("note", "") or "—"] for f in fs]
 
     out = hdr
+    dast_n = sum(1 for c in candidates if c.get("source") == "nuclei-dast")
     stat = (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">'
-            f'{_stat(len(confirmed), "Confirmed", "red", "💉")}'
-            f'{_stat(len(shaky), "Needs manual check", "yellow", "❔")}'
-            f'{_stat(len({f.get("url","") for f in findings}), "Affected URLs", "orange", "🎯")}</div>')
+            f'{_stat(len(candidates), "Candidates", "orange", "🎯")}'
+            f'{_stat(dast_n, "Nuclei DAST hits", "red" if dast_n else "gray", "🧨")}'
+            + (f'{_stat(len(confirmed), "sqlmap Confirmed", "red", "💉")}'
+               f'{_stat(len(shaky), "Needs manual check", "yellow", "❔")}' if active else '')
+            + '</div>')
     out += stat
+    if not active:
+        out += ('<div class="alert-box" style="margin-bottom:14px;background:rgba(59,130,246,.08);'
+                'border-color:rgba(59,130,246,.3);color:#93c5fd">'
+                'ℹ Active sqlmap testing is off (fast mode). Every likely injection point is listed '
+                'below with a ready-to-run <code>sqlmap</code> command. Re-run with '
+                '<code>--stage14</code> or set <code>tools.sqli_active: true</code> to confirm them.</div>')
     if confirmed:
         # one PoC card per confirmed point: the sqlmap resume command replays it
         cards = ""
@@ -1582,7 +1610,30 @@ def _section_sqli(sq):
                 'possibly false-positive / unexploitable — verify by hand before reporting)</span></div>'
                 + _vtable(["Target URL", "Parameter", "Place", "Technique(s)", "sqlmap note"],
                           _rows(shaky), "vt-sqli-shaky", copy_cols=[0]))
+    out += _sqli_candidates_html(candidates, _tech_full, skip_confirmed={f.get("url") for f in confirmed})
     return out + "</div>"
+
+
+def _sqli_candidates_html(candidates, tech_full, skip_confirmed=None):
+    skip_confirmed = skip_confirmed or set()
+    rows = []
+    for c in candidates:
+        if c.get("url") in skip_confirmed:
+            continue
+        rows.append([
+            str(c.get("score", "")),
+            c.get("param", ""),
+            c.get("why", ""),
+            c.get("url", ""),
+            c.get("sqlmap_cmd", ""),
+        ])
+    if not rows:
+        return _empty("No parameterised URLs to flag as SQLi candidates.")
+    return ('<div class="subsection-label" style="margin:18px 0 8px">Candidate injection points '
+            '<span style="color:var(--muted);font-weight:400">(ranked by likelihood — '
+            'copy the sqlmap command to test one)</span></div>'
+            + _vtable(["Score", "Parameter", "Why flagged", "URL", "sqlmap command — click ⧉ to copy"],
+                      rows, "vt-sqli-cand", copy_cols=[3, 4]))
 
 
 def _section_nuclei(nuc):
@@ -1770,10 +1821,12 @@ def _section_xss(xss):
                 base = f.get("url") or ""
             k = (base, f.get("param") or "")
             g = _grp.setdefault(k, {"payloads": set(), "types": set(), "sev": set(),
-                                    "poc": f.get("url") or "", "confirmed": False})
+                                    "poc": f.get("url") or "", "confirmed": False, "evidence": ""})
             g["payloads"].add(f.get("payload") or "")
             g["types"].add(f.get("type") or "")
             g["sev"].add(f.get("severity") or "")
+            if f.get("evidence") and not g["evidence"]:
+                g["evidence"] = f["evidence"]
             if f.get("url") in _confirmed_urls or f.get("type") in (
                     _DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"]):
                 g["confirmed"] = True
@@ -1783,17 +1836,21 @@ def _section_xss(xss):
                                        key=lambda kv: (0 if kv[1]["confirmed"] else 1,
                                                        -len(kv[1]["payloads"]))):
             grows.append([
-                "✅ CONFIRMED" if g["confirmed"] else "unconfirmed",
+                "✅ CONFIRMED" if g["confirmed"] else "unconfirmed — check context",
                 param,
                 base,
                 str(len(g["payloads"])),
+                (g["evidence"] or "")[:180],
                 g["poc"],
             ])
         body += ('<div class="subsection-label" style="margin:18px 0 8px">Injection points '
                  f'<span style="color:var(--muted);font-weight:400">({len(_grp)} unique · '
-                 f'{len(findings)} raw payload hits — ✅ = a real dialog fired on headless replay)</span></div>'
-                 + _vtable(["Status", "Parameter", "URL", "# payloads", "PoC URL — click ⧉ to copy the whole thing"],
-                           grows, "vt-xss-grp", copy_cols=[4]))
+                 f'{len(findings)} raw payload hits — ✅ = a real dialog fired on headless replay; '
+                 f'"unconfirmed" = payload reflected but did not execute on replay, check the '
+                 f'evidence column for context)</span></div>'
+                 + _vtable(["Status", "Parameter", "URL", "# payloads", "Reflection context (dalfox evidence)",
+                            "PoC URL — click ⧉ to copy"],
+                           grows, "vt-xss-grp", copy_cols=[5]))
 
         # ── 3. every payload hit — full PoC URL copyable per row ──
         body += '<div class="subsection-label" style="margin:18px 0 8px">All payload hits</div>'
@@ -2255,7 +2312,11 @@ body{
 /* v8.5: per-cell copy button (URL/payload PoC columns) — hidden until the row
    is hovered, so it doesn't clutter every row visually. Copies the cell's
    FULL untruncated value (see vtRender), not the CSS-ellipsis-clipped text. */
-.tbl-scroll td.has-copy{display:flex;align-items:center;gap:6px;max-width:320px}
+/* v8.6-fix: display:flex on a <td> breaks table column layout (two copy-cells
+   in one row would stack). Keep the td a normal table cell; lay out its
+   content with an inner flex wrapper instead. */
+.tbl-scroll td.has-copy{max-width:420px;white-space:nowrap}
+.tbl-scroll td.has-copy .cell-wrap{display:flex;align-items:center;gap:6px}
 .tbl-scroll td.has-copy .cell-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
 .cell-copy{flex:0 0 auto;opacity:0;width:20px;height:20px;padding:0;border:1px solid var(--border);
   border-radius:4px;background:var(--surface2);color:var(--muted);font-size:11px;line-height:1;cursor:pointer;
@@ -2583,7 +2644,9 @@ function vtRender(uid){
             setTimeout(function(){ btn.classList.remove('copied'); btn.textContent='⧉'; },900);
           });
         };
-        td.appendChild(span); td.appendChild(btn);
+        var wrap=document.createElement('div'); wrap.className='cell-wrap';
+        wrap.appendChild(span); wrap.appendChild(btn);
+        td.appendChild(wrap);
       } else {
         td.textContent=c;
       }
@@ -2920,7 +2983,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 <div class="nav-grp"><div class="nav-lbl">Findings</div>
   {_nav("🧨" if not nuc.get("meta",{}).get("tool_failed") else "⚠️","Nuclei","nuclei", len(nuc.get("findings",[])) if not nuc.get("meta",{}).get("tool_failed") else "ERR", "red")}
   {_nav("💥" if not xss.get("meta",{}).get("tool_failed") else "⚠️","XSS","xss", len(xss.get("findings",[])) if not xss.get("meta",{}).get("tool_failed") else "ERR", "orange" if not xss.get("meta",{}).get("tool_failed") else "red")}
-  {_nav("💉" if not sqli.get("meta",{}).get("tool_failed") else "⚠️","SQL Injection","sqli", len(sqli.get("findings",[])) if not sqli.get("meta",{}).get("tool_failed") else "ERR", "red" if (sqli.get("findings") or sqli.get("meta",{}).get("tool_failed")) else None)}
+  {_nav("💉" if not sqli.get("meta",{}).get("tool_failed") else "⚠️","SQL Injection","sqli", (len(sqli.get("findings",[])) or len(sqli.get("candidates",[]))) if not sqli.get("meta",{}).get("tool_failed") else "ERR", "red" if (sqli.get("findings") or any(c.get("source")=="nuclei-dast" for c in sqli.get("candidates",[])) or sqli.get("meta",{}).get("tool_failed")) else None)}
   {_nav("🛡️","Extra Checks","extra", extra_vuln_n, "red" if extra_vuln_n else None)}
   {_nav("🔑","JS Secrets","js", len(js.get("secrets",[])), "purple")}
   {_nav("⚡","API Discovery","api", len(api.get("probes",[])) + sum(len(v) for v in api.get("found",{}).values()))}
