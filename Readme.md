@@ -103,11 +103,14 @@ git clone https://github.com/2u1fuk4r/ReconX
 cd ReconX
 sudo bash install.sh          # installs every external tool, idempotent
 python3 -m pip install --break-system-packages -r requirements.txt
-cp config.example.yaml config.yaml     # then add your API keys (or use env vars)
+python3 reconX.py --doctor    # verifies the install; also writes a default config.yaml
 ```
 
-`config.yaml` is git-ignored (it holds keys); ReconX also auto-generates a
-default one on first run if it's missing.
+`config.yaml` is git-ignored (it holds API keys) and is **not** shipped in the
+repo in any form. If it is missing, ReconX writes a working default from its
+built-in template on first run — every knob at its default value, with the
+non-obvious ones commented. Edit that file, or supply secrets through the
+environment instead (`RECONX_CENSYS_KEY`, …).
 
 External tools used (installed by `install.sh`): `httpx`, `subfinder`,
 `assetfinder`, `findomain`, `dnsx`, `nuclei` (+ templates), `katana`, `gau`,

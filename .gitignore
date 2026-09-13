@@ -1,4 +1,4 @@
-# Local config (holds API keys) — ship config.example.yaml instead.
+# Local config (holds API keys) — never commit it in any form.
 # ReconX auto-generates a fresh config.yaml on first run if missing.
 config.yaml
 
