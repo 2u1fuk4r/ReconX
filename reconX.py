@@ -7726,7 +7726,7 @@ _PY_CHECKS = [
     ("curl_cffi", "recommended", "Primary HTTP client (Cloudflare-friendly TLS)"),
     ("stem",      "optional",    "Tor control port — automatic IP rotation"),
     ("flask",     "optional",    "Web control panel (reconx_web.py)"),
-    ("playwright","optional",    "Stage 6 — headless XSS proof screenshots"),
+    ("selenium",  "optional",    "Stage 6 — headless XSS proof screenshots (needs chromedriver too)"),
 ]
 
 _SEV_STYLE = {

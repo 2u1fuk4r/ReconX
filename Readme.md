@@ -69,8 +69,11 @@ tool is itself the assertion that you have authorization.
   cloud sandboxes) ReconX detects the broken resolver and transparently
   routes lookups through a bundled DoH forwarder (`reconx_dns.py`), so tools
   stop silently failing with "could not resolve host".
-- Curated `xss-payloads.txt` (WAF-bypass / context-breakout vectors) fed to
-  Dalfox `--custom-payload` on top of its built-in set.
+- Curated `xss-payloads.txt` (WAF-bypass / context-breakout vectors) shipped for
+  Dalfox `--custom-payload`. **Off by default** since v8.6: feeding 65 extra
+  payloads per parameter made stage 6 ~5x slower without finding more than
+  dalfox's own built-ins. Opt in with `tools.dalfox_custom_payload:
+  "xss-payloads.txt"`.
 - Authenticated scanning: `--login-*`, `--cookie`, or replay a raw Burp/ZAP
   request with `-r`.
 
@@ -83,7 +86,7 @@ tool is itself the assertion that you have authorization.
 | 1 | Initial Recon | whois, whatweb, wafw00f, nmap, HTTP probe |
 | 2 | Subdomain Enumeration | subfinder, assetfinder, findomain, crt.sh fallback |
 | 3 | Alive Detection | httpx probe + fingerprint (status/title/tech/IP/CDN) |
-| 4 | URL Discovery | gau, waybackurls, katana (+ dead-URL pruning) |
+| 4 | URL Discovery | gau (wayback/commoncrawl/otx/urlscan) + katana (+ dead-URL pruning) |
 | 5 | Categorisation | reflection detection, XSS-target prioritisation, param extraction |
 | 6 | XSS | Dalfox (standard + DOM mining + custom payloads + blind/interactsh) |
 | 7 | Nuclei | template scan (tech fastpass + severity filter) **+ DAST fuzzing pass** |
@@ -120,10 +123,13 @@ External tools used (installed by `install.sh`): `httpx`, `subfinder`,
 Run `python3 reconX.py --doctor` at any time to see which of them are present
 and which stage each missing one would degrade.
 
-Optional — XSS `alert()` verification screenshots:
+Optional — XSS `alert()` verification screenshots (stage 6 replays every dalfox
+candidate in a headless browser and only marks it CONFIRMED when a real dialog
+fires). Uses Selenium against the system Chromium/Chrome:
 
 ```bash
-python3 -m pip install --break-system-packages playwright && playwright install chromium
+python3 -m pip install --break-system-packages selenium
+sudo apt install -y chromium chromium-driver     # or: chromedriver
 ```
 
 ---
@@ -204,7 +210,7 @@ settings:
 tools:
   nuclei_severity: critical,high,medium
   nuclei_dast: true            # Stage 7 DAST fuzzing pass
-  dalfox_custom_payload: "xss-payloads.txt"
+  dalfox_custom_payload: ""    # "" = dalfox built-ins only (default, ~5x faster)
   blind_xss_auto: true         # auto-provision an interactsh OOB callback
   dalfox_max_targets: 40       # hard cap on the dalfox target list
   dalfox_time_budget_sec: 1500 # per-stage wall-clock budget for dalfox

@@ -81,8 +81,8 @@ go_need httpx        "github.com/projectdiscovery/httpx/cmd/httpx"
 go_need subfinder    "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 go_need nuclei       "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 go_need katana       "github.com/projectdiscovery/katana/cmd/katana"
+go_need dnsx         "github.com/projectdiscovery/dnsx/cmd/dnsx"
 go_need gau          "github.com/lc/gau/v2/cmd/gau"
-go_need waybackurls  "github.com/tomnomnom/waybackurls"
 go_need dalfox       "github.com/hahwul/dalfox/v2"
 go_need findomain    "github.com/Findomain/Findomain"
 go_need assetfinder  "github.com/tomnomnom/assetfinder"
@@ -140,33 +140,6 @@ else
   skip "paramspider"
 fi
 
-# Sublist3r (git clone + pip)
-if ! command -v sublist3r >/dev/null 2>&1; then
-  info "Kuruluyor: sublist3r"
-  rm -rf /tmp/Sublist3r
-  git clone -q --depth 1 https://github.com/aboul3la/Sublist3r /tmp/Sublist3r
-  pip_install /tmp/Sublist3r || warn "sublist3r kurulamadi"
-else
-  skip "sublist3r"
-fi
-
-# LinkFinder (git clone + pip). "python setup.py install" is REMOVED — recent
-# setuptools no longer supports it at all (and Python 3.12+ dropped distutils
-# from the stdlib that old setup.py scripts implicitly relied on), so it
-# always failed on any current system. "pip install ." is the modern
-# equivalent and goes through the same PEP 668 handling as everything else.
-if ! command -v linkfinder >/dev/null 2>&1; then
-  info "Kuruluyor: linkfinder"
-  rm -rf /tmp/LinkFinder
-  git clone -q --depth 1 https://github.com/GerbenJavado/LinkFinder /tmp/LinkFinder
-  pip_install /tmp/LinkFinder || warn "linkfinder kurulamadi"
-else
-  skip "linkfinder"
-fi
-
-# Hakrawler (go alt diziniyle kurulur)
-go_need hakrawler "github.com/hakluke/hakrawler"
-
 # --------------------------------------------------------------------------
 # Nuclei template guncellemesi
 if command -v nuclei >/dev/null 2>&1; then
@@ -180,15 +153,16 @@ fi
 # --------------------------------------------------------------------------
 echo
 info "Kurulum tamamlandi. Kurulu araclarin ozeti:"
-for c in httpx subfinder nuclei katana gau waybackurls dalfox trufflehog \
-         findomain assetfinder hakrawler theHarvester wafw00f arjun \
-         paramspider sublist3r linkfinder nmap whatweb interactsh-client; do
+for c in httpx subfinder nuclei katana gau dnsx dalfox trufflehog \
+         findomain assetfinder wafw00f arjun paramspider \
+         nmap whatweb interactsh-client tor; do
   if command -v "$c" >/dev/null 2>&1; then ok "$c"; else warn "$c — YOK"; fi
 done
 
 echo
-info "Opsiyonel: XSS 'alert' dogrulama ekran goruntuleri icin Playwright:"
-echo "  python3 -m pip install --break-system-packages playwright && playwright install chromium"
+info "Optional — headless XSS 'alert' verification screenshots (Selenium):"
+echo "  python3 -m pip install --break-system-packages selenium"
+echo "  sudo apt install -y chromium chromium-driver"
 
 echo
 info "Ornek kullanim:"

@@ -1,5 +1,5 @@
 # ReconX Python dependencies (the pipeline itself)
-# External scanners (httpx, nuclei, dalfox, sqlmap, subfinder, ...) are NOT
+# External scanners (httpx, nuclei, dalfox, subfinder, katana, ...) are NOT
 # pip packages — install them with ./install.sh.
 
 pyyaml>=6.0            # config.yaml
@@ -7,9 +7,11 @@ requests>=2.31.0       # HTTP fallback client
 curl-cffi>=0.6.0       # primary HTTP client (Cloudflare-friendly TLS fingerprint)
 stem>=1.8.2            # Tor control-port client (settings.auto_tor block-triggered IP rotation)
 
-# Optional — only needed for XSS alert() verification screenshots (Stage 6):
-#   pip install playwright && playwright install chromium
-# playwright>=1.40.0
+# Optional — only needed for XSS alert() verification screenshots (Stage 6).
+# The verifier drives the SYSTEM Chromium/Chrome through Selenium, so it needs
+# a chromedriver on PATH as well (apt: chromium-driver).
+#   pip install selenium && sudo apt install -y chromium chromium-driver
+# selenium>=4.20.0
 
 # Web control panel (reconx_web.py) — optional
 flask>=3.0
