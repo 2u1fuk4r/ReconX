@@ -148,21 +148,57 @@ DNS_PROXY = {"proc": None, "resolv_backup": None, "port": None}
 DNS_PROXY_SCRIPT = BASE_DIR / "reconx_dns.py"
 
 
-def _dns_is_healthy(hosts=("one.one.one.one", "dns.google", "example.com"), min_ok=2):
-    import socket as _s
-    good = 0
-    for h in hosts:
-        for _ in range(2):
-            try:
-                _s.getaddrinfo(h, 443, proto=_s.IPPROTO_TCP)
-                good += 1
-                break
-            except OSError:
-                continue
-    return good >= min_ok
+def _system_nameservers(limit=3):
+    """Nameservers from /etc/resolv.conf, in order."""
+    out = []
+    try:
+        for line in Path("/etc/resolv.conf").read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("nameserver"):
+                parts = line.split()
+                if len(parts) > 1:
+                    out.append(parts[1])
+    except Exception:
+        pass
+    return out[:limit]
 
 
-def _udp_dns_answers(server, port, name="cloudflare.com"):
+def _dns_is_healthy(deadline=4.0):
+    """Can the system's own nameservers answer over UDP/53?
+
+    Deliberately a RAW UDP query rather than socket.getaddrinfo():
+
+      * getaddrinfo is a blocking libc call that ignores
+        socket.setdefaulttimeout(), so it only returns once glibc has burned
+        the whole resolv.conf retry budget. Run serially over 3 hosts x 2
+        attempts (the original implementation) that measured 13s of silent
+        dead air right after the banner, and 117s when DNS was flaky — the
+        "it hangs at the banner" report.
+      * Running those lookups concurrently is WORSE, not better: measured on
+        this box, three parallel getaddrinfo calls left two of them unreturned
+        after 4s while the very same lookups took 0.05s each sequentially.
+        glibc serialises concurrent resolver state.
+
+    A raw query has a real socket timeout and tests precisely what the DoH
+    fallback exists to work around: UDP/53 reachability. Total cost is bounded
+    by `deadline` no matter how broken the network is."""
+    servers = _system_nameservers()
+    if not servers:
+        return True          # nothing configured to probe — don't fight the system
+    end = time.time() + deadline
+    # Two short attempts per server: a single dropped UDP packet should not be
+    # enough to flip the verdict and drag the whole run onto the DoH fallback.
+    for attempt in range(2):
+        for ns in servers:
+            if time.time() >= end:
+                return False
+            budget = min(0.9, max(0.3, end - time.time()))
+            if _udp_dns_answers(ns, 53, timeout=budget):
+                return True
+    return False
+
+
+def _udp_dns_answers(server, port, name="cloudflare.com", timeout=4.0):
     """Fire one raw A query at server:port and return True if we get an answer."""
     import socket as _s, struct
     q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
@@ -170,7 +206,7 @@ def _udp_dns_answers(server, port, name="cloudflare.com"):
          + b"\x00\x00\x01\x00\x01")
     try:
         sk = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
-        sk.settimeout(4)
+        sk.settimeout(timeout)
         sk.sendto(q, (server, port))
         data, _ = sk.recvfrom(1024)
         return len(data) > 12 and struct.unpack(">H", data[6:8])[0] > 0
@@ -212,7 +248,11 @@ def _restore_dns():
 def ensure_resilient_dns():
     if os.environ.get("RECONX_NO_DNS_FIX"):
         return
+    _t0 = time.time()
     if _dns_is_healthy():
+        # Only worth a line when it actually cost the operator some waiting.
+        if time.time() - _t0 > 1.5:
+            sub(f"DNS check: {time.time() - _t0:.1f}s (system resolver OK)")
         return
     warn("System DNS looks unreliable (UDP/53 likely blocked) — engaging DoH fallback")
     if not DNS_PROXY_SCRIPT.exists():
