@@ -2824,7 +2824,8 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
 
 # ── Streaming tool runner ─────────────────────────────────────────────────────
 def _stream_tool(cmd, timeout: int, log=None, label: str = "",
-                 line_cb=None, stall_timeout: int = 0, ok_exit_codes=(0, None)) -> tuple:
+                 line_cb=None, stall_timeout: int = 0, ok_exit_codes=(0, None),
+                 status: dict = None) -> tuple:
     """stall_timeout: eger > 0 ve o kadar saniye boyunca TEK BIR YENI SATIR bile
     gelmezse (arac askida kalmis / network'e sessizce takilmis olabilir), sureci
     zorla durdurur. v6.17: nuclei gibi araclarin bazen kendi ic guncelleme/
@@ -2832,6 +2833,11 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
     askida kalabildigi gozlemlendi — bu onceden saatlerce (T['nuclei']=14400s)
     sessizce beklemeye yol aciyordu. Artik boyle bir durum acikca tespit edilip
     kullaniciya raporlanir.
+    status: an optional dict the CALLER owns and its line_cb writes into. The
+    spinner renders status["text"] next to the label on every redraw, so a tool
+    that reports its own progress on stdout (dalfox prints
+    "[SID:n][done/total][pct%]" per target) can show real progress instead of
+    just a line counter.
     ok_exit_codes: v8.4-fix — which exit codes count as "success" for THIS
     tool, default (0, None) preserves the original behavior for every
     existing caller. Added because dalfox v3.x (Rust) uses a grep-style
@@ -2866,18 +2872,22 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
             # print (from a dalfox line_cb, also running on the reader
             # thread) and this spinner redraw both touch stdout with \r; the
             # lock keeps one from garbling mid-write into the other.
+            live = ""
+            if status:
+                live = str(status.get("text") or "")
             with _PRINT_LOCK:
                 sys.stdout.write(
                     f"\r  {C.CYAN}{frames[i % len(frames)]}{C.RESET} "
                     f"{C.DIM}{spin_label}{C.RESET} "
-                    f"{C.DIM}processing {total_lines[0]:,} lines{C.RESET} "
-                    f"{C.DIM}{int(elapsed)}s{C.RESET}   "
+                    + (f"{C.WHITE}{live}{C.RESET} " if live else "")
+                    + f"{C.DIM}processing {total_lines[0]:,} lines{C.RESET} "
+                      f"{C.DIM}{int(elapsed)}s{C.RESET}   "
                 )
                 sys.stdout.flush()
             i += 1
             time.sleep(0.12)
         with _PRINT_LOCK:
-            sys.stdout.write(f"\r{' ' * 72}\r")
+            sys.stdout.write(f"\r{' ' * 120}\r")
             sys.stdout.flush()
 
     spin_thread = threading.Thread(target=_spin_ticker, daemon=True)
@@ -3470,7 +3480,7 @@ class ReconPipeline:
                  login_csrf_field="", raw_cookie=None, request_file=None,
                  nuclei_templates_override=None, nuclei_severity_override=None,
                  blind_cb=None, config_path=None, session_dir=None,
-                 max_time_min=0, scan_diff=True):
+                 max_time_min=0, scan_diff=True, xss_payloads=None):
         self.target      = target.strip()
         self.cfg         = cfg
         self._config_path = Path(config_path) if config_path else CFG_FILE
@@ -3502,6 +3512,7 @@ class ReconPipeline:
         # be launched from a scheduler/CI/background job with zero stdin.
         self.auto_mode   = bool(auto_mode)
         self._blind_cb   = (blind_cb or "").strip()
+        self._xss_payloads = (xss_payloads or "").strip()
         self.url_targets = url_targets or []
         self.summary     = {}
         self.log         = None
@@ -4629,7 +4640,8 @@ class ReconPipeline:
         _dfx_workers = int(_cfg_get(self.cfg, "tools", "dalfox_workers",
                                     default=_cfg_get(self.cfg, "settings", "threads", default=40)) or 40)
         _dfx_delay = int(_cfg_get(self.cfg, "tools", "dalfox_delay_ms", default=0) or 0)
-        cmd += ["--worker", str(max(1, min(_dfx_workers, 60)))]
+        _dfx_worker_n = max(1, min(_dfx_workers, 60))
+        cmd += ["--worker", str(_dfx_worker_n)]
         if _dfx_delay > 0:
             cmd += ["--delay", str(_dfx_delay)]
         cmd += _tor_cli_flag("dalfox", self.cfg)
@@ -4715,7 +4727,9 @@ class ReconPipeline:
             pass
 
         try:
-            cpl = (_cfg_get(self.cfg, "tools", "dalfox_custom_payload", default="") or "")
+            # --xss-payloads overrides the config for this run
+            cpl = (self._xss_payloads
+                   or _cfg_get(self.cfg, "tools", "dalfox_custom_payload", default="") or "")
             if cpl:
                 # v8.2: resolve a relative path against BASE_DIR (where
                 # reconx.py itself lives) if it doesn't resolve from the
@@ -4799,15 +4813,66 @@ class ReconPipeline:
         # "live" hits all at once when the scan finishes, not progressively
         # while it runs — harmless (still faster than waiting for the final
         # report) but don't expect a steady trickle during a long v3 scan.
+        # Live progress. dalfox (with --silence OFF, which it already is here)
+        # prints its own per-target markers on stdout alongside the jsonl
+        # findings — verified against v2.12.0:
+        #   [*] Starting scan [SID:0][0/3][0.00%] / URL: http://...
+        #   [*] [ Created 100 workers ] [ Allocated 672 queries ]
+        #   [*] [duration: 20.0s][issues: 5] Finish Scan!
+        # Those were already streaming past unparsed, so the spinner could only
+        # say "processing N lines" — useless for judging how far along a 40
+        # target scan is. Completed targets are counted off "Finish Scan!"
+        # rather than the [x/y] index, because the index is printed when a
+        # target STARTS.
+        _dfx_total = max(1, _count_lines(xss_file))
+        # dalfox only prints its own "[ Created N workers ]" line when --worker
+        # is NOT given, and we always give it — so seed the count from the value
+        # we set rather than waiting for a line that never arrives.
+        dfx_status = {"text": f"target 0/{_dfx_total} (0%) · {_dfx_worker_n}w"}
+        prog = {"done": 0, "workers": _dfx_worker_n, "hits": 0}
+
+        def _dfx_status_text():
+            pct = prog["done"] * 100.0 / _dfx_total
+            bits = [f"target {prog['done']}/{_dfx_total} ({pct:.0f}%)"]
+            if prog["workers"]:
+                bits.append(f"{prog['workers']}w")
+            if prog["hits"]:
+                bits.append(f"{prog['hits']} hit{'s' if prog['hits'] > 1 else ''}")
+            return " · ".join(bits)
+
         def _dalfox_line_cb(line: str):
             s = line.strip()
-            if not s or s[0] != "{":
+            if not s:
+                return
+            if s[0] != "{":
+                low = s.lower()
+                if "finish scan" in low:
+                    prog["done"] = min(_dfx_total, prog["done"] + 1)
+                    dfx_status["text"] = _dfx_status_text()
+                elif "created" in low and "workers" in low:
+                    m = re.search(r"created\s+(\d+)\s+workers", low)
+                    if m:
+                        prog["workers"] = int(m.group(1))
+                        dfx_status["text"] = _dfx_status_text()
+                elif "starting scan" in low:
+                    m = re.search(r"\[sid:\d+\]\[(\d+)/(\d+)\]", low)
+                    if m:
+                        # trust dalfox's own total when it disagrees with our count
+                        try:
+                            tot = int(m.group(2))
+                            if tot > 0:
+                                prog["done"] = max(prog["done"], int(m.group(1)))
+                        except ValueError:
+                            pass
+                        dfx_status["text"] = _dfx_status_text()
                 return
             try:
                 rec = json.loads(s)
             except Exception:
                 return
             if isinstance(rec, dict) and ("payload" in rec or "data" in rec) and "type" in rec:
+                prog["hits"] += 1
+                dfx_status["text"] = _dfx_status_text()
                 xss_live_hit(rec)
 
         # v8.4-fix: only dalfox v3.x uses exit 1 == "vulnerabilities found";
@@ -4833,7 +4898,7 @@ class ReconPipeline:
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
             cmd, timeout=_dfx_budget, log=self.log, label=f"dalfox-{run_tag}",
-            line_cb=_dalfox_line_cb, stall_timeout=_dalfox_stall_sec,
+            line_cb=_dalfox_line_cb, stall_timeout=_dalfox_stall_sec, status=dfx_status,
             ok_exit_codes=_dalfox_ok_codes
         )
         res["duration_sec"] = round(time.time() - _t0, 1)
@@ -5127,20 +5192,30 @@ class ReconPipeline:
                 if not pr.hostname or not self._is_in_scope_url(u):
                     continue
                 params = tuple(sorted(k for k, _ in parse_qsl(pr.query)))
+                reflect = _has_reflection_param(pr.query)
             except Exception:
                 continue
             shape = (pr.hostname, pr.path.rstrip("/"), params)
             if shape in seen_shape:
                 continue
             seen_shape.add(shape)
-            clean.append((u, len(params)))
-        # params first, then by shorter URL (less likely to be junk)
-        clean.sort(key=lambda t: (0 if t[1] else 1, len(t[0])))
-        _param_urls = [u for u, n in clean if n]
+            clean.append((u, len(params), reflect))
+        # Ranking, best first:
+        #   1. a parameter whose NAME is one people actually echo back into the
+        #      page (q/search/redirect/name/msg/... — _REFLECTION_PARAM_NAMES)
+        #   2. any other parameterised URL
+        #   3. path-only URLs
+        # then shorter URL first inside each tier (less likely to be crawler junk).
+        # This costs zero extra requests — it is pure ordering — but it decides
+        # WHICH URLs fill the tools.dalfox_max_targets budget, so the cap now
+        # spends itself on the endpoints most likely to actually reflect.
+        clean.sort(key=lambda t: (0 if (t[1] and t[2]) else (1 if t[1] else 2), len(t[0])))
+        _param_urls = [u for u, n, _r in clean if n]
+        _reflect_urls = [u for u, n, r in clean if n and r]
         if _dfx_path_only or len(_param_urls) < 5:
             # keep path-only URLs too (config opted in, or too few real
             # injection points to fill a useful run)
-            final = [u for u, _ in clean[:_dfx_max]]
+            final = [u for u, _n, _r in clean[:_dfx_max]]
         else:
             # every URL dalfox tests without a query param costs ~30s of DOM
             # mining for near-zero XSS yield — drop them
@@ -5152,6 +5227,10 @@ class ReconPipeline:
             # scope check) fed a raw, unfiltered slice straight to dalfox.
             final = [u for u in raw
                      if u.startswith(("http://", "https://")) and self._is_in_scope_url(u)][:_dfx_max]
+        _n_reflect = sum(1 for u in final if u in set(_reflect_urls))
+        if _reflect_urls:
+            sub(f"XSS target ranking: {_n_reflect} of the {len(final)} selected carry a "
+                f"reflection-prone parameter ({len(_reflect_urls)} found in total) — those go first")
         tested_f = d / "xss_targets_tested.txt"
         write_lines(tested_f, final)
         xss_file = tested_f
@@ -7977,6 +8056,13 @@ def main():
                    help="Nuclei severity filter (e.g. critical,high,medium)")
     p.add_argument("--blind",           dest="blind_cb", default=None,
                    help="Blind XSS callback URL for Dalfox")
+    p.add_argument("--xss-payloads",    dest="xss_payloads", nargs="?", const="xss-payloads.txt",
+                   default=None, metavar="FILE",
+                   help="Feed dalfox an extra payload list (default: the bundled "
+                        "xss-payloads.txt of WAF-bypass / context-breakout vectors) on top of its "
+                        "own built-ins. OFF by default because it measured ~5x slower for no extra "
+                        "findings on ordinary targets — worth it when a target reflects but dalfox's "
+                        "built-ins get filtered.")
 
     auth_grp = p.add_argument_group("Authenticated scanning")
     auth_grp.add_argument("--login-url", dest="login_url", default=None,
@@ -8126,6 +8212,7 @@ def main():
         nuclei_templates_override=args.nuclei_templates,
         nuclei_severity_override=args.severity,
         blind_cb=args.blind_cb,
+        xss_payloads=args.xss_payloads,
         config_path=str(Path(args.config)),
     ).run(stages=stages)
 
