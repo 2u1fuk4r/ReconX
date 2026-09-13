@@ -2,6 +2,19 @@
 
 ### Sequential Bug-Bounty Reconnaissance & Vulnerability Pipeline
 
+<p align="center">
+  <img src="docs/reconx-demo.gif" alt="ReconX: scan, interrupt with Ctrl+C, resume from the checkpoint, and open the report" width="100%">
+</p>
+
+<p align="center">
+  <sub>
+    One run: recon → live XSS hits → <b>Ctrl+C</b> → <b>--resume</b> picks up from the
+    checkpoint → the interactive report.<br>
+    Walkthrough of the workflow with sample findings, rendered through the real
+    report builder — not a recording of a scan against a live third party.
+  </sub>
+</p>
+
 ReconX is a stage-based, automation-first recon and scanning framework for
 **authorized** bug-bounty and penetration-testing engagements. One command
 takes a domain from zero to an interactive HTML report: subdomains, live

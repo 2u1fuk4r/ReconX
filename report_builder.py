@@ -739,9 +739,40 @@ def _poc_field(value: str, label: str = "PoC URL") -> str:
             f'<code class="poc-val">{_e(v)}</code>'
             f'<button class="poc-copy" data-copy="{_e(v)}" onclick="copyOne(this)">Copy</button></div>')
 
-def _vscroll(data: list, uid: str, kind: str = "URL") -> str:
+VSCROLL_MAX = 25_000   # entries embedded per list; see _vscroll()
+
+
+def _vscroll(data: list, uid: str, kind: str = "URL", source: str = "") -> str:
+    """Virtual-scrolling list. At most VSCROLL_MAX entries are embedded; when
+    the list is longer the overflow is stated in the toolbar (and `source`, if
+    given, names the on-disk file holding the complete set) so a truncated view
+    can never be mistaken for the whole result."""
+    def _as_line(x):
+        """Every entry must be a plain string — see vsRender()."""
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            for k in ("url", "endpoint", "host", "name", "value"):
+                if x.get(k):
+                    extra = x.get("status") or x.get("severity") or ""
+                    return f"{x[k]}  [{extra}]" if extra else str(x[k])
+            return json.dumps(x, ensure_ascii=False)
+        return str(x)
+
+    data = [_as_line(x) for x in (data or [])]
+    total = len(data)
+    truncated = total > VSCROLL_MAX
+    if truncated:
+        data = data[:VSCROLL_MAX]
     safe = _safe_json(data)
+    trunc_html = ""
+    if truncated:
+        src = f' &middot; full list: <code>{_e(source)}</code>' if source else ""
+        trunc_html = (f'<div class="vs-trunc">⚠ showing the first '
+                      f'{VSCROLL_MAX:,} of {total:,} {_e(kind)}s in this viewer'
+                      f'{src}</div>')
     return f'''<div class="vs-wrap">
+  {trunc_html}
   <div class="vs-toolbar">
     <span class="vs-counter" id="{_e(uid)}-cnt"></span>
     <input class="vs-search" id="{_e(uid)}-q" placeholder="Filter {_e(kind)}s..." oninput="vsFilter('{_e(uid)}')">
@@ -1166,7 +1197,7 @@ def _section_subdomains(subs):
          for t, u in subs["by_tool"].items() if u],
         key=lambda r: -int(r[1])
     )
-    body = (f'{_vscroll(all_s, "vs-subs", "subdomain")}'
+    body = (f'{_vscroll(all_s, "vs-subs", "subdomain", "checkpoints/stage2_subdomains.txt")}'
             f'<div style="margin-top:28px"><div class="subsection-label">Tool Breakdown</div>'
             f'{_vtable(["Tool", "Count", "Sample"], tool_rows, "vt-sub-tools")}</div>'
             if all_s else _empty())
@@ -1269,7 +1300,12 @@ def _section_urls(urls, prune=None):
         ("urlscan",      f"URLScan ({len(urls.get('_urlscan',[])):,})",           urls.get("_urlscan",[])),
         ("otx",          f"OTX ({len(urls.get('_otx',[])):,})",                   urls.get("_otx",[])),
     ]
-    tab_items = [(tid, label, _vscroll(data, f"vs-url-{tid}"))
+    _url_src = {"all": "checkpoints/stage4_urls.txt", "gau": "04_urls/gau.txt",
+                "katana": "04_urls/katana.txt", "wayback": "04_urls/waybackurls.txt",
+                "commoncrawl": "04_urls/commoncrawl.txt", "urlscan": "04_urls/urlscan.txt",
+                "otx": "04_urls/otx.txt", "gospider": "04_urls/gospider.txt",
+                "hakrawler": "04_urls/hakrawler.txt"}
+    tab_items = [(tid, label, _vscroll(data, f"vs-url-{tid}", "URL", _url_src.get(tid, "")))
                  for tid, label, data in tool_tabs if data]
 
     note = ""
@@ -2208,6 +2244,9 @@ body{
 .sec-hdr h2{font-family:var(--display);font-size:20px;font-weight:700;letter-spacing:-.5px;color:#fff;display:flex;align-items:center;gap:10px}
 .sec-hdr h2::before{content:'';width:3px;height:20px;background:var(--accent);border-radius:2px;box-shadow:0 0 8px var(--accent-glow)}
 .sec-sub{color:var(--muted);font-size:12.5px;margin-top:4px;font-weight:400}
+/* .export-btn-wrap is position:fixed at top-right; without this the floating
+   Export button sits directly on top of the section-header badge. */
+.sec-hdr-badge{margin-right:172px;flex-shrink:0}
 .target-code{
   background:rgba(56,189,248,.1);color:var(--accent2);padding:2px 7px;border-radius:6px;
   font-family:var(--mono);font-size:11.5px;border:1px solid rgba(56,189,248,.2);
@@ -2287,6 +2326,12 @@ body{
   transition:background .12s;
 }
 .vs-row:hover{background:rgba(56,189,248,.06);color:var(--text)}
+.vs-trunc{font-size:11px;color:#ffb86a;background:rgba(249,115,22,.08);
+  border:1px solid rgba(249,115,22,.25);border-radius:8px;padding:7px 11px;margin-bottom:8px}
+.vs-trunc code{font-family:var(--mono);color:#ffd7a8}
+.vs-row .vs-val{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vs-row .vs-copy{margin-left:8px}
+.vs-row:hover .cell-copy{opacity:1}
 .tbl-scroll{overflow:auto;max-height:420px}
 .tbl-scroll table{width:100%;border-collapse:collapse;font-size:12.5px}
 .tbl-scroll th{
@@ -2426,6 +2471,8 @@ body{
   .two-col{grid-template-columns:1fr}
   .stat-grid{grid-template-columns:repeat(2,1fr)}
   .export-btn-wrap{top:10px;right:10px}
+  /* the button moves up into its own strip here, so drop the reserved gap */
+  .sec-hdr-badge{margin-right:0}
 }
 @media print{
   .sidebar,.export-btn-wrap,.export-dropdown,.tm-toolbar,.vs-toolbar,.sb-toggle,.sb-scrim{display:none!important}
@@ -2538,19 +2585,85 @@ function toast(msg, type){
   setTimeout(function(){ el.style.opacity='0'; el.style.transform='translateY(6px)'; el.style.transition='all .3s'; },2200);
   setTimeout(function(){ try{el.remove()}catch(e){} },2600);
 }
+// ── clipboard ───────────────────────────────────────────────────────────────
+// Single entry point for every copy button in the report. navigator.clipboard
+// only exists in a secure context — file:// is not one in every browser, and
+// the web panel serves the report over plain http — so fall back to the
+// hidden-textarea + execCommand route instead of failing silently.
+function rxCopyRaw(text){
+  text = (text == null) ? '' : String(text);
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise(function(resolve, reject){
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly','');
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select(); ta.setSelectionRange(0, ta.value.length);
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error('execCommand refused'));
+    }catch(e){ reject(e); }
+  });
+}
+// rxCopy(text, okMsg, onOk) — copies, toasts, and never leaves a rejected
+// promise dangling. onOk is the per-button "turned into a tick" feedback.
+function rxCopy(text, okMsg, onOk){
+  rxCopyRaw(text).then(function(){
+    if(okMsg) toast(okMsg, 'ok');
+    if(onOk) try{ onOk(); }catch(e){}
+  }).catch(function(){
+    toast('Copy blocked by the browser — select the value and press Ctrl+C', 'warn');
+  });
+}
 // One-piece copy for a PoC field (URL+payload as a single string).
 function copyOne(btn){
   var v = btn.getAttribute('data-copy') || '';
-  navigator.clipboard.writeText(v).then(function(){
-    var o = btn.textContent; btn.textContent = '✓ copied';
-    toast('PoC copied to clipboard','ok');
+  var o = btn.textContent;
+  rxCopy(v, 'PoC copied to clipboard', function(){
+    btn.textContent = '✓ copied';
     setTimeout(function(){ btn.textContent = o; }, 1400);
-  }).catch(function(){ toast('Copy failed','warn'); });
+  });
+}
+// Is this cell worth its own one-click copy button? URLs and hostnames always
+// are (they are the thing people paste into Burp), and so is any long unbroken
+// value — payloads, secrets, template ids — since those are exactly the cells
+// CSS truncates.
+function rxCopyable(v){
+  if(!v) return false;
+  v = String(v);
+  if(v.indexOf('://') !== -1) return true;                     // any URL
+  if(/^[a-z0-9_.-]+\.[a-z]{2,}$/i.test(v)) return true;        // bare hostname
+  if(/^\//.test(v) && v.length > 3) return true;               // path / endpoint
+  if(v.length > 48 && v.indexOf(' ') === -1) return true;       // payload/secret/id
+  return false;
+}
+// Columns whose CONTENT is meant to be taken elsewhere (pasted into Burp, a
+// curl line, a report) get the button even when a single value happens to be
+// short — an endpoint like /api/v2/users or a 20-char AWS key id would
+// otherwise miss the length/URL heuristics above.
+var RX_COPY_HDR = /url|uri|endpoint|secret|token|payload|poc|host|cname|matched|template|param|path|snippet|key|technolog/i;
+function rxCopyableCol(headers, ci){
+  if(!headers || !headers.length) return false;
+  if(headers.length === 1) return true;          // single-column list: always
+  return RX_COPY_HDR.test(String(headers[ci] || ''));
 }
 // Virtual scroll (kept + improved)
 var VS_H=34, VS_OS=8;
 function vsInit(uid){ var d=window._VS && window._VS[uid]; if(!d) return; vsCnt(uid); vsRender(uid); }
+// A scroll gesture fires many events per frame; render at most once per frame.
+var _VS_RAF = {};
 function vsRender(uid){
+  if(_VS_RAF[uid]) return;
+  _VS_RAF[uid] = (window.requestAnimationFrame || function(f){ return setTimeout(f, 16); })(function(){
+    _VS_RAF[uid] = 0;
+    vsRenderNow(uid);
+  });
+}
+function vsRenderNow(uid){
   var d=window._VS && window._VS[uid]; if(!d) return;
   var c=document.getElementById(uid+'-scroll');
   var vp=document.getElementById(uid+'-vp');
@@ -2565,13 +2678,29 @@ function vsRender(uid){
     var row=document.createElement('div');
     row.className='vs-row'; row.style.top=(i*VS_H)+'px';
     var txt=d.filtered[i];
-    var esc=document.createElement('span'); esc.textContent=txt;
-    // make link clickable
-    if(txt.startsWith('http')){
+    if(typeof txt!=='string') txt = (txt==null) ? '' : String(txt);
+    if(txt.indexOf('http')===0){
       var a=document.createElement('a'); a.href=txt; a.target='_blank'; a.rel='noopener';
-      a.textContent=txt; a.style.color='var(--accent2)'; a.style.textDecoration='none'; a.style.overflow='hidden'; a.style.textOverflow='ellipsis';
+      a.textContent=txt; a.className='vs-val'; a.style.color='var(--accent2)'; a.style.textDecoration='none';
       row.appendChild(a);
-    } else { row.appendChild(esc); }
+    } else {
+      var esc=document.createElement('span'); esc.className='vs-val'; esc.textContent=txt;
+      row.appendChild(esc);
+    }
+    // one-click copy of the FULL line, not the ellipsis-truncated render
+    (function(value){
+      var btn=document.createElement('button');
+      btn.type='button'; btn.className='cell-copy vs-copy'; btn.textContent='⧉';
+      btn.title='Copy this line';
+      btn.onclick=function(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        rxCopy(value, 'Copied', function(){
+          btn.classList.add('copied'); btn.textContent='✓';
+          setTimeout(function(){ btn.classList.remove('copied'); btn.textContent='⧉'; }, 900);
+        });
+      };
+      row.appendChild(btn);
+    })(txt);
     frag.appendChild(row);
   }
   vp.innerHTML=''; vp.appendChild(frag);
@@ -2589,7 +2718,7 @@ function vsFilter(uid){
 function vsCopy(uid){
   var d=window._VS && window._VS[uid]; if(!d) return;
   var txt=d.filtered.join('\n');
-  navigator.clipboard.writeText(txt).then(function(){ toast('Copied '+d.filtered.length+' lines','ok'); });
+  rxCopy(txt, 'Copied ' + d.filtered.length.toLocaleString() + ' lines');
 }
 function vsExport(uid){
   var d=window._VS && window._VS[uid]; if(!d) return;
@@ -2621,15 +2750,14 @@ function vtRender(uid){
     var copyCols=d.copyCols||[];
     cells.forEach(function(c,ci){
       var td=document.createElement('td');
-      if(copyCols.indexOf(ci)!==-1 && c){
+      if((copyCols.indexOf(ci)!==-1 || rxCopyable(c) || rxCopyableCol(d.headers, ci)) && c){
         td.className='has-copy';
         var span=document.createElement('span'); span.className='cell-txt'; span.textContent=c; span.title=c;
         var btn=document.createElement('button'); btn.type='button'; btn.className='cell-copy'; btn.textContent='⧉'; btn.title='Copy full value';
         btn.onclick=function(ev){
           ev.stopPropagation();
-          navigator.clipboard.writeText(c).then(function(){
+          rxCopy(c, 'Copied', function(){
             btn.classList.add('copied'); btn.textContent='✓';
-            toast('Copied','ok');
             setTimeout(function(){ btn.classList.remove('copied'); btn.textContent='⧉'; },900);
           });
         };
@@ -2649,7 +2777,7 @@ function vtRender(uid){
 function vtCopy(uid){
   var d=window._VT && window._VT[uid]; if(!d) return;
   var txt=d.filtered.map(function(r){ var cells = d.rowClass ? r.slice(0,-1) : r; return cells.join('\t')}).join('\n');
-  navigator.clipboard.writeText(txt).then(function(){ toast('Copied '+d.filtered.length+' rows','ok'); });
+  rxCopy(txt, 'Copied ' + d.filtered.length.toLocaleString() + ' rows');
 }
 function vtExportCSV(uid){
   var d=window._VT && window._VT[uid]; if(!d) return;
@@ -2692,7 +2820,7 @@ function renderAlive(){
 }
 function aliveCopy(){
   var txt=(window._AF||window._AR||[]).map(function(r){return r[0]}).join('\n');
-  navigator.clipboard.writeText(txt).then(function(){ toast('Copied URLs','ok'); });
+  rxCopy(txt, 'Copied URLs');
 }
 function aliveCSV(){
   var rows=window._AF||window._AR||[];
@@ -2765,7 +2893,7 @@ function exportFullHTML(){
   toast('Report exported','ok');
 }
 function printReport(){ window.print(); }
-function copyReportLink(){ navigator.clipboard.writeText(location.href).then(function(){ toast('Link copied','ok'); }); }
+function copyReportLink(){ rxCopy(location.href, 'Link copied'); }
 document.addEventListener('click',function(e){
   var dd=document.getElementById('export-dropdown');
   var btn=document.getElementById('export-main-btn');
@@ -2902,15 +3030,24 @@ document.addEventListener('DOMContentLoaded',function(){
       showSection(hid, document.querySelector('.nav-a[data-sid="'+hid+'"]'));
     }
   });
-  // scroll listeners for tables
+  // Tables: load the next page when the scroll nears the bottom. Without this
+  // d.page stayed at 0 forever and everything past row 60 was unreachable.
   document.querySelectorAll('.vt-wrap .tbl-scroll').forEach(function(el){
-    el.addEventListener('scroll',function(){
-      // lazy load already handled by vtRender pagination - just trigger more
-    });
+    var body = el.querySelector('tbody[id$="-body"]');
+    if(!body) return;
+    var uid = body.id.replace(/-body$/, '');
+    el.addEventListener('scroll', function(){
+      var d = window._VT && window._VT[uid];
+      if(!d) return;
+      if(el.scrollTop + el.clientHeight < el.scrollHeight - 120) return;
+      if((d.page + 1) * 60 >= d.filtered.length) return;     // everything shown
+      d.page++;
+      vtRender(uid);
+    }, {passive:true});
   });
-  document.querySelectorAll('.vs-scroll').forEach(function(el){
-    el.addEventListener('scroll',function(){ var uid=el.id.replace('-scroll',''); vsRender(uid); });
-  });
+  // .vs-scroll already carries an inline onscroll="vsRender(uid)" from
+  // _vscroll(); adding a second listener here ran the whole windowed render
+  // twice per scroll event.
 });
 """
 
