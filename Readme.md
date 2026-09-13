@@ -284,7 +284,7 @@ MIT
 
 ## 👤 Author
 
-**Zulfukar Karabulut** — Security Researcher | Pentester | eWPTX & eCPPT
+**Zulfukar Karabulut** — Security Researcher | Pentester | eWPTX & eCPPT & eCIR
 [linkedin.com/in/2u1fuk4r](https://linkedin.com/in/2u1fuk4r)
 
 Use responsibly.
