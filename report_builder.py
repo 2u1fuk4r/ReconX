@@ -1309,7 +1309,19 @@ def _section_urls(urls, prune=None):
                  for tid, label, data in tool_tabs if data]
 
     note = ""
-    if prune.get("enabled"):
+    if prune.get("rejected"):
+        # reconX.py refused to trust this prune (it removed so much of the
+        # corpus that the target was almost certainly throttling the probe).
+        # Say so where the numbers are read, not just in the scan log.
+        note = (f'<div class="info-banner info-orange" style="margin-bottom:14px">'
+                f'<span>⚠ Dead-URL pruning was <strong>discarded</strong>: it reported '
+                f'{prune.get("removed",0):,} of {prune.get("before",0):,} URLs '
+                f'({prune.get("removed_pct",0)}%) as dead, which is far more than a real '
+                f'corpus loses — the target most likely rate-limited the liveness probe. '
+                f'The <strong>full unpruned list</strong> is shown below, so it may include '
+                f'dead/404 URLs. Lower <code>settings.threads</code> or set '
+                f'<code>settings.prune_dead_urls: false</code> if this repeats.</span></div>')
+    elif prune.get("enabled"):
         if prune.get("ran") and prune.get("removed", 0) > 0:
             note = (f'<div style="font-size:11px;color:var(--muted);margin-bottom:14px;padding:8px 12px;'
                     f'background:var(--surface2);border-radius:6px;border-left:3px solid var(--border)">'

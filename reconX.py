@@ -799,9 +799,11 @@ class _IS:
     _op_skip    = False
     _stage_skip = False
     _hard       = False
-    _menu_lock  = threading.Lock()
     _raw_sigint = threading.Event()
     _watcher_started = False
+    _last_sigint = 0.0
+    _notice      = ""
+    DOUBLE_TAP_SEC = 2.0
 
     @classmethod
     def reset_op(cls):
@@ -813,8 +815,8 @@ class _IS:
 
     @classmethod
     def reset(cls):
-        # Geriye donuk: interrupt'la ilgisiz yerlerde (orn. bir y/n
-        # prompt'unun reddi sonrasi savunmacı temizlik) ikisini de temizler.
+        # Also used well away from interrupts (e.g. defensive cleanup after a
+        # declined y/n prompt), so it clears both flags.
         cls.reset_op()
         cls.reset_stage()
 
@@ -836,54 +838,46 @@ class _IS:
 
     @classmethod
     def handle(cls, sig, frm):
+        """SIGINT. Does the decision itself — no menu, no prompt, no stdin.
+
+        The handler only flips flags and wakes the printer thread: it runs in
+        the main thread between bytecodes, so anything slower (and stdin in
+        particular) would stall whatever the scan was doing."""
+        if cls._hard:
+            return
+        now = time.time()
+        if now - cls._last_sigint <= cls.DOUBLE_TAP_SEC:
+            cls._hard = True
+            cls._notice = "hard"
+        else:
+            cls._notice = "skip"
+        cls._op_skip = True
+        cls._stage_skip = True
+        cls._last_sigint = now
         cls._raw_sigint.set()
 
     @classmethod
     def _watch_loop(cls):
+        """Prints what the handler decided. Printing is done here rather than in
+        the handler so it can take _PRINT_LOCK and pause the spinner without
+        doing that work inside a signal context."""
         while True:
             cls._raw_sigint.wait()
             cls._raw_sigint.clear()
-            if cls._hard:
-                continue
-            cls._show_menu()
-
-    @classmethod
-    def _show_menu(cls):
-        with cls._menu_lock:
-            if cls._hard:
-                return
+            note = cls._notice
+            cls._notice = ""
             _SPINNER_PAUSE.set()
             try:
                 with _PRINT_LOCK:
                     sys.stdout.write("\r" + " " * 100 + "\r")
-                    print(f"\n{C.YELLOW}{C.BOLD}[!] Ctrl+C caught. What do you want to do?{C.RESET}")
-                    print(f"  {C.WHITE}1){C.RESET} Skip this stage — everything collected so far is "
-                          f"saved and the pipeline continues with the next stage")
-                    print(f"  {C.WHITE}2){C.RESET} Skip only the running operation — the rest of this "
-                          f"stage carries on normally")
-                    print(f"  {C.WHITE}3){C.RESET} Stop the tool — the scan is checkpointed and a report "
-                          f"is generated from what was collected (resume later with --resume)")
-                    sys.stdout.flush()
-                choice = None
-                while choice not in ("1", "2", "3"):
-                    if not sys.stdin.isatty():
-                        choice = "3"
-                        break
-                    try:
-                        choice = input(f"  {C.BOLD}Seciminiz [1/2/3]: {C.RESET}").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        choice = "3"
-                    if choice not in ("1", "2", "3"):
-                        warn("Please enter 1, 2 or 3.")
-                if choice == "1":
-                    cls._stage_skip = True
-                    cls._op_skip = True
-                elif choice == "2":
-                    cls._op_skip = True
-                else:
-                    cls._hard = True
-                    print(f"{C.RED}[✗] Stopping — checkpointing and building a report from the "
-                          f"collected data...{C.RESET}", flush=True)
+                    if note == "hard":
+                        print(f"{C.RED}{C.BOLD}[✗] Ctrl+C again — stopping. Checkpointing and "
+                              f"building a report from what was collected...{C.RESET}", flush=True)
+                    elif note == "skip":
+                        print(f"{C.YELLOW}{C.BOLD}[!] Ctrl+C — skipping this stage.{C.RESET} "
+                              f"{C.DIM}Everything collected so far is saved; the pipeline continues "
+                              f"with the next stage. Press Ctrl+C again within "
+                              f"{cls.DOUBLE_TAP_SEC:.0f}s to stop the tool.{C.RESET}", flush=True)
             finally:
                 _SPINNER_PAUSE.clear()
 
@@ -4342,8 +4336,14 @@ class ReconPipeline:
             return raw_all, stats
         codes = (_cfg_get(self.cfg, "settings", "prune_dead_urls_filter_codes", default="404") or "404").strip()
         stats["filter_codes"] = codes
+        # The prune is the heaviest burst the pipeline aims at a single host —
+        # one request per collected URL. Running it at the full thread budget is
+        # what trips a CDN/WAF into throttling, and a throttled probe reads back
+        # as "everything is dead". Capped well below the general budget.
         base_threads = int(_cfg_get(self.cfg, "settings", "threads", default=50))
-        threads = self._tuned_threads(min(base_threads, 120), 120)
+        prune_cap = int(_cfg_get(self.cfg, "settings",
+                                 "prune_dead_urls_threads", default=25) or 25)
+        threads = self._tuned_threads(min(base_threads, prune_cap), prune_cap)
         headers = pick_header_strategy(self.target, self.cfg)
         if self.has_auth():
             headers = self._auth_headers(headers)
@@ -4378,6 +4378,36 @@ class ReconPipeline:
         stats["ran"] = True
         stats["after"] = _count_lines(pruned_file)
         stats["removed"] = max(0, stats["before"] - stats["after"])
+        removed_pct = (stats["removed"] / stats["before"] * 100) if stats["before"] else 0.0
+        stats["removed_pct"] = round(removed_pct, 1)
+
+        # A liveness probe only proves death if the target was actually
+        # answering. Confirmed on a real scan: 15,553 collected URLs came back
+        # as 348 "live" (97.8% "dead") — but only 3 of the 15,553 were
+        # malformed, every survivor sat in the first quarter of the input order
+        # with nothing at all surviving past that point, and the host whose
+        # 14,729 URLs were ALL dropped resolved to the same Cloudflare IP as the
+        # host that did answer. That is a WAF throttling the probe, not a dead
+        # corpus — and the pruned list then silently became "all URLs" for every
+        # later stage and for the report.
+        #
+        # So past a threshold, refuse to trust the prune and keep the raw list:
+        # the same rule the rest of the tool follows — "no answer" is not
+        # "clean", and a silent 98% data loss is the worst possible default.
+        max_pct = float(_cfg_get(self.cfg, "settings",
+                                 "prune_dead_urls_max_removal_pct", default=70) or 70)
+        if removed_pct > max_pct and stats["before"] >= 50:
+            stats["rejected"] = True
+            stats["reject_reason"] = (f"removed {removed_pct:.1f}% (> {max_pct:.0f}% limit) — "
+                                      f"treated as throttling, not as dead URLs")
+            warn(f"Dead-URL pruning claimed {stats['removed']:,} of {stats['before']:,} URLs "
+                 f"({removed_pct:.1f}%) are dead — far more than a real corpus loses, so the "
+                 f"target most likely rate-limited the probe.")
+            sub(f"Keeping the full {stats['before']:,}-URL list. Lower settings.threads, or set "
+                f"settings.prune_dead_urls: false, if this repeats.")
+            return raw_all, stats
+
+        stats["rejected"] = False
         ok(f"Dead-URL pruning: {stats['before']:,} → {stats['after']:,} live URLs "
            f"({stats['removed']:,} removed as {codes or 'dead'})")
         return pruned_file, stats
