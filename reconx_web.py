@@ -37,7 +37,7 @@ PYTHON = sys.executable or "python3"
 
 EXTERNAL_TOOLS = [
     "httpx", "subfinder", "nuclei", "katana", "gau", "waybackurls", "dalfox",
-    "sqlmap", "arjun", "paramspider", "interactsh-client", "trufflehog",
+    "arjun", "paramspider", "interactsh-client", "trufflehog",
     "wafw00f", "whatweb", "nmap", "dnsx", "chromium", "chromedriver",
 ]
 
@@ -57,6 +57,9 @@ SCAN = {
     "returncode": None,
     "stage": "-",
     "paused": False,
+    "starting": False,     # claimed by a start/resume request, Popen not launched yet
+    "last_request": None,  # the /api/scan/start request body, for a faithful --resume
+    "orphan": False,       # re-attached via /proc scan (no marker) — STDOUT_LOG is NOT this pid's
     "log": deque(maxlen=6000),
     "log_seq": 0,
     "lock": threading.Lock(),
@@ -74,7 +77,6 @@ _STAGE_HINTS = [
     ("nuclei-dast", "7 — Nuclei DAST"), ("nuclei", "7 — Nuclei"),
     ("paramspider", "9 — Params"), ("arjun", "9 — Params"),
     ("trufflehog", "10 — JS secrets"),
-    ("sqlmap", "14 — SQLi"),
 ]
 
 
@@ -127,23 +129,29 @@ def _pid_alive(pid):
 STDOUT_LOG = OUTPUT_DIR / ".webui_stdout.log"
 
 
-def _tail(alive_fn, proc=None):
+def _tail(alive_fn, proc=None, follow_log=True):
     """Follow STDOUT_LOG (reconX's stdout+stderr, written to a FILE not a pipe
     so killing/restarting the web server never breaks the scan) until alive_fn()
-    goes False, then finalise."""
+    goes False, then finalise.
+
+    v8.7-fix: follow_log=False for a scan re-attached via /proc scanning
+    (no launch marker) — STDOUT_LOG only ever holds THIS web-server
+    instance's own launched scans' output, so tailing it for an orphan
+    process would show stale/unrelated content instead of nothing."""
     fh = None
     pos = 0
     _last_resolve = 0.0
     while True:
         try:
-            if fh is None and STDOUT_LOG.exists():
-                fh = STDOUT_LOG.open("r", errors="replace")
-            if fh:
-                fh.seek(pos)
-                chunk = fh.read()
-                pos = fh.tell()
-                for line in chunk.splitlines():
-                    _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
+            if follow_log:
+                if fh is None and STDOUT_LOG.exists():
+                    fh = STDOUT_LOG.open("r", errors="replace")
+                if fh:
+                    fh.seek(pos)
+                    chunk = fh.read()
+                    pos = fh.tell()
+                    for line in chunk.splitlines():
+                        _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
         except Exception:
             pass
         # keep the output dir resolved while the scan runs (so the Report
@@ -154,7 +162,7 @@ def _tail(alive_fn, proc=None):
         if not alive_fn():
             time.sleep(1.0)
             try:
-                if fh:
+                if follow_log and fh:
                     fh.seek(pos)
                     for line in fh.read().splitlines():
                         _push_log(re.sub(r"\x1b\[[0-9;]*m", "", line))
@@ -222,11 +230,21 @@ def _reattach():
             m = json.loads(MARKER.read_text())
         except Exception:
             _clear_marker()
+    is_orphan = False
     if not (m and _pid_alive(m.get("pid"))):
         pid, cmd = _find_orphan_scan()
         if not pid:
             _clear_marker()
             return
+        is_orphan = True
+        # v8.7-fix: this process was NOT launched by this web-server instance
+        # (no marker), so we don't know its real process group — derive it
+        # directly from the pid instead of leaving pgid unset, otherwise
+        # Stop/Pause silently no-op for any scan re-attached this way.
+        try:
+            pgid = os.getpgid(pid)
+        except Exception:
+            pgid = None
         newest = None
         if OUTPUT_DIR.exists():
             for d in sorted((x for x in OUTPUT_DIR.iterdir() if x.is_dir()),
@@ -234,7 +252,7 @@ def _reattach():
                 if not (d / "SUMMARY.json").exists():
                     newest = d
                     break
-        m = {"pid": pid, "cmd": cmd,
+        m = {"pid": pid, "pgid": pgid, "cmd": cmd,
              "target": (newest.name.rsplit("_", 2)[0] if newest else "scan"),
              "hint": (newest.name.rsplit("_", 2)[0] if newest else ""),
              "started": time.time()}
@@ -245,12 +263,22 @@ def _reattach():
             "outdir": None, "outdir_hint": m.get("hint", ""),
             "started": m.get("started", time.time()), "ended": 0.0,
             "returncode": None, "stage": "re-attached", "paused": False,
+            "orphan": is_orphan,
         })
         SCAN["log"].clear()
         SCAN["log_seq"] = 0
     _push_log(f"[reconx-web] re-attached to running scan (pid {m['pid']})")
+    if is_orphan:
+        # v8.7-fix: STDOUT_LOG only ever receives THIS process's own launched
+        # scans' output (see api_scan_start/api_scan_resume) — a scan found
+        # via /proc scanning was never redirected there, so tailing it would
+        # show stale/unrelated content instead of this scan's real progress.
+        _push_log("[reconx-web] no launch marker for this scan — live log/stage "
+                  "detection is unavailable for a re-attached orphan process; "
+                  "only start/stop state is tracked")
     pid = m["pid"]
-    threading.Thread(target=_tail, args=(lambda: _pid_alive(pid),), daemon=True).start()
+    threading.Thread(target=_tail, args=(lambda: _pid_alive(pid),),
+                     kwargs={"follow_log": not is_orphan}, daemon=True).start()
 
 
 
@@ -263,9 +291,22 @@ def _resolve_outdir():
         key=lambda p: p.stat().st_mtime, reverse=True)
     if cands:
         SCAN["outdir"] = cands[0]
+        # v8.7-fix: persist the exact request body this scan was launched
+        # with, so /api/scan/resume can relaunch with the SAME options
+        # (auth/cookie/request-file/stage-selection/etc.) instead of
+        # silently falling back to a bare "domain --auto" run.
+        req = SCAN.get("last_request")
+        req_f = SCAN["outdir"] / ".scan_request.json"
+        if req and not req_f.exists():
+            try:
+                req_f.write_text(json.dumps(req))
+            except Exception:
+                pass
 
 
 def _is_running():
+    if SCAN.get("starting"):
+        return True
     p = SCAN["proc"]
     if p is not None:
         return p.poll() is None
@@ -278,7 +319,7 @@ def _is_running():
 def _parse_summary(d: Path):
     sj = d / "SUMMARY.json"
     out = {"target": "", "timestamp": "", "stages": {}, "xss": 0, "xss_confirmed": 0,
-           "sqli": 0, "sqli_candidates": 0, "nuclei": 0, "nuclei_dast": 0,
+           "nuclei": 0, "nuclei_dast": 0,
            "js_secrets": 0, "subs": 0, "alive": 0, "urls": 0}
     if not sj.exists():
         return out
@@ -296,18 +337,11 @@ def _parse_summary(d: Path):
     s7 = st.get("stage7", {}) or {}
     out["nuclei"] = int(s7.get("findings", 0) or 0)
     out["nuclei_dast"] = int(s7.get("findings_dast", 0) or 0)
-    s14 = st.get("stage14", {}) or {}
-    out["sqli"] = int(s14.get("findings_confirmed", 0) or 0)
-    out["sqli_candidates"] = int(s14.get("candidates", 0) or 0)
+    s10 = st.get("stage10", {}) or {}
+    out["js_secrets"] = int(s10.get("secrets", 0) or 0)
 
     # fall back to the on-disk artefacts when SUMMARY lost a stage to a
     # partial re-run (--resume / -s N rewrites SUMMARY without those stages)
-    def _jlen(p):
-        try:
-            return len(json.loads((d / p).read_text(errors="ignore")) or [])
-        except Exception:
-            return 0
-
     def _lines(p):
         try:
             return sum(1 for x in (d / p).read_text(errors="ignore").splitlines() if x.strip())
@@ -320,20 +354,22 @@ def _parse_summary(d: Path):
         out["xss_confirmed"] = sum(1 for x in (json.loads((d / "07_xss/xss_verified.json").read_text(errors="ignore"))
                                                if (d / "07_xss/xss_verified.json").exists() else [])
                                    if x.get("dialog_confirmed"))
-    if not out["sqli_candidates"]:
-        out["sqli_candidates"] = _jlen("14_sqli/sqli_candidates.json")
-    if not out["sqli"]:
-        out["sqli"] = sum(1 for x in (json.loads((d / "14_sqli/sqli_findings.json").read_text(errors="ignore"))
-                                      if (d / "14_sqli/sqli_findings.json").exists() else [])
-                          if x.get("confirmed", True))
     if not out["nuclei"]:
         out["nuclei"] = _lines("07_nuclei/nuclei_scan.json") + _lines("07_nuclei/nuclei_dast.json")
     if not out["nuclei_dast"]:
         out["nuclei_dast"] = _lines("07_nuclei/nuclei_dast.json")
     for key, sk in (("subs", "stage2"), ("alive", "stage3"), ("urls", "stage4")):
         out[key] = int((st.get(sk, {}) or {}).get("count", 0) or 0)
-    out["js_secrets"] = len(((d / "10_js_secrets" / "secrets.json").exists()
-                             and json.loads((d / "10_js_secrets" / "secrets.json").read_text(errors="ignore") or "[]")) or [])
+    if not out["js_secrets"]:
+        # v8.7-fix: secrets.json holds the full deduped `details` list
+        # (endpoints AND secrets — see reconX.py stage10_js_secrets), so
+        # counting every record here double-counted endpoints as "secrets".
+        # Filter to type=="secret" to match the report's own JS Secrets count.
+        try:
+            _details = json.loads((d / "10_js_secrets" / "secrets.json").read_text(errors="ignore") or "[]")
+            out["js_secrets"] = sum(1 for x in _details if isinstance(x, dict) and x.get("type") == "secret")
+        except Exception:
+            pass
     return out
 
 
@@ -437,10 +473,16 @@ def _build_cmd(f):
         cmd.append("--auto")
     if f.get("resume"):
         cmd.append("--resume")
-    if f.get("no_legal"):
-        cmd.append("--no-legal")
-    if f.get("sqli_active"):
-        cmd.append("--sqli-active")
+    if f.get("fresh"):
+        cmd.append("--fresh")
+    try:
+        _mt = int(f.get("max_time") or 0)
+    except (TypeError, ValueError):
+        _mt = 0
+    if _mt > 0:
+        cmd += ["--max-time", str(_mt)]
+    if f.get("no_diff"):
+        cmd.append("--no-diff")
     if f.get("severity"):
         cmd += ["--severity", f["severity"].strip()]
     if f.get("nuclei_templates"):
@@ -466,32 +508,47 @@ def _build_cmd(f):
 
 @app.post("/api/scan/start")
 def api_scan_start():
-    if _is_running():
-        return jsonify({"ok": False, "error": "a scan is already running"}), 409
-    f = request.json or {}
-    cmd, err = _build_cmd(f)
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
-
-    target = (f.get("domain") or f.get("single") or f.get("urls") or f.get("urlfile") or "target").strip()
-    hint = re.sub(r"^https?://", "", target).split("/")[0].split()[0] if target else ""
-
-    env = dict(os.environ)
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    logfh = STDOUT_LOG.open("wb")            # a FILE, not a pipe — survives web-server restart
-    proc = subprocess.Popen(
-        cmd, cwd=str(BASE_DIR), stdout=logfh, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, start_new_session=True, env=env)
-    logfh.close()                            # child keeps its own fd
+    # v8.7-fix: check-then-act on _is_running() was not atomic — two
+    # concurrent requests could both pass the check before either updated
+    # SCAN state, launching two reconX.py processes against the same
+    # STDOUT_LOG/output dir. Claim the "starting" slot inside the lock
+    # before doing any I/O; only one caller can win it.
     with SCAN["lock"]:
-        SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
-                     "cmd": " ".join(shlex.quote(c) for c in cmd),
-                     "target": target, "outdir": None, "outdir_hint": hint,
-                     "started": time.time(), "ended": 0.0, "returncode": None,
-                     "stage": "starting", "paused": False})
-        SCAN["log"].clear()
-        SCAN["log_seq"] = 0
+        if _is_running():
+            return jsonify({"ok": False, "error": "a scan is already running"}), 409
+        SCAN["starting"] = True
+    launched = False
+    try:
+        f = request.json or {}
+        cmd, err = _build_cmd(f)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+
+        target = (f.get("domain") or f.get("single") or f.get("urls") or f.get("urlfile") or "target").strip()
+        hint = re.sub(r"^https?://", "", target).split("/")[0].split()[0] if target else ""
+
+        env = dict(os.environ)
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        logfh = STDOUT_LOG.open("wb")            # a FILE, not a pipe — survives web-server restart
+        proc = subprocess.Popen(
+            cmd, cwd=str(BASE_DIR), stdout=logfh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+        logfh.close()                            # child keeps its own fd
+        launched = True
+        with SCAN["lock"]:
+            SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
+                         "cmd": " ".join(shlex.quote(c) for c in cmd),
+                         "target": target, "outdir": None, "outdir_hint": hint,
+                         "started": time.time(), "ended": 0.0, "returncode": None,
+                         "stage": "starting", "paused": False, "starting": False,
+                         "last_request": f})
+            SCAN["log"].clear()
+            SCAN["log_seq"] = 0
+    finally:
+        if not launched:
+            with SCAN["lock"]:
+                SCAN["starting"] = False
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
     _write_marker()
     threading.Thread(target=_tail, args=(lambda: proc.poll() is None, proc), daemon=True).start()
@@ -564,32 +621,61 @@ def api_scan_resume_paused():
 @app.post("/api/scan/resume")
 def api_scan_resume():
     """Re-launch --resume against an existing output dir's target."""
-    if _is_running():
-        return jsonify({"ok": False, "error": "a scan is already running"}), 409
-    name = (request.json or {}).get("name", "")
-    d = OUTPUT_DIR / name
-    if not d.is_dir():
-        return jsonify({"ok": False, "error": "unknown scan"}), 404
-    summ = _parse_summary(d)
-    target = summ["target"] or name.rsplit("_", 2)[0]
-    f = {"input_mode": "domain", "domain": target, "auto": True, "resume": True}
-    cmd, err = _build_cmd(f)
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    logfh = STDOUT_LOG.open("wb")
-    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=logfh,
-                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                            start_new_session=True,
-                            env={**os.environ, "PYTHONUNBUFFERED": "1"})
-    logfh.close()
     with SCAN["lock"]:
-        SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
-                     "cmd": " ".join(shlex.quote(c) for c in cmd), "target": target,
-                     "outdir": d, "outdir_hint": d.name.rsplit("_", 2)[0],
-                     "started": time.time(), "ended": 0.0, "returncode": None,
-                     "stage": "resuming", "paused": False})
-        SCAN["log"].clear(); SCAN["log_seq"] = 0
+        if _is_running():
+            return jsonify({"ok": False, "error": "a scan is already running"}), 409
+        SCAN["starting"] = True
+    launched = False
+    try:
+        name = (request.json or {}).get("name", "")
+        d = OUTPUT_DIR / name
+        if not d.is_dir():
+            return jsonify({"ok": False, "error": "unknown scan"}), 404
+        summ = _parse_summary(d)
+        target = summ["target"] or name.rsplit("_", 2)[0]
+        # v8.7-fix: reuse the ORIGINAL launch options (auth/login/cookie/
+        # request-file/stage-selection/--severity/etc.) saved by
+        # _resolve_outdir() when this scan first started, instead of
+        # silently relaunching a bare "domain --auto" run that drops them.
+        f = None
+        req_f = d / ".scan_request.json"
+        if req_f.exists():
+            try:
+                f = json.loads(req_f.read_text(errors="ignore"))
+            except Exception:
+                f = None
+        if f is None:
+            f = {"input_mode": "domain", "domain": target}
+            _push_log("[reconx-web] no saved launch options for this scan — "
+                      "resuming with domain + defaults only (auth/stage "
+                      "options from the original run, if any, are lost)")
+        f["domain"] = f.get("domain") or target
+        f["auto"] = True
+        f["resume"] = True
+        f["fresh"] = False   # a saved --fresh would contradict the resume intent
+        cmd, err = _build_cmd(f)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        logfh = STDOUT_LOG.open("wb")
+        proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=logfh,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True,
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        logfh.close()
+        launched = True
+        with SCAN["lock"]:
+            SCAN.update({"proc": proc, "ext_pid": None, "pgid": os.getpgid(proc.pid),
+                         "cmd": " ".join(shlex.quote(c) for c in cmd), "target": target,
+                         "outdir": d, "outdir_hint": d.name.rsplit("_", 2)[0],
+                         "started": time.time(), "ended": 0.0, "returncode": None,
+                         "stage": "resuming", "paused": False, "starting": False,
+                         "last_request": f})
+            SCAN["log"].clear(); SCAN["log_seq"] = 0
+    finally:
+        if not launched:
+            with SCAN["lock"]:
+                SCAN["starting"] = False
     _push_log(f"[reconx-web] $ {SCAN['cmd']}")
     _write_marker()
     threading.Thread(target=_tail, args=(lambda: proc.poll() is None, proc), daemon=True).start()
@@ -599,8 +685,9 @@ def api_scan_resume():
 @app.post("/api/scan/delete")
 def api_scan_delete():
     name = (request.json or {}).get("name", "")
-    d = OUTPUT_DIR / name
-    if not d.is_dir() or OUTPUT_DIR not in d.parents:
+    d = (OUTPUT_DIR / name).resolve()
+    out_resolved = OUTPUT_DIR.resolve()
+    if not d.is_dir() or (out_resolved not in d.parents and d != out_resolved):
         return jsonify({"ok": False, "error": "bad path"}), 400
     if _is_running() and SCAN["outdir"] and SCAN["outdir"].name == name:
         return jsonify({"ok": False, "error": "that scan is running"}), 409
@@ -728,7 +815,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
 
       <label>Stages</label>
       <div style="margin-bottom:6px">
-        <label class="chk"><input type="radio" name="stagemode" value="all" checked> All (1–14)</label>
+        <label class="chk"><input type="radio" name="stagemode" value="all" checked> All (1–13)</label>
         <label class="chk"><input type="radio" name="stagemode" value="pick"> Pick…</label>
       </div>
       <div class="stages" id="stagebox" style="display:none"></div>
@@ -736,9 +823,13 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc2);font-size:12.5p
       <label>Options</label>
       <div>
         <label class="chk"><input type="checkbox" id="auto" checked> --auto (no prompts)</label>
-        <label class="chk"><input type="checkbox" id="resume"> --resume</label>
-        <label class="chk"><input type="checkbox" id="no_legal"> --no-legal</label>
-        <label class="chk"><input type="checkbox" id="sqli_active"> --sqli-active (run sqlmap, slow)</label>
+        <label class="chk"><input type="checkbox" id="resume"> --resume (continue unfinished scan)</label>
+        <label class="chk"><input type="checkbox" id="fresh"> --fresh (never resume)</label>
+        <label class="chk"><input type="checkbox" id="no_diff"> --no-diff</label>
+      </div>
+      <div class="row">
+        <div style="flex:1;min-width:200px"><label>Time budget (minutes, 0 = unlimited)</label>
+          <input type="number" id="max_time" min="0" step="5" placeholder="0"></div>
       </div>
       <div class="row">
         <div style="flex:1;min-width:200px"><label>Nuclei severity</label><input type="text" id="severity" placeholder="critical,high,medium"></div>
@@ -872,7 +963,7 @@ $('#report-newtab').onclick=()=>{ if(curReport) window.open('/report/'+curReport
 // stage checkboxes
 const STG=[[1,'Recon'],[2,'Subdomains'],[3,'Alive'],[4,'URLs'],[5,'Categorise'],[6,'XSS'],
  [7,'Nuclei+DAST'],[8,'Auth crawl'],[9,'Params'],[10,'JS secrets'],[11,'Tech'],[12,'Extra'],
- [13,'API'],[14,'SQLi']];
+ [13,'API']];
 $('#stagebox').innerHTML=STG.map(([n,t])=>`<label class="chk"><input type="checkbox" class="stg" value="${n}"> ${n} ${t}</label>`).join('');
 $$('input[name=stagemode]').forEach(r=>r.onchange=()=>{
   $('#stagebox').style.display=$('input[name=stagemode]:checked').value==='pick'?'grid':'none';
@@ -888,8 +979,8 @@ $('#input_mode').onchange=()=>{
 function collectForm(){
   const m=$('#input_mode').value;
   const f={input_mode:m,
-    auto:$('#auto').checked, resume:$('#resume').checked, no_legal:$('#no_legal').checked,
-    sqli_active:$('#sqli_active').checked,
+    auto:$('#auto').checked, resume:$('#resume').checked, fresh:$('#fresh').checked,
+    no_diff:$('#no_diff').checked, max_time:$('#max_time').value,
     severity:$('#severity').value, nuclei_templates:$('#nuclei_templates').value, blind:$('#blind').value,
     login_url:$('#login_url').value, login_user:$('#login_user').value, login_pass:$('#login_pass').value,
     login_user_field:$('#login_user_field').value, login_pass_field:$('#login_pass_field').value,
@@ -985,8 +1076,6 @@ async function loadScans(){
     const s=r.summary; const B=[];
     if(s.xss_confirmed) B.push(`<span class="badge b-red">XSS ${s.xss_confirmed}✓</span>`);
     else if(s.xss) B.push(`<span class="badge b-org">XSS ${s.xss}</span>`);
-    if(s.sqli) B.push(`<span class="badge b-red">SQLi ${s.sqli}✓</span>`);
-    else if(s.sqli_candidates) B.push(`<span class="badge b-org">SQLi ${s.sqli_candidates} cand</span>`);
     if(s.nuclei) B.push(`<span class="badge b-blue">Nuclei ${s.nuclei}</span>`);
     if(s.js_secrets) B.push(`<span class="badge b-org">JS ${s.js_secrets}</span>`);
     if(s.subs) B.push(`<span class="badge b-gray">${s.subs} subs</span>`);

@@ -1,5 +1,5 @@
 # ReconX v8.6 — Professional Bug Bounty Configuration
-# Tüm hassas anahtarlar ENV üzerinden de verilebilir: RECONX_SHODAN_KEY, RECONX_CENSYS_KEY vb.
+# Tüm hassas anahtarlar ENV üzerinden de verilebilir: RECONX_CENSYS_KEY vb.
 # Dosyadaki değerler boş bırakılırsa ENV değişkenleri otomatik kullanılır.
 
 settings:
@@ -20,6 +20,24 @@ settings:
   rerun_max: 2
   rerun_backoff: 0.65
   rerun_pause_sec: 6
+  # v8.8: Tor tabanli otomatik IP rotasyonu — hedef/WAF engellemesi
+  # ALGILANDIGINDA (403/429/waf_block_page, httpx/nuclei block_ratio esigi)
+  # devreye girer. Normal, engellenmeyen istekler dogrudan gider — Tor
+  # sadece bir fallback'tir, varsayilan taramayi yavaslatmaz. Gereksinim:
+  # ./install.sh (tor + python 'stem' paketini kurar) — eksikse otomatik
+  # rotasyon sessizce devre disi kalir, tarama normal devam eder. Kendi
+  # izole SOCKS/Control portlarini ve kendi .tor_data/ dizinini kullanir,
+  # sistem genelinde ayrica calisan bir Tor kurulumuyla CAKISMAZ.
+  auto_tor: true
+  tor_socks_port: 9060
+  tor_control_port: 9061
+  # Bir stage icinde en fazla kac kez devre/IP degistirilir (rerun_max'in
+  # Tor karsiligi) — hedef gercekten cevrimdisiyse sonsuz donguyu onler.
+  tor_max_rotations_per_stage: 5
+  # ControlPort kimlik dogrulama sifresi. Bos birakilirsa ilk calistirmada
+  # otomatik uretilip .tor_data/control_password.txt icine yazilir —
+  # elle girmeniz gerekmez.
+  tor_control_password: ""
   user_agent_rotation: true
   respect_scope: true
   max_subdomains: 5000
@@ -76,9 +94,8 @@ settings:
   xss_verify_budget_sec: 900
 
 api_keys:
-  # Boş bırak ve ENV kullan — örn: $env:RECONX_SHODAN_KEY="xxx" (PowerShell) veya export RECONX_SHODAN_KEY=xxx (Linux)
+  # Boş bırak ve ENV kullan — örn: $env:RECONX_CENSYS_KEY="xxx" (PowerShell) veya export RECONX_CENSYS_KEY=xxx (Linux)
   # Dosyaya anahtar yazmak istiyorsan sadece private repo'da ve .gitignore ile koru.
-  shodan: ""
   censys: ""
   chaos: ""
   github: ""
@@ -108,37 +125,6 @@ tools:
   # each one is hit with many payloads across every fuzz template, so this
   # bounds the pass on large targets. Raise for deeper coverage.
   nuclei_dast_max_urls: 400
-
-  # SQL injection — sqlmap (Stage 14)
-  # Active injection testing on discovered parameterised URLs. Gated behind an
-  # interactive confirmation; runs automatically under --auto. A "no findings"
-  # result is only meaningful if the stage actually completed (check the
-  # report's SQL Injection panel for status).
-  # Master switch for Stage 14. true = the stage runs (candidate listing always;
-  # active sqlmap only per sqli_active below).
-  sqli_enabled: true
-  # ACTIVE sqlmap testing. false (default) = Stage 14 only LISTS likely
-  # injection points + any nuclei-DAST SQLi hit, each with a ready-to-run
-  # sqlmap command — fast, no active injection traffic. true = also run sqlmap
-  # to confirm and DBMS-fingerprint (adds 10-30 min). You can also force the
-  # active run for one scan with `--stage14` without touching this.
-  sqli_active: false
-  # Hard cap on how many unique parameterised URLs are handed to sqlmap, since
-  # sqlmap tests targets sequentially and is slow. URLs are deduped by
-  # (host, path, sorted-param-names) first, so this is 25 distinct injection
-  # surfaces, not 25 near-identical links.
-  sqli_max_targets: 25
-  # sqlmap --level (1-5) and --risk (1-3). 3/2 is the common bug-bounty baseline
-  # (a real confirmed injection often needs exactly this to surface). Risk 3
-  # adds OR-based payloads that can be destructive on UPDATE stmts — avoided.
-  sqli_level: 3
-  sqli_risk: 2
-  # Overall wall-clock ceiling (seconds) for the whole sqlmap run across all
-  # targets. Hit = stage stops and reports partial results.
-  sqli_timeout_sec: 1800
-  # sqlmap --technique. B=boolean E=error U=union S=stacked T=time Q=inline.
-  # Default BEUST (no Q) — detection only, never dump/modify.
-  sqli_technique: "BEUST"
 
   # XSS / Dalfox
   # Manual blind XSS callback URL. Leave empty to let ReconX auto-provision one
@@ -211,10 +197,10 @@ tools:
   # Only parallelise when there are at least this many targets — below it the
   # process-spawn overhead isn't worth it.
   dalfox_parallel_min: 8
-  # dalfox's own per-target concurrency (its default is 100). Capped at 40.
+  # dalfox's own per-target concurrency (its default is 100). Capped at 60.
   # Lower this if the target rate-limits the payload burst (symptom: dalfox
   # spends real time but reports 0 findings on a live target).
-  dalfox_workers: 25
+  dalfox_workers: 40
   # milliseconds between dalfox requests (0 = none). Raise alongside lowering
   # workers ONLY if a target is throttling (symptom: dalfox runs long, finds 0
   # on a live target). At 100ms this alone can 5-10x the total run time, so it

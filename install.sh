@@ -49,21 +49,34 @@ go_need(){ # go_need <executable> <go-import>
 }
 
 # --------------------------------------------------------------------------
-info "${B}ReconX kurulum basliyor — sistem guncelleniyor...${N}"
+info "ReconX kurulum basliyor — sistem guncelleniyor..."
 sudo apt-get update -y >/dev/null 2>&1
 sudo apt-get install -y git curl wget unzip python3-pip python3-venv \
-    nmap whatweb golang-go >/dev/null 2>&1
+    nmap whatweb golang-go tor >/dev/null 2>&1
 
 # Python bagimliliklari
-python3 -m pip install --break-system-packages pyyaml curl-cffi 2>/dev/null \
-  || python3 -m pip install pyyaml >/dev/null 2>&1
+python3 -m pip install --break-system-packages pyyaml curl-cffi stem 2>/dev/null \
+  || python3 -m pip install pyyaml stem >/dev/null 2>&1
+
+# Tor — engellenme ALGILANDIGINDA otomatik IP/devre rotasyonu icin (bkz.
+# config.yaml: settings.auto_tor). ReconX kendi izole SOCKS/Control portlarini
+# (.tor_data/) kullanarak KENDI Tor surecini baslatir — buradaki sistem
+# paketi/binary'yi calistirmaz, sadece PATH'te bulunmasini saglar. Eksikse
+# rotasyon ozelligi sessizce devre disi kalir, tarama normal calismaya devam eder.
+if ! command -v tor >/dev/null 2>&1; then
+  warn "tor kurulamadi — Ctrl+C menusu ve diger tum ozellikler calisir, "
+  warn "sadece otomatik IP rotasyonu (settings.auto_tor) devre disi kalir"
+else
+  skip "tor"
+fi
 
 # Nuclei templates (cfg: "nuclei_templates" bos kalirsa otomatik)
 export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin:${HOME}/go/bin"
 
 # --------------------------------------------------------------------------
 # Go tabanli araclar
-info "${B}\n== Go araclari ==${N}"
+echo
+info "== Go araclari =="
 go_need httpx        "github.com/projectdiscovery/httpx/cmd/httpx"
 go_need subfinder    "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 go_need nuclei       "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
@@ -71,39 +84,57 @@ go_need katana       "github.com/projectdiscovery/katana/cmd/katana"
 go_need gau          "github.com/lc/gau/v2/cmd/gau"
 go_need waybackurls  "github.com/tomnomnom/waybackurls"
 go_need dalfox       "github.com/hahwul/dalfox/v2"
-go_need trufflehog   "github.com/trufflesecurity/trufflehog"
 go_need findomain    "github.com/Findomain/Findomain"
 go_need assetfinder  "github.com/tomnomnom/assetfinder"
 
+# trufflehog — "go install .../v3@latest" currently FAILS (exit 1): the
+# module's own go.mod carries replace directives, which `go install pkg@ver`
+# refuses to honor (a Go toolchain restriction, not a ReconX bug — verified
+# directly against the real v3.97.4 module). apt's build is unaffected and
+# is what Kali itself ships, so it's the primary path; go install is kept
+# only as a last-resort fallback for non-Kali Debian systems without the
+# apt package (may still fail for the reason above).
+if ! command -v trufflehog >/dev/null 2>&1; then
+  info "Kuruluyor: trufflehog"
+  sudo apt-get install -y trufflehog >/dev/null 2>&1 \
+    || ( export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin"
+         go install github.com/trufflesecurity/trufflehog/v3@latest >/dev/null 2>&1 ) \
+    || warn "trufflehog kurulamadi"
+else
+  skip "trufflehog"
+fi
+
 # --------------------------------------------------------------------------
 # Python / pip araclari
-info "${B}\n== Python araclari ==${N}"
+echo
+info "== Python araclari =="
 pipx_need theHarvester "theHarvester"
 pipx_need wafw00f      "wafw00f"
 pipx_need arjun        "arjun"
-pipx_need shodan       "shodan"
-
-# sqlmap — Stage 14 (SQL injection). apt paketi Kali'de mevcut; degilse pip.
-if ! command -v sqlmap >/dev/null 2>&1; then
-  info "Kuruluyor: sqlmap"
-  sudo apt-get install -y sqlmap >/dev/null 2>&1 \
-    || python3 -m pip install --break-system-packages sqlmap >/dev/null 2>&1 \
-    || warn "sqlmap kurulamadi — Stage 14 (SQLi) devre disi kalir"
-else
-  skip "sqlmap"
-fi
 
 # interactsh-client — blind XSS OOB callback (Stage 6). Opsiyonel ama onerilir.
 go_need interactsh-client "github.com/projectdiscovery/interactsh/cmd/interactsh-client"
+
+# v8.8-fix: these three used a BARE "pip install" (no "python3 -m" / no
+# --break-system-packages). On Kali (and any PEP 668 "externally-managed-
+# environment" system) that fails INSTANTLY with "error: externally-managed-
+# environment" — verified directly on a real Kali box — which is exactly why
+# all three silently showed "kurulamadi" for every user on a stock Kali
+# install. pip_install() below matches the same --break-system-packages-
+# then-plain-pip fallback chain already used elsewhere in this script (see
+# pipx_need / the pyyaml+curl-cffi+stem line above).
+pip_install(){
+  python3 -m pip install --break-system-packages "$@" >/dev/null 2>&1 \
+    || python3 -m pip install "$@" >/dev/null 2>&1
+}
 
 # ParamSpider (git clone + pip)
 if ! command -v paramspider >/dev/null 2>&1; then
   info "Kuruluyor: paramspider"
   rm -rf /tmp/ParamSpider
   git clone -q --depth 1 https://github.com/devanshbatham/ParamSpider /tmp/ParamSpider
-  pip install /tmp/ParamSpider >/dev/null 2>&1 \
-    || (cd /tmp/ParamSpider && pip install -r requirements.txt >/dev/null 2>&1 \
-        && pip install . >/dev/null 2>&1) \
+  pip_install /tmp/ParamSpider \
+    || (cd /tmp/ParamSpider && pip_install -r requirements.txt && pip_install .) \
     || warn "paramspider kurulamadi"
 else
   skip "paramspider"
@@ -114,18 +145,21 @@ if ! command -v sublist3r >/dev/null 2>&1; then
   info "Kuruluyor: sublist3r"
   rm -rf /tmp/Sublist3r
   git clone -q --depth 1 https://github.com/aboul3la/Sublist3r /tmp/Sublist3r
-  pip install /tmp/Sublist3r >/dev/null 2>&1 || warn "sublist3r kurulamadi"
+  pip_install /tmp/Sublist3r || warn "sublist3r kurulamadi"
 else
   skip "sublist3r"
 fi
 
-# LinkFinder (git clone + pip)
+# LinkFinder (git clone + pip). "python setup.py install" is REMOVED — recent
+# setuptools no longer supports it at all (and Python 3.12+ dropped distutils
+# from the stdlib that old setup.py scripts implicitly relied on), so it
+# always failed on any current system. "pip install ." is the modern
+# equivalent and goes through the same PEP 668 handling as everything else.
 if ! command -v linkfinder >/dev/null 2>&1; then
   info "Kuruluyor: linkfinder"
   rm -rf /tmp/LinkFinder
   git clone -q --depth 1 https://github.com/GerbenJavado/LinkFinder /tmp/LinkFinder
-  ( cd /tmp/LinkFinder && python3 setup.py install >/dev/null 2>&1 ) \
-    || warn "linkfinder kurulamadi"
+  pip_install /tmp/LinkFinder || warn "linkfinder kurulamadi"
 else
   skip "linkfinder"
 fi
@@ -136,7 +170,8 @@ go_need hakrawler "github.com/hakluke/hakrawler"
 # --------------------------------------------------------------------------
 # Nuclei template guncellemesi
 if command -v nuclei >/dev/null 2>&1; then
-  info "${B}\nNuclei template'leri guncelleniyor...${N}"
+  echo
+  info "Nuclei template'leri guncelleniyor..."
   nuclei -update-templates -silent >/dev/null 2>&1 \
     && ok "Nuclei templates guncellendi" \
     || warn "nuclei template guncelleme basarisiz (sonra nuclei -update-templates dene)"
@@ -144,10 +179,10 @@ fi
 
 # --------------------------------------------------------------------------
 echo
-info "${B}Kurulum tamamlandi. Kurulu araclarin ozeti:${N}"
+info "Kurulum tamamlandi. Kurulu araclarin ozeti:"
 for c in httpx subfinder nuclei katana gau waybackurls dalfox trufflehog \
-         findomain assetfinder shodan hakrawler theHarvester wafw00f arjun \
-         paramspider sublist3r linkfinder nmap whatweb sqlmap interactsh-client; do
+         findomain assetfinder hakrawler theHarvester wafw00f arjun \
+         paramspider sublist3r linkfinder nmap whatweb interactsh-client; do
   if command -v "$c" >/dev/null 2>&1; then ok "$c"; else warn "$c — YOK"; fi
 done
 
@@ -156,9 +191,9 @@ info "Opsiyonel: XSS 'alert' dogrulama ekran goruntuleri icin Playwright:"
 echo "  python3 -m pip install --break-system-packages playwright && playwright install chromium"
 
 echo
-info "${B}Ornek kullanim:${N}"
+info "Ornek kullanim:"
 echo "  python3 reconX.py -d example.com"
 echo "  python3 reconX.py -u https://example.com  (tek URL)"
 echo "  python3 reconx_web.py                    (web arayuz: http://127.0.0.1:8711)"
-echo "  python3 reconX.py -d example.com --auto   (tam otomatik, tum 14 stage)"
+echo "  python3 reconX.py -d example.com --auto   (tam otomatik, tum 13 stage)"
 echo "  python3 reconX.py --help                 (tum secenekler)"

@@ -102,12 +102,20 @@ def xss_live_hit(rec: dict):
     except Exception:
         pass
 
+# v8.8: set while the Ctrl+C interrupt menu is on screen so every spinner
+# (this one and _stream_tool's own _spin_ticker) stops redrawing instead of
+# garbling the menu/input() prompt with a \r-based frame mid-write.
+_SPINNER_PAUSE = threading.Event()
+
 def _spinner(stop_evt: threading.Event, label: str):
     frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
     i = 0
     if not sys.stdout.isatty():
         return
     while not stop_evt.is_set():
+        if _SPINNER_PAUSE.is_set():
+            time.sleep(0.05)
+            continue
         sys.stdout.write(f"\r  {C.CYAN}{frames[i % len(frames)]}{C.RESET} {C.DIM}{label}{C.RESET}   ")
         sys.stdout.flush()
         i += 1
@@ -121,7 +129,7 @@ def stage(n, t):
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CFG_FILE = BASE_DIR / "config.yaml"
-VERSION = "8.6"
+VERSION = "8.9"
 ANSI_RE  = re.compile(r"\x1b\[[0-9;]*m")
 
 def strip_ansi(s: str) -> str:
@@ -276,6 +284,11 @@ def load_config(path=None):
             "rerun_max": 2,
             "rerun_backoff": 0.65,
             "rerun_pause_sec": 6,
+            "auto_tor": True,
+            "tor_socks_port": 9060,
+            "tor_control_port": 9061,
+            "tor_max_rotations_per_stage": 5,
+            "tor_control_password": "",
             "user_agent_rotation": True,
             "respect_scope": True,
             "max_subdomains": 5000,
@@ -305,7 +318,7 @@ def load_config(path=None):
             "dalfox_dedup_query_params": True,
             "dalfox_max_targets": 40,
             "dalfox_time_budget_sec": 2400,
-            "dalfox_workers": 25,
+            "dalfox_workers": 40,
             "dalfox_delay_ms": 0,
             "dalfox_stall_timeout_sec": 0,
             "dalfox_mass_workers": 10,
@@ -345,20 +358,18 @@ def load_config(path=None):
     # config.yaml beklenen "dict" semasinda degilse (liste/string/int YAML),
     # default'lara dus — aksi halde asagidaki data[k]=v olmayan dict'i cokerir.
     if not isinstance(data, dict):
-        warn(f"config.yaml bir sözlük (dict) degil ({type(data).__name__}) — "
-             f"varsayilan ayarlar kullaniliyor")
+        warn(f"config.yaml is not a dict ({type(data).__name__}) — "
+             f"falling back to built-in defaults")
         return defaults
 
     # v6.17: "yabanci" config.yaml tespiti + otomatik gocurme.
     # ReconX'in kendi semasi ust seviyede settings/api_keys/tools bekler.
     # Baska bir arac/sablondan gelen config.yaml (orn. providers/reconx/
     # database/cache/scope/advanced gibi anahtarlar) sessizce yok
-    # sayiliyordu — icindeki API anahtarlari (orn. shodan) hicbir zaman
-    # kullanilmiyordu ama arac hicbir hata da vermiyordu, sadece "not
-    # configured" diyordu. Artik bu durum tespit edilip: (1) bilinen
-    # alternatif yollardan API anahtarlari (su an: shodan) gocuruluyor,
-    # (2) eski dosya .bak olarak yedekleniyor, (3) doğru semali taze bir
-    # config.yaml yaziliyor, (4) kullaniciya net bir uyari basiliyor.
+    # sayiliyordu — arac hicbir hata da vermiyordu, sadece "not configured"
+    # diyordu. Artik bu durum tespit edilip: (1) eski dosya .bak olarak
+    # yedekleniyor, (2) doğru semali taze bir config.yaml yaziliyor,
+    # (3) kullaniciya net bir uyari basiliyor.
     # v6.17-fix: sadece "tools" ortak olabilir (cok genel bir isim, baska
     # araclarin config'lerinde de gecebilir) — bu yuzden tek basina guvenilir
     # bir sinyal degil. "settings" VE "api_keys" ikisi birden HER ZAMAN
@@ -369,53 +380,22 @@ def load_config(path=None):
                       and "api_keys" not in data)
 
     if looks_foreign:
-        migrated = {}
-        shodan_candidates = [
-            ("providers", "shodan"), ("api_keys", "shodan"),
-            ("shodan", "api_key"), ("shodan", "key"),
-        ]
-        shodan_key = ""
-        for path in shodan_candidates:
-            v = data
-            for seg in path:
-                v = v.get(seg) if isinstance(v, dict) else None
-                if v is None:
-                    break
-            if isinstance(v, str) and v.strip() and v.strip().lower() not in (
-                    "", "your_key_here", "change_me", "none", "null"):
-                shodan_key = v.strip()
-                break
-        if not shodan_key:
-            v = data.get("shodan_api_key")
-            if isinstance(v, str) and v.strip():
-                shodan_key = v.strip()
-        if shodan_key:
-            migrated["shodan"] = shodan_key
-
-        warn(f"config.yaml taninmayan bir sema ile yazilmis (ReconX'in kendi "
-             f"semasi degil: settings/api_keys/tools bekleniyor). Bulunan "
-             f"anahtarlar: {', '.join(sorted(data.keys()))}")
+        warn(f"config.yaml uses an unknown schema (ReconX expects top-level "
+             f"settings/api_keys/tools). Keys found: "
+             f"{', '.join(sorted(data.keys()))}")
         try:
             backup = p.with_suffix(p.suffix + ".bak")
             shutil.copy2(p, backup)
-            warn(f"Eski config.yaml yedeklendi: {backup}")
+            warn(f"Old config.yaml backed up: {backup}")
         except Exception:
             pass
 
         new_cfg = json.loads(json.dumps(defaults))  # deep copy
-        if migrated.get("shodan"):
-            new_cfg["api_keys"]["shodan"] = migrated["shodan"]
-            ok(f"Shodan API anahtari eski config'den gocuruldu (providers/shodan "
-               f"benzeri bir yoldan bulundu) ve yeni config.yaml'a yazildi.")
-        else:
-            warn("Eski config.yaml icinde taninabilir bir Shodan API anahtari "
-                 "bulunamadi — api_keys.shodan bos birakildi, dogru sema icin "
-                 "asagidaki ornegi kullanabilirsin.")
         try:
             _write_default_config_yaml(p, new_cfg)
-            ok(f"Yeni, dogru semali config.yaml yazildi: {p}")
+            ok(f"A fresh config.yaml with the correct schema was written: {p}")
         except Exception as e:
-            warn(f"Yeni config.yaml yazilamadi: {e}")
+            warn(f"Could not write the new config.yaml: {e}")
         return new_cfg
 
     for k, v in defaults.items():
@@ -430,7 +410,6 @@ def _write_default_config_yaml(p: Path, cfg: dict) -> None:
     """cfg (settings/api_keys/tools semasinda) icin okunabilir, yorumlu bir
     config.yaml yazar. Migrasyon sonrasi ve ilk-calistirma sablonunda kullanilir."""
     s = cfg.get("settings", {})
-    a = cfg.get("api_keys", {})
     t = cfg.get("tools", {})
     def _yq(v):  # YAML icin guvenli, alintili string
         s_ = str(v)
@@ -456,6 +435,15 @@ settings:
   rerun_max: {s.get('rerun_max', 1)}
   rerun_backoff: {s.get('rerun_backoff', 0.65)}
   rerun_pause_sec: {s.get('rerun_pause_sec', 6)}
+  # Tor tabanli otomatik IP rotasyonu — hedef/WAF engellemesi ALGILANDIGINDA
+  # devreye girer (normal istekler dogrudan gider, Tor sadece fallback'tir).
+  # Gereksinim: ./install.sh (tor + stem kurar). Kendi izole SOCKS/Control
+  # portlarini kullanir, sistem genelindeki bir Tor kurulumuyla CAKISMAZ.
+  auto_tor: {str(s.get('auto_tor', True)).lower()}
+  tor_socks_port: {s.get('tor_socks_port', 9060)}
+  tor_control_port: {s.get('tor_control_port', 9061)}
+  tor_max_rotations_per_stage: {s.get('tor_max_rotations_per_stage', 5)}
+  tor_control_password: {_yq(s.get('tor_control_password', ''))}
   prune_dead_urls: {str(s.get('prune_dead_urls', True)).lower()}
   prune_dead_urls_filter_codes: {_yq(s.get('prune_dead_urls_filter_codes', '404'))}
   xss_alert_screenshots: {str(s.get('xss_alert_screenshots', True)).lower()}
@@ -464,10 +452,9 @@ settings:
   xss_verify_max_checks: {s.get('xss_verify_max_checks', 60)}
   xss_verify_budget_sec: {s.get('xss_verify_budget_sec', 900)}
 
-# Sadece "shodan" su an kullaniliyor (stage1'de shodan host lookup icin).
-# Ornek: shodan: "abcd1234..."
-api_keys:
-  shodan: {_yq(a.get('shodan', ''))}
+# Su an aktif kullanilan bir API anahtari yok — ileride eklenecek
+# saglayicilar icin ayrilmis bos sema.
+api_keys: {{}}
 
 tools:
   nuclei_severity: {_yq(t.get('nuclei_severity', 'critical,high,medium'))}
@@ -479,13 +466,6 @@ tools:
   nuclei_concurrency: {t.get('nuclei_concurrency', 25)}
   nuclei_dast: {str(t.get('nuclei_dast', True)).lower()}
   nuclei_dast_max_urls: {t.get('nuclei_dast_max_urls', 400)}
-  sqli_enabled: {str(t.get('sqli_enabled', True)).lower()}
-  sqli_active: {str(t.get('sqli_active', False)).lower()}
-  sqli_max_targets: {t.get('sqli_max_targets', 25)}
-  sqli_level: {t.get('sqli_level', 3)}
-  sqli_risk: {t.get('sqli_risk', 2)}
-  sqli_timeout_sec: {t.get('sqli_timeout_sec', 1800)}
-  sqli_technique: {_yq(t.get('sqli_technique', 'BEUST'))}
   blind_xss_callback: {_yq(t.get('blind_xss_callback', ''))}
   dalfox_custom_payload: {_yq(t.get('dalfox_custom_payload', ''))}
   dalfox_blind: {str(t.get('dalfox_blind', False)).lower()}
@@ -496,7 +476,7 @@ tools:
   dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 2400)}
   dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
-  dalfox_workers: {t.get('dalfox_workers', 25)}
+  dalfox_workers: {t.get('dalfox_workers', 40)}
   dalfox_delay_ms: {t.get('dalfox_delay_ms', 0)}
   dalfox_stall_timeout_sec: {t.get('dalfox_stall_timeout_sec', 0)}
   dalfox_mass_workers: {t.get('dalfox_mass_workers', 10)}
@@ -628,9 +608,8 @@ def _pd_httpx():
     return None
 
 def _env_api_key(key: str) -> str:
-    """ENV üzerinden API anahtarını döndürür — örn RECONX_SHODAN_KEY."""
+    """Return an API key from the environment — e.g. RECONX_CENSYS_KEY."""
     env_map = {
-        "shodan": "RECONX_SHODAN_KEY",
         "censys": "RECONX_CENSYS_KEY",
         "chaos": "RECONX_CHAOS_KEY",
         "github": "RECONX_GITHUB_TOKEN",
@@ -641,17 +620,16 @@ def _env_api_key(key: str) -> str:
     return (os.environ.get(env_name) or "").strip()
 
 def get_api_key(cfg, key: str) -> str:
-    """config.yaml -> ENV fallback ile anahtar çözer."""
+    """Resolve an API key: config.yaml first, then the ENV fallback."""
     v = (cfg.get("api_keys", {}) or {}).get(key, "") or ""
     v = str(v).strip()
-    if v and v.lower() not in {"", "your_key_here", "change_me", "none", "null", "your_shodan_api_key"}:
+    if v and v.lower() not in {"", "your_key_here", "change_me", "none", "null"}:
         return v
     return _env_api_key(key)
 
 def has_valid_api_key(cfg, key):
     v = get_api_key(cfg, key)
-    bad = {"", "your_key_here", "change_me", "none", "null",
-           "your_shodan_api_key", "your_censys_api_key"}
+    bad = {"", "your_key_here", "change_me", "none", "null", "your_censys_api_key"}
     return bool(v) and v.strip().lower() not in bad
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +666,7 @@ def discover_nuclei_templates(cfg_override: str = "") -> str:
             ok(f"Nuclei templates (config): {p}")
             return str(p)
         elif p.exists() and p.is_dir():
-            warn(f"Nuclei template path in config bos/gecersiz (template yok): {p} — auto-detecting")
+            warn(f"Nuclei template path in config is empty/invalid (no templates): {p} — auto-detecting")
         else:
             warn(f"Nuclei template path in config not found: {p} — auto-detecting")
 
@@ -727,8 +705,8 @@ def discover_nuclei_templates(cfg_override: str = "") -> str:
     except Exception:
         pass
 
-    warn("Nuclei template path not found (veya bulunanlar bos) — nuclei kendi "
-         "varsayilan/built-in template setini kullanmaya calisacak")
+    warn("Nuclei template path not found (or the ones found are empty) — nuclei "
+         "will fall back to its own built-in template set")
     return ""
 
 
@@ -737,7 +715,7 @@ def ask_yes_no(question, default="y"):
     is_yes = default.lower() in ("y", "e", "yes", "evet")
     if not sys.stdin.isatty():
         return is_yes
-    hint = "[E/h]" if is_yes else "[e/H]"
+    hint = "[Y/n]" if is_yes else "[y/N]"
     print(f"\n{C.MAGENTA}{'─'*60}{C.RESET}")
     print(f"{C.WHITE}{C.BOLD}  {question}{C.RESET}")
     print(f"{C.MAGENTA}{'─'*60}{C.RESET}")
@@ -750,63 +728,353 @@ def ask_yes_no(question, default="y"):
             return True
         if ans in ("h", "n", "hayir", "no", "0"):
             return False
-        warn("'e' veya 'h' girin.")
+        warn("Please answer y or n.")
 
 # ── Interrupt State ───────────────────────────────────────────────────────────
+# v8.8: Ctrl+C artik "yumusak/sert" iki durumlu bir tahminden ibaret degil —
+# her basisinda interaktif, 3 secenekli bir menu gosterir:
+#   1) stage'i atla     -> o ana kadar toplanan veriler kaydedilir, bir sonraki
+#                          stage'den normal akista devam edilir
+#   2) sadece bu islemi atla -> yalnizca su an calisan tek arac/istek durur,
+#                          mevcut stage'in geri kalani degismeden surer
+#   3) araci tamamen durdur -> pipeline durur, toplanan kismi veriyle rapor
+#                          yine de uretilir
+# Eskiden tek olan `_tool` bayragi bu yuzden ikiye ayrildi:
+#   _op_skip    -> GECICI: sadece "su an calisan tek islem" durdurulsun.
+#                  Ilgili _run_once/_stream_tool cagrisi bittigi an
+#                  reset_op() ile otomatik temizlenir.
+#   _stage_skip -> STAGE BOYUNCA KALICI: mevcut stage'in KALAN tum
+#                  donguleri/komutlari kirilir; pipeline bir sonraki
+#                  stage'e gecince main driver reset_stage() ile temizler.
+#   _hard       -> SUREC SONUNA KADAR KALICI: pipeline tamamen durur.
+# Signal handler'in kendisi print()/input() YAPMAZ (sinyal-guvenli degil,
+# ayrica _spinner/_stream_tool'un stdout yazmalariyla yarisa girer) — sadece
+# bir Event set eder; asil menu ayri bir arka plan "watcher" thread'inde
+# gosterilir.
 class _IS:
-    _tool  = False
-    _hard  = False
-    _cnt   = 0
-    _last  = 0.0
-    _WIN   = 1.5
-    _lock  = threading.Lock()
+    _op_skip    = False
+    _stage_skip = False
+    _hard       = False
+    _menu_lock  = threading.Lock()
+    _raw_sigint = threading.Event()
+    _watcher_started = False
+
+    @classmethod
+    def reset_op(cls):
+        cls._op_skip = False
+
+    @classmethod
+    def reset_stage(cls):
+        cls._stage_skip = False
 
     @classmethod
     def reset(cls):
-        with cls._lock:
-            cls._tool = False
-            cls._cnt  = 0
-            cls._last = 0.0
+        # Geriye donuk: interrupt'la ilgisiz yerlerde (orn. bir y/n
+        # prompt'unun reddi sonrasi savunmacı temizlik) ikisini de temizler.
+        cls.reset_op()
+        cls.reset_stage()
 
     @classmethod
-    def interrupted(cls): return cls._tool
+    def op_skip(cls):
+        return cls._op_skip
 
     @classmethod
-    def hard(cls): return cls._hard
+    def stage_skip(cls):
+        return cls._stage_skip or cls._hard
+
+    @classmethod
+    def interrupted(cls):
+        return cls._op_skip or cls._stage_skip or cls._hard
+
+    @classmethod
+    def hard(cls):
+        return cls._hard
 
     @classmethod
     def handle(cls, sig, frm):
-        now = time.time()
-        with cls._lock:
-            elapsed = now - cls._last
-            cls._last = now
-            cls._cnt += 1
-            if cls._cnt == 1 or elapsed > cls._WIN:
-                cls._cnt  = 1
-                cls._tool = True
-                print(f"\n{C.YELLOW}[!]{C.RESET} Ctrl+C — tool stopped (press again to exit)", flush=True)
-            else:
-                cls._hard = True
-                print(f"\n{C.RED}[✗] Force exit...{C.RESET}", flush=True)
+        cls._raw_sigint.set()
+
+    @classmethod
+    def _watch_loop(cls):
+        while True:
+            cls._raw_sigint.wait()
+            cls._raw_sigint.clear()
+            if cls._hard:
+                continue
+            cls._show_menu()
+
+    @classmethod
+    def _show_menu(cls):
+        with cls._menu_lock:
+            if cls._hard:
+                return
+            _SPINNER_PAUSE.set()
+            try:
+                with _PRINT_LOCK:
+                    sys.stdout.write("\r" + " " * 100 + "\r")
+                    print(f"\n{C.YELLOW}{C.BOLD}[!] Ctrl+C caught. What do you want to do?{C.RESET}")
+                    print(f"  {C.WHITE}1){C.RESET} Skip this stage — everything collected so far is "
+                          f"saved and the pipeline continues with the next stage")
+                    print(f"  {C.WHITE}2){C.RESET} Skip only the running operation — the rest of this "
+                          f"stage carries on normally")
+                    print(f"  {C.WHITE}3){C.RESET} Stop the tool — the scan is checkpointed and a report "
+                          f"is generated from what was collected (resume later with --resume)")
+                    sys.stdout.flush()
+                choice = None
+                while choice not in ("1", "2", "3"):
+                    if not sys.stdin.isatty():
+                        choice = "3"
+                        break
+                    try:
+                        choice = input(f"  {C.BOLD}Seciminiz [1/2/3]: {C.RESET}").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        choice = "3"
+                    if choice not in ("1", "2", "3"):
+                        warn("Please enter 1, 2 or 3.")
+                if choice == "1":
+                    cls._stage_skip = True
+                    cls._op_skip = True
+                elif choice == "2":
+                    cls._op_skip = True
+                else:
+                    cls._hard = True
+                    print(f"{C.RED}[✗] Stopping — checkpointing and building a report from the "
+                          f"collected data...{C.RESET}", flush=True)
+            finally:
+                _SPINNER_PAUSE.clear()
+
+    @classmethod
+    def start_watcher(cls):
+        if cls._watcher_started:
+            return
+        cls._watcher_started = True
+        threading.Thread(target=cls._watch_loop, daemon=True, name="reconx-interrupt-watcher").start()
 
 _INT = _IS
+_INT.start_watcher()
 signal.signal(signal.SIGINT,  _INT.handle)
 signal.signal(signal.SIGTERM, lambda s, f: (
     setattr(_INT, "_hard", True),
+    _INT._raw_sigint.set(),
     print(f"\n{C.RED}[✗] SIGTERM{C.RESET}", flush=True)
 ))
+
+# ── Tor-based auto IP rotation (block-triggered fallback) ────────────────────
+# v8.8: normal, engellenmeyen istekler HER ZAMAN dogrudan (ya da kullanicinin
+# kendi settings.proxy'si uzerinden) gider — Tor SADECE bir WAF/rate-limit
+# engeli fiilen tespit edildiginde (bkz. ReconPipeline._apply_adaptive)
+# devreye giren bir fallback'tir, varsayilan taramayi yavaslatmaz. Kendi
+# izole SOCKS/Control portlarini ve kendi torrc/veri dizinini (.tor_data/)
+# kullanir — sistem genelinde ayrica calisan bir Tor kurulumuyla CAKISMAZ.
+_TOR_ACTIVE = threading.Event()
+
+def _resolve_proxy(cfg: dict) -> str:
+    """Her requests-tabanli cagrinin proxy secimi icin TEK dogru kaynak.
+    Kullanicinin ayarladigi settings.proxy HER ZAMAN kazanir; o bos ve bu
+    calistirmada Tor rotasyonu en az bir kez tetiklenmisse (_TOR_ACTIVE)
+    yerel Tor SOCKS proxy'sine dusulur; ikisi de yoksa dogrudan baglanti
+    kullanilir (bos string doner)."""
+    explicit = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
+    if explicit:
+        return explicit
+    if _TOR_ACTIVE.is_set():
+        port = int(_cfg_get(cfg, "settings", "tor_socks_port", default=9060) or 9060)
+        return f"socks5h://127.0.0.1:{port}"
+    return ""
+
+# Native proxy destegi --help ile DOGRULANMIS CLI araclari (bkz. plan) — bu
+# aracin native proxy bayragi olmayan digerleri (assetfinder/findomain/gau/
+# whatweb/nmap/wafw00f/...) icin bilerek dokunulmuyor: yanlis bir bayrak
+# eklemek o araci komple cokertir.
+_TOR_CLI_PROXY_FLAG = {"nuclei": "-proxy", "dalfox": "--proxy", "katana": "-proxy", "subfinder": "-proxy"}
+
+def _tor_cli_flag(tool: str, cfg: dict) -> list:
+    """Tor aktif degilse veya proxy cozulemiyorsa bos liste (davranis degismez)."""
+    if not _TOR_ACTIVE.is_set():
+        return []
+    proxy = _resolve_proxy(cfg)
+    flag = _TOR_CLI_PROXY_FLAG.get(tool)
+    if not (proxy and flag):
+        return []
+    return [flag, proxy]
+
+
+class _TorManager:
+    """v8.8: hedef/WAF tarama aracini engelledigini tespit ettiginde (bkz.
+    ReconPipeline._apply_adaptive), kendi yonettigi izole bir Tor sureci
+    lazy olarak baslatir ve devreyi (ControlPort -> SIGNAL NEWNYM) degistirip
+    IP'yi yeniler; tarama kaldigi yerden Tor SOCKS proxy'si uzerinden devam
+    eder. Normal, hic engellenmeyen bir tarama Tor'a hic dokunmaz — sadece
+    config'de auto_tor:true ve gercek bir blok sinyali oldugunda calisir.
+    Gereksinim: `tor` (apt) + `stem` (pip) — ./install.sh kurar; ikisinden
+    biri eksikse sessizce devre disi kalir, tarama normal (Tor'suz) devam eder.
+    """
+
+    def __init__(self, cfg: dict, log=None):
+        self.cfg = cfg
+        self.log = log
+        self.enabled = bool(_cfg_get(cfg, "settings", "auto_tor", default=True))
+        self.socks_port = int(_cfg_get(cfg, "settings", "tor_socks_port", default=9060) or 9060)
+        self.control_port = int(_cfg_get(cfg, "settings", "tor_control_port", default=9061) or 9061)
+        self.max_rotations = int(_cfg_get(cfg, "settings", "tor_max_rotations_per_stage", default=5) or 5)
+        self.data_dir = BASE_DIR / ".tor_data"
+        self.torrc_path = self.data_dir / "torrc"
+        self.password = str(_cfg_get(cfg, "settings", "tor_control_password", default="") or "").strip()
+        self._proc = None
+        self._controller = None
+        self.rotations_this_stage = 0
+        self.total_rotations = 0
+        self._last_rotation_ts = 0.0
+        self._start_lock = threading.Lock()
+        self._started = False
+        self._start_failed = False
+
+    def reset_stage_counter(self):
+        self.rotations_this_stage = 0
+
+    def _write_torrc(self) -> str:
+        """.tor_data/torrc + HashedControlPassword'u ilk calistirmada uretir,
+        sonraki calistirmalarda ayni parolayi tekrar kullanir."""
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "data").mkdir(parents=True, exist_ok=True)
+        if not self.password:
+            pw_f = self.data_dir / "control_password.txt"
+            if pw_f.exists() and pw_f.stat().st_size > 0:
+                self.password = pw_f.read_text(encoding="utf-8").strip()
+            else:
+                import secrets as _secrets
+                self.password = _secrets.token_hex(16)
+                pw_f.write_text(self.password, encoding="utf-8")
+                try:
+                    os.chmod(pw_f, 0o600)
+                except Exception:
+                    pass
+        hashed = ""
+        try:
+            hp = subprocess.run(["tor", "--hash-password", self.password],
+                                 capture_output=True, text=True, timeout=15)
+            lines = [l.strip() for l in (hp.stdout or "").splitlines() if l.strip().startswith("16:")]
+            if lines:
+                hashed = lines[-1]
+        except Exception:
+            hashed = ""
+        torrc = (
+            f"SocksPort {self.socks_port}\n"
+            f"ControlPort {self.control_port}\n"
+            f"DataDirectory {self.data_dir / 'data'}\n"
+            f"PidFile {self.data_dir / 'tor.pid'}\n"
+            f"Log notice file {self.data_dir / 'tor.log'}\n"
+        )
+        torrc += f"HashedControlPassword {hashed}\n" if hashed else "CookieAuthentication 1\n"
+        self.torrc_path.write_text(torrc, encoding="utf-8")
+        return str(self.torrc_path)
+
+    def ensure_started(self) -> bool:
+        if self._started:
+            return True
+        if self._start_failed or not self.enabled:
+            return False
+        with self._start_lock:
+            if self._started:
+                return True
+            if self._start_failed:
+                return False
+            if not tool_exists("tor"):
+                warn("Tor is not installed (run ./install.sh) — automatic IP rotation disabled")
+                self._start_failed = True
+                return False
+            try:
+                from stem.control import Controller
+                from stem import Signal  # noqa: F401
+            except Exception:
+                warn("Python package 'stem' is missing (pip install stem) — automatic IP rotation disabled")
+                self._start_failed = True
+                return False
+            try:
+                torrc = self._write_torrc()
+                info(f"Starting Tor (isolated SOCKS:{self.socks_port} / Control:{self.control_port})...")
+                self._proc = subprocess.Popen(["tor", "-f", torrc],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.time() + 30
+                bootstrapped = False
+                log_f = self.data_dir / "tor.log"
+                while time.time() < deadline:
+                    if self._proc.poll() is not None:
+                        break
+                    if log_f.exists() and "Bootstrapped 100%" in log_f.read_text(errors="ignore"):
+                        bootstrapped = True
+                        break
+                    time.sleep(0.5)
+                if not bootstrapped:
+                    warn("Tor 30s icinde bootstrap olamadi — otomatik IP rotasyonu devre disi")
+                    self.stop()
+                    self._start_failed = True
+                    return False
+                self._controller = Controller.from_port(port=self.control_port)
+                try:
+                    self._controller.authenticate(password=self.password)
+                except Exception:
+                    self._controller.authenticate()
+                _TOR_ACTIVE.set()
+                self._started = True
+                ok(f"Tor ready — blocked requests will now go through socks5h://127.0.0.1:{self.socks_port}")
+                return True
+            except Exception as e:
+                warn(f"Tor baslatilamadi: {e} — otomatik IP rotasyonu devre disi")
+                if self.log:
+                    self.log.warning(f"Tor start failed: {e}")
+                self.stop()
+                self._start_failed = True
+                return False
+
+    def rotate(self, reason: str) -> bool:
+        if not self.ensure_started():
+            return False
+        if self.rotations_this_stage >= self.max_rotations:
+            warn(f"Tor rotasyon limiti asildi (max={self.max_rotations}/stage) — "
+                 f"rotasyon yapilmadan devam ediliyor")
+            return False
+        if (time.time() - self._last_rotation_ts) < 10:
+            return False  # Tor kendi NEWNYM'ini zaten ~10s'de bir sinirliyor
+        try:
+            from stem import Signal
+            self._controller.signal(Signal.NEWNYM)
+            self._last_rotation_ts = time.time()
+            self.rotations_this_stage += 1
+            self.total_rotations += 1
+            info(f"Tor circuit renewed (new exit IP) — reason: {reason}")
+            time.sleep(2)  # yeni devrenin kurulmasi icin kisa bekleme
+            return True
+        except Exception as e:
+            warn(f"Tor NEWNYM sinyali basarisiz: {e}")
+            return False
+
+    def stop(self):
+        try:
+            if self._controller:
+                self._controller.close()
+        except Exception:
+            pass
+        self._controller = None
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
 
 # ── Timeouts ──────────────────────────────────────────────────────────────────
 T = {
     "whois": 120, "whatweb": 600, "wafw00f": 120, "nmap": 1800,
-    "shodan": 120,
     "subfinder": 1800, "assetfinder": 900, "findomain": 900,
     "httpx": 1800,
     "gau": 3600, "katana": 3600,
     "nuclei": 14400,
     "nuclei_dast": 7200,
     "dalfox": 7200,
-    "sqlmap": 2400,
     "login": 60,
     "paramspider": 1800,
     "arjun": 3600,
@@ -1241,7 +1509,7 @@ def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
         return {"ok": False, "error": "no_http_client"}
     settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
     impersonate = settings.get("curl_cffi_impersonate", "chrome110")
-    proxy = (settings.get("proxy") or "").strip()
+    proxy = _resolve_proxy(cfg)
     jitter_max = float(settings.get("jitter_max", 0.0) or 0.0)
     host = _extract_domain_from_any(url) or ""
     headers = pick_header_strategy(host, cfg)
@@ -1297,23 +1565,16 @@ def send_webhook_notification(cfg: dict, target: str, summary: dict) -> bool:
     try:
         s7 = (summary or {}).get("stage7") or {}
         s6 = (summary or {}).get("stage6") or {}
-        s14 = (summary or {}).get("stage14") or {}
         sev = s7.get("severity_counts") or {}
         crit = int(sev.get("critical", 0)); high = int(sev.get("high", 0))
         med  = int(sev.get("medium", 0))
         xss_n = int(s6.get("findings", 0) or 0)
-        sqli_conf = int(s14.get("findings_confirmed", 0) or 0)
-        sqli_cand = int(s14.get("candidates", 0) or 0)
-        sqli_dast = int(s14.get("dast_hits", 0) or 0)
         dast_n = int(s7.get("findings_dast", 0) or 0)
-        alert = "🔴" if (crit or high or sqli_conf or sqli_dast) else ("🟡" if (med or xss_n or dast_n) else "🟢")
-        sqli_txt = (f"{sqli_conf} confirmed" if sqli_conf
-                    else (f"{sqli_dast} DAST-flagged / {sqli_cand} candidates" if sqli_dast
-                          else f"{sqli_cand} candidates (not tested)"))
+        alert = "🔴" if (crit or high) else ("🟡" if (med or xss_n or dast_n) else "🟢")
         lines = [
             f"{alert} *ReconX scan complete* — `{target}`",
             f"Nuclei: {crit} critical, {high} high, {med} medium ({dast_n} via DAST)  ·  "
-            f"XSS: {xss_n}  ·  SQLi: {sqli_txt}",
+            f"XSS: {xss_n}",
         ]
         text = "\n".join(lines)
         payload = {"text": text, "content": text}  # Slack uses "text", Discord uses "content"
@@ -1711,7 +1972,7 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
     for i, f in enumerate(picked):
         if checks >= max_checks or (time.time() - t0) > budget_sec:
             break
-        if _INT.hard() or _INT.interrupted():
+        if _INT.stage_skip():
             break
         # once an injection point is proven, don't burn budget on its other payloads
         if _key(f) in confirmed_points:
@@ -1869,6 +2130,302 @@ def checkpoint(path, lines, label):
     n = write_lines(path, lines)
     ok(f"Checkpoint [{label}]: {n:,} entries → {Path(path).name}")
     return n
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage-level checkpoint / resume
+# ══════════════════════════════════════════════════════════════════════════════
+# Every scan session owns exactly one state file:
+#
+#     <output-dir>/checkpoints/state.json
+#
+# It is rewritten (atomically: temp file + os.replace, so a Ctrl+C *during* the
+# write can never leave a half-parsed file behind) at three moments:
+#
+#   1. when a stage starts          -> status "running"
+#   2. when a stage ends            -> status "done" / "partial" / "failed" /
+#                                      "skipped", plus that stage's summary
+#                                      block and wall-clock duration
+#   3. when the run is interrupted  -> "interrupted": true + the reason
+#
+# Because the file is flushed after EVERY stage transition, a Ctrl+C (or a
+# SIGTERM, a crash, or the --max-time budget firing) always leaves behind an
+# accurate record of which stages finished and what they produced. The next run
+# reads it back, offers to resume, skips the stages already marked "done" and
+# restores their stored results into the in-memory summary so the final report
+# still contains them (see ReconPipeline._restore_stage).
+#
+# Note the deliberate split: only "done" is skipped on resume. A "partial"
+# stage (interrupted mid-way) or a "failed" one is re-run from scratch, because
+# its on-disk artefacts are by definition incomplete; a "skipped" stage (the
+# operator declined the XSS/Nuclei prompt) is offered again.
+STATE_SCHEMA = 1
+STATE_FILE   = "state.json"
+
+STAGE_TITLES = {
+    0:  "URL Seed Mode",
+    1:  "Initial Reconnaissance",
+    2:  "Subdomain Enumeration",
+    3:  "Host Validation — httpx",
+    4:  "URL Discovery",
+    5:  "URL Categorisation",
+    6:  "XSS Testing — Dalfox",
+    7:  "Nuclei Vulnerability Scan",
+    8:  "Authenticated Crawl",
+    9:  "Param Discovery",
+    10: "JS Endpoint / Secret Analysis",
+    11: "Tech-Based Prioritisation",
+    12: "Extra Security Checks",
+    13: "API Discovery",
+}
+
+# Checkpoint files whose first lines are shown back to the operator when a
+# stage is restored from an earlier run ("here is what you already have").
+_STAGE_ARTEFACTS = {
+    1:  ["stage1_done"],
+    2:  ["stage2_subdomains"],
+    3:  ["stage3_alive"],
+    4:  ["stage4_urls"],
+    5:  ["stage5_xss_targets", "stage5_params"],
+    8:  ["stage8_authenticated_urls"],
+    9:  ["stage9_params"],
+    13: ["stage13_api"],
+}
+
+_STATE_STATUS_COLOR = {
+    "done":        (C.GREEN,   "DONE"),
+    "partial":     (C.YELLOW,  "PARTIAL"),
+    "failed":      (C.RED,     "FAILED"),
+    "skipped":     (C.DIM,     "SKIPPED"),
+    "running":     (C.YELLOW,  "INTERRUPTED"),
+}
+
+
+class ScanState:
+    """Durable, stage-level scan state backed by checkpoints/state.json.
+
+    Thread-safe (the --max-time watchdog and the main thread can both touch it)
+    and failure-tolerant by design: every persistence call is best-effort and
+    never raises into the pipeline — a scan must not die because a checkpoint
+    could not be written, it should just lose the ability to resume.
+    """
+
+    def __init__(self, out_dir, target: str, argv=None):
+        self.dir  = Path(out_dir)
+        self.path = self.dir / "checkpoints" / STATE_FILE
+        self._lock = threading.Lock()
+        now = datetime.now().isoformat(timespec="seconds")
+        self.data = {
+            "schema":      STATE_SCHEMA,
+            "version":     VERSION,
+            "target":      target,
+            "output_dir":  str(self.dir),
+            "created":     now,
+            "updated":     now,
+            "completed":   False,
+            "interrupted": False,
+            "finalized":   False,   # set once the run ends in a known way
+            "interrupt_reason": "",
+            "argv":        list(argv or sys.argv[1:]),
+            "stages":      {},
+        }
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    def load(self) -> bool:
+        """Read an existing state file into memory. True if one was found."""
+        data = read_state_file(self.dir)
+        if not data:
+            return False
+        stages = data.get("stages")
+        if not isinstance(stages, dict):
+            data["stages"] = {}
+        # keep the *original* creation metadata, adopt everything else
+        self.data.update(data)
+        self.data["schema"]  = STATE_SCHEMA
+        self.data["version"] = VERSION
+        return True
+
+    def save(self):
+        """Atomic write — a crash mid-save can never corrupt the state file."""
+        with self._lock:
+            self.data["updated"] = datetime.now().isoformat(timespec="seconds")
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False, default=str),
+                               encoding="utf-8")
+                os.replace(tmp, self.path)   # atomic on POSIX and Windows
+            except Exception:
+                pass                          # never break a scan over a checkpoint
+
+    # ── stage bookkeeping ────────────────────────────────────────────────────
+    def stage_info(self, n) -> dict:
+        rec = self.data.get("stages", {}).get(str(n))
+        return rec if isinstance(rec, dict) else {}
+
+    def stage_status(self, n) -> str:
+        return str(self.stage_info(n).get("status") or "")
+
+    def is_done(self, n) -> bool:
+        return self.stage_status(n) == "done"
+
+    def done_stages(self) -> list:
+        out = []
+        for k, v in (self.data.get("stages") or {}).items():
+            if isinstance(v, dict) and v.get("status") == "done":
+                try:
+                    out.append(int(k))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(out)
+
+    def start_stage(self, n, title=""):
+        self.data.setdefault("stages", {})[str(n)] = {
+            "status":  "running",
+            "title":   title or STAGE_TITLES.get(n, ""),
+            "started": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.data["last_stage"] = n
+        self.save()
+
+    def finish_stage(self, n, status, summary=None, duration=None):
+        rec = self.data.setdefault("stages", {}).get(str(n)) or {}
+        rec.update({
+            "status":   status,
+            "title":    rec.get("title") or STAGE_TITLES.get(n, ""),
+            "finished": datetime.now().isoformat(timespec="seconds"),
+        })
+        if duration is not None:
+            rec["duration_sec"] = round(float(duration), 1)
+        if isinstance(summary, dict):
+            rec["summary"] = summary
+        self.data["stages"][str(n)] = rec
+        self.data["last_stage"] = n
+        self.save()
+
+    def mark_interrupted(self, reason=""):
+        self.data["interrupted"]      = True
+        self.data["completed"]        = False
+        self.data["finalized"]        = True
+        self.data["interrupt_reason"] = reason or "interrupted"
+        # a stage still flagged "running" was killed mid-flight — its artefacts
+        # are incomplete, so downgrade it to "partial" and re-run it on resume.
+        for k, v in (self.data.get("stages") or {}).items():
+            if isinstance(v, dict) and v.get("status") == "running":
+                v["status"] = "partial"
+        self.save()
+
+    def mark_completed(self):
+        """A run counts as completed only when no stage is left in a state that
+        would benefit from being re-run. A crashed stage, or one cut short by a
+        skip/budget, keeps the session resumable rather than letting the scan
+        quietly declare itself finished with a hole in it."""
+        pending = sorted(
+            (k for k, v in (self.data.get("stages") or {}).items()
+             if isinstance(v, dict) and v.get("status") in ("failed", "partial", "running")),
+            key=lambda k: int(k) if str(k).isdigit() else 99)
+        self.data["interrupted"] = False
+        self.data["finalized"]   = True
+        self.data["incomplete_stages"] = pending
+        if pending:
+            self.data["completed"]        = False
+            self.data["interrupt_reason"] = f"stage(s) incomplete: {', '.join(pending)}"
+        else:
+            self.data["completed"]        = True
+            self.data["interrupt_reason"] = ""
+        self.save()
+
+    def planned(self, stages):
+        """Record which stages this invocation intends to run."""
+        self.data["planned_stages"] = list(stages or [])
+        self.save()
+
+
+def read_state_file(session_dir) -> dict:
+    """Best-effort read of one session's state.json. {} when absent/corrupt."""
+    try:
+        p = Path(session_dir) / "checkpoints" / STATE_FILE
+        if not p.exists() or p.stat().st_size == 0:
+            return {}
+        data = json.loads(p.read_text(errors="ignore"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def find_sessions(out_root, target_slug, completed=None) -> list:
+    """All session dirs for a target, newest first.
+
+    completed=None  -> every session
+    completed=False -> only resumable ones (interrupted / never finished)
+    completed=True  -> only sessions that ran to the end (used by --diff)
+    """
+    root = Path(out_root)
+    if not root.is_dir():
+        return []
+    out = []
+    for d in root.glob(f"{target_slug}_*"):
+        if not d.is_dir():
+            continue
+        st = read_state_file(d)
+        if completed is True and not st.get("completed"):
+            continue
+        if completed is False:
+            # resumable = has state, did not complete, and actually got somewhere
+            if not st or st.get("completed") or not st.get("stages"):
+                continue
+        out.append((d, st))
+    def _sort_key(entry):
+        d, st = entry
+        try:
+            mtime = d.stat().st_mtime
+        except OSError:
+            mtime = 0
+        return (st.get("updated") or "", mtime)
+    out.sort(key=_sort_key, reverse=True)
+    return out
+
+
+def print_state_table(session_dir, state: dict):
+    """Show what an earlier, interrupted run already finished."""
+    stages = state.get("stages") or {}
+    print(f"\n{C.CYAN}{C.BOLD}{'═'*66}")
+    print(f"  UNFINISHED SCAN FOUND — {state.get('target', '?')}")
+    print(f"{'═'*66}{C.RESET}")
+    print(f"  {C.BLUE}Session   : {Path(session_dir).name}{C.RESET}")
+    print(f"  {C.BLUE}Started   : {state.get('created', '?')}{C.RESET}")
+    print(f"  {C.BLUE}Last write: {state.get('updated', '?')}{C.RESET}")
+    if state.get("interrupt_reason"):
+        print(f"  {C.BLUE}Stopped by: {state['interrupt_reason']}{C.RESET}")
+    print(f"  {C.DIM}{'─'*64}{C.RESET}")
+    for key in sorted(stages, key=lambda k: int(k) if str(k).isdigit() else 99):
+        rec = stages[key] or {}
+        status = str(rec.get("status") or "?")
+        color, label = _STATE_STATUS_COLOR.get(status, (C.DIM, status.upper()))
+        title = rec.get("title") or STAGE_TITLES.get(int(key) if str(key).isdigit() else -1, "")
+        summ  = rec.get("summary") if isinstance(rec.get("summary"), dict) else {}
+        detail = _summary_headline(summ)
+        dur = f" {C.DIM}({rec['duration_sec']}s){C.RESET}" if rec.get("duration_sec") else ""
+        print(f"  {color}{label:<12}{C.RESET} stage {str(key):>2}  {title:<32}"
+              f"{C.DIM}{detail}{C.RESET}{dur}")
+    print(f"  {C.DIM}{'─'*64}{C.RESET}")
+
+
+def _summary_headline(summary: dict) -> str:
+    """One compact 'what did this stage produce' line from its summary block."""
+    if not isinstance(summary, dict) or not summary:
+        return ""
+    bits = []
+    for key in ("count", "findings", "endpoints", "secrets", "high", "live_hits",
+                "js_files", "pattern_hits", "target_ip"):
+        val = summary.get(key)
+        if isinstance(val, (int, float)) and val:
+            bits.append(f"{key}={val:,}" if isinstance(val, int) else f"{key}={val}")
+        elif isinstance(val, str) and val and val != "unknown":
+            bits.append(f"{key}={val}")
+    if not bits and summary.get("status"):
+        bits.append(str(summary["status"]))
+    return "  " + " · ".join(bits[:4]) if bits else ""
 
 def _help_text(name):
     results = []
@@ -2080,7 +2637,10 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
 # ── run_cmd ───────────────────────────────────────────────────────────────────
 def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
             silent=False, stream=False, retries=2, retry_delay=5, stdin_file=None):
-    if _INT.hard():
+    # v8.8: stage_skip() zaten hard()'i de kapsar — "stage'i atla" secildiginde
+    # bu stage'in KALAN cagrilari hic baslatilmadan atlanir (once baslatilip
+    # hemen ardindan oldurulmesini beklemek yerine).
+    if _INT.stage_skip():
         return False, ""
     _attempt = 0
     while True:
@@ -2125,7 +2685,7 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
 
 def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
               silent=False, stream=False, attempt=0, stdin_file=None):
-    if _INT.hard():
+    if _INT.stage_skip():
         return False, ""
     if label:
         pass
@@ -2220,7 +2780,7 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
                 for _sl in _snippet[:6]:
                     if _sl.strip():
                         print(f"  {C.DIM}  └ {_sl.strip()[:160]}{C.RESET}", flush=True)
-    _INT.reset()
+    _INT.reset_op()
     return (not timed_out[0] and not ctrl_killed[0] and rc == 0), txt
 
 
@@ -2243,7 +2803,7 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
     (ended with error) console line right above the correct "found N
     findings" line that follows it, which is confusing/alarming even though
     the results themselves were never affected by this cosmetic bug."""
-    if _INT.hard():
+    if _INT.stage_skip():
         return -1, 0, True, False
     start       = time.time()
     total_lines = [0]
@@ -2260,6 +2820,9 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
         if not sys.stdout.isatty():
             return
         while not stop_spin.is_set():
+            if _SPINNER_PAUSE.is_set():
+                time.sleep(0.05)
+                continue
             elapsed = round(time.time() - start, 0)
             # v8.3: shared _PRINT_LOCK with xss_live_hit() — a live finding
             # print (from a dalfox line_cb, also running on the reader
@@ -2337,10 +2900,9 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
             last_count = total_lines[0]
             last_progress_ts = now
         if stall_timeout and (now - last_progress_ts) > stall_timeout:
-            warn(f"{spin_label}: {stall_timeout}s boyunca hic ilerleme yok "
-                 f"({total_lines[0]} satirda takili kaldi) — arac askida "
-                 f"kalmis olabilir (network engeli, kendi guncelleme kontrolu "
-                 f"vb.), durduruluyor")
+            warn(f"{spin_label}: no progress for {stall_timeout}s "
+                 f"(stuck at {total_lines[0]} lines) — the tool may be hung "
+                 f"(network block, its own update check, ...), stopping it")
             stalled[0] = True
             killed[0] = True
             if proc_ref[0]:
@@ -2375,11 +2937,11 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
         # v6.14: arac hata koduyla cikti (orn. nuclei 'no templates provided',
         # dalfox gecersiz argüman). Bunu "basarili" gibi gostermek, sahte bir
         # "0 bulgu = temiz" izlenimi verip gercek bir arac cokmesini gizleyebilir.
-        warn(f"{spin_label} HATA ILE SONLANDI (exit code {rc[0]}, {elapsed}s) — "
-             f"sonuclar EKSIK/GECERSIZ olabilir, log dosyasina bakin")
+        warn(f"{spin_label} FAILED (exit code {rc[0]}, {elapsed}s) — "
+             f"results may be INCOMPLETE/INVALID, check the log file")
     else:
         ok(f"{spin_label} done ({elapsed}s) — {total_lines[0]:,} lines")
-    _INT.reset()
+    _INT.reset_op()
     return rc[0], total_lines[0], killed[0], stalled[0]
 
 
@@ -2427,7 +2989,7 @@ def perform_login(login_url: str, username: str, password: str, cfg: dict,
 
     settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
     impersonate = settings.get("curl_cffi_impersonate", "chrome110")
-    proxy = (settings.get("proxy") or "").strip()
+    proxy = _resolve_proxy(cfg)
     host = _extract_domain_from_any(login_url) or ""
     headers = pick_header_strategy(host, cfg)
 
@@ -2587,7 +3149,7 @@ def perform_request_login(request_file: str, cfg: dict, timeout: int = 60, log=N
 
     settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
     impersonate = settings.get("curl_cffi_impersonate", "chrome110")
-    proxy = (settings.get("proxy") or "").strip()
+    proxy = _resolve_proxy(cfg)
 
     try:
         req = parse_request_file(
@@ -2677,7 +3239,7 @@ def check_cors_misconfig(url: str, cfg: dict, log=None) -> dict:
     try:
         kw = dict(timeout=12, allow_redirects=True, headers=headers)
         kw["verify"] = False
-        proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
+        proxy = _resolve_proxy(cfg)
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
         if is_cffi:
@@ -2741,7 +3303,7 @@ def check_subdomain_takeover(host_url: str, cfg: dict, log=None) -> dict:
         kw = dict(timeout=10, allow_redirects=True,
                   headers=pick_header_strategy(domain, cfg))
         kw["verify"] = False
-        proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
+        proxy = _resolve_proxy(cfg)
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
         if is_cffi:
@@ -2804,7 +3366,7 @@ def check_cloud_bucket(bucket_url: str, provider: str, cfg: dict, log=None) -> d
         kw = dict(timeout=timeout, allow_redirects=True,
                   headers={"User-Agent": _pick_ua()})
         kw["verify"] = False
-        proxy = str(_cfg_get(cfg, "settings", "proxy", default="") or "").strip()
+        proxy = _resolve_proxy(cfg)
         if proxy:
             kw["proxies"] = {"http": proxy, "https": proxy}
         if is_cffi:
@@ -2836,7 +3398,7 @@ def check_cloud_bucket(bucket_url: str, provider: str, cfg: dict, log=None) -> d
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _crtsh_enum(domain: str, timeout: int = 20) -> list:
-    """crt.sh fallback - API anahtarı gerektirmez, passive subdomain keşfi."""
+    """crt.sh fallback — passive subdomain discovery, needs no API key."""
     try:
         client, is_cffi = _get_http_client({"settings": {"use_curl_cffi": False}})
         if client is None:
@@ -2869,7 +3431,8 @@ class ReconPipeline:
                  login_success_indicator="", login_failure_indicator="",
                  login_csrf_field="", raw_cookie=None, request_file=None,
                  nuclei_templates_override=None, nuclei_severity_override=None,
-                 blind_cb=None, config_path=None):
+                 blind_cb=None, config_path=None, session_dir=None,
+                 max_time_min=0, scan_diff=True):
         self.target      = target.strip()
         self.cfg         = cfg
         self._config_path = Path(config_path) if config_path else CFG_FILE
@@ -2879,10 +3442,20 @@ class ReconPipeline:
         self.resume      = resume
         target_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.target).strip("._") or "target"
         self._target_slug = target_slug
-        if resume:
-            candidates = sorted(self._out_root.glob(f"{target_slug}_*"),
-                                key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
-            self.out = candidates[0] if candidates and candidates[0].is_dir() else self._out_root / f"{target_slug}_{self.ts}"
+        # Resume writes back into the ORIGINAL session directory so the stages
+        # already on disk keep their artefacts. main() normally resolves that
+        # directory (it needs the state to prompt the operator anyway) and
+        # hands it over as session_dir; the glob below is the fallback for
+        # callers that only pass resume=True.
+        if resume and session_dir:
+            self.out = Path(session_dir)
+        elif resume:
+            found = find_sessions(self._out_root, target_slug, completed=False)
+            if not found:
+                found = [(d, {}) for d in sorted(self._out_root.glob(f"{target_slug}_*"),
+                                                 key=lambda x: x.stat().st_mtime if x.exists() else 0,
+                                                 reverse=True) if d.is_dir()]
+            self.out = found[0][0] if found else self._out_root / f"{target_slug}_{self.ts}"
         else:
             self.out = self._out_root / f"{target_slug}_{self.ts}"
         # --auto: run the entire pipeline unattended — never block on the
@@ -2933,21 +3506,61 @@ class ReconPipeline:
         self.nuclei_asked = False
         self.nuclei_chosen = False
         self.nuclei_dast_results = None
-        self.sqli_results = None
-        self.sqli_asked = False
-        self.sqli_chosen = False
 
         for d in ["01_recon", "02_subdomains", "03_alive", "04_urls",
                   "05_categorized", "06_authenticated", "07_nuclei",
                   "07_xss", "09_params", "10_js_secrets", "11_tech",
-                  "12_extra", "13_api", "14_sqli", "checkpoints"]:
+                  "12_extra", "13_api", "checkpoints"]:
             (self.out / d).mkdir(parents=True, exist_ok=True)
 
         self.log = setup_logger(self.out / "pipeline.log")
+
+        # ── checkpoint/resume state ──────────────────────────────────────────
+        # Created AFTER the directory tree exists so the very first save() has
+        # somewhere to land. On a resume run the previous state is read back and
+        # every completed stage's stored summary is seeded into self.summary, so
+        # the final report contains the whole scan and not just the stages this
+        # particular invocation happened to execute.
+        self.state = ScanState(self.out, self.target)
+        if self.resume and self.state.load():
+            for n in self.state.done_stages():
+                saved = self.state.stage_info(n).get("summary")
+                if isinstance(saved, dict):
+                    self.summary[f"stage{n}"] = dict(saved)
+        self.state.data["interrupted"] = False
+        self.state.data["interrupt_reason"] = ""
+        self.state.save()
+
+        # ── global wall-clock budget (--max-time) ────────────────────────────
+        # 0 = unlimited. When the deadline passes the watchdog raises the same
+        # "hard stop" flag Ctrl+C option 3 raises: running tools are killed, the
+        # state file is flagged interrupted, and a report is produced from what
+        # was collected — the run stays resumable.
+        self.max_time_min  = max(0, int(max_time_min or 0))
+        self.deadline      = (time.time() + self.max_time_min * 60) if self.max_time_min else None
+        self._budget_fired = False
+        self._watchdog     = None
+        self._wd_stop      = None
+
+        # ── scan diff (--no-diff to disable) ─────────────────────────────────
+        self.want_diff = bool(scan_diff)
+        self.scan_diff = {}
+
         atexit.register(self._emergency_save)
+        self.tor = _TorManager(self.cfg, log=self.log)
+        atexit.register(self.tor.stop)
         self._precheck_katana_permission()
 
     def _emergency_save(self):
+        """atexit hook — last line of defence for an unexpected death (SIGKILL
+        of a child, an uncaught exception, the terminal going away). The state
+        file is normally already current; this just makes sure the run is not
+        left claiming to be 'running' and that a SUMMARY.json exists."""
+        try:
+            if getattr(self, "state", None) and not self.state.data.get("finalized"):
+                self.state.mark_interrupted(self.state.data.get("interrupt_reason") or "process exit")
+        except Exception:
+            pass
         try:
             sf = self.out / "SUMMARY.json"
             if not sf.exists():
@@ -2961,9 +3574,23 @@ class ReconPipeline:
             pass
 
     def _cp(self, name):    return self.out / "checkpoints" / f"{name}.txt"
+
     def _cp_ok(self, name):
+        """Legacy in-stage resume shortcut — now gated by the checkpoint state.
+
+        A checkpoint FILE existing is not proof its stage finished: a stage
+        killed mid-run (Ctrl+C, --max-time, a crash) leaves a PARTIAL file
+        behind, and the old "file exists -> resumed, done" rule then adopted
+        that truncated set as the stage's final answer — a scan silently
+        continuing on 6 subdomains instead of 29,000. So the file must exist
+        AND state.json must record that stage as done."""
         p = self._cp(name)
-        return self.resume and p.exists() and p.stat().st_size > 0
+        if not (self.resume and p.exists() and p.stat().st_size > 0):
+            return False
+        m = re.match(r"stage(\d+)", name)
+        if m and not self.state.is_done(int(m.group(1))):
+            return False
+        return True
 
     def _is_root(self) -> bool:
         try:
@@ -3006,21 +3633,32 @@ class ReconPipeline:
         return ""
 
     def _apply_adaptive(self, reason: str, extra_backoff: float = 1.0):
-        if not bool(_cfg_get(self.cfg, "settings", "adaptive_rate", default=True)):
-            return
-        floor = float(_cfg_get(self.cfg, "settings", "adaptive_floor_mult", default=0.25))
-        before = float(self.adapt_mult)
-        decay = 0.65 * float(extra_backoff)
-        self.adapt_mult = max(floor, min(self.adapt_mult, 1.0) * decay)
-        after = float(self.adapt_mult)
-        evt = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "reason": reason,
-            "mult_before": round(before, 4),
-            "mult_after": round(after, 4),
-        }
-        self.adaptive_events.append(evt)
-        warn(f"Adaptive rate ({reason}). Multiplier: {before:.2f} → {after:.2f}")
+        if bool(_cfg_get(self.cfg, "settings", "adaptive_rate", default=True)):
+            floor = float(_cfg_get(self.cfg, "settings", "adaptive_floor_mult", default=0.25))
+            before = float(self.adapt_mult)
+            decay = 0.65 * float(extra_backoff)
+            self.adapt_mult = max(floor, min(self.adapt_mult, 1.0) * decay)
+            after = float(self.adapt_mult)
+            evt = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "mult_before": round(before, 4),
+                "mult_after": round(after, 4),
+            }
+            self.adaptive_events.append(evt)
+            warn(f"Adaptive rate ({reason}). Multiplier: {before:.2f} → {after:.2f}")
+        # v8.8: hiz dusurmenin yaninda/yerine, engelleme gercekten fiiliyse
+        # (bkz. cagiran yerler) yerel Tor uzerinden IP/devre rotasyonu dener.
+        # _hard (kullanici "tamamen durdur" secti) sirasinda asla tetiklenmez.
+        # Rotasyon olayi, report_builder'in zaten cizdigi "Adaptive Rate"
+        # zaman cizelgesine eklenir — ayri bir rapor alani gerekmez.
+        if not _INT.hard() and self.tor.rotate(reason):
+            self.adaptive_events.append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "reason": f"Tor IP rotasyonu ({reason}) — devre #{self.tor.total_rotations}",
+                "mult_before": round(float(self.adapt_mult), 4),
+                "mult_after": round(float(self.adapt_mult), 4),
+            })
 
     def _tuned_threads(self, base: int, cap: int) -> int:
         base = int(base); cap = int(cap)
@@ -3225,6 +3863,7 @@ class ReconPipeline:
             httpx_cmd = (
                 f"{httpx_bin} -l {seed_file} -no-color -threads {threads} -timeout 20 -retries 2 "
                 f"-follow-redirects -status-code -title -tech-detect -content-length "
+                + (f"-http-proxy {_resolve_proxy(self.cfg)} " if _TOR_ACTIVE.is_set() else "")
                 + _hdr_args_httpx(auth_headers)
                 + f" -json -o {httpx_json}"
             )
@@ -3242,6 +3881,7 @@ class ReconPipeline:
                 "-d 5",
                 f"-concurrency {conc}" if "-concurrency" in kh else "",
                 "-timeout 15" if "-timeout" in kh else "",
+                " ".join(_tor_cli_flag("katana", self.cfg)),
             ]))
             run_cmd(f"katana -list {seed_file} {flags} {hdr_flags} -o {katana_urls}",
                     timeout=T["katana"], log=self.log, label="katana-auth", retries=1, retry_delay=8)
@@ -3398,29 +4038,9 @@ class ReconPipeline:
         # (subdomain) + whatweb/wafw00f/nmap (fingerprint) zaten ayni isi
         # yapiyor; theHarvester genelde API anahtari gerektiren motorlar
         # yuzunden tutarsiz sekilde cakiyordu (exit 1).
-        if has_valid_api_key(self.cfg, "shodan") and tool_exists("shodan"):
-            # ENV fallback otomatik — get_api_key ile çözülür
-            # v8.0: ENV fallback ile shodan key'i otomatik init et
-            _sh_key = get_api_key(self.cfg, "shodan")
-            if _sh_key:
-                try:
-                    # shodan CLI API key'i kalıcı olarak set et (sessiz)
-                    subprocess.run(["shodan", "init", _sh_key], capture_output=True, timeout=10)
-                except Exception:
-                    pass
-            ok2, _ = run_cmd("shodan info", timeout=10, log=self.log, label="shodan-check", silent=True, retries=0)
-            if ok2:
-                # v6.17: eskiden target_ip bossa "$(dig +short {tgt} | head -1)"
-                # LITERAL STRING olarak shodan'a arguman geciliyordu (shell
-                # command substitution shell=False altinda calismaz). Artik
-                # zaten sinif icinde bulunan _resolve_ip() kullaniliyor.
-                st = target_ip or self._resolve_ip(tgt)
-                if st:
-                    run_cmd(f"shodan host {st}", out_file=d / "shodan.txt", timeout=T["shodan"], log=self.log, label="shodan")
-                else:
-                    warn("shodan: IP cozulemedi — atlaniyor")
-        else:
-            sub("shodan not configured")
+        # v8.7: shodan kaldirildi — asil odak subdomain enum + URL kesfi
+        # oldugu icin API-key gerektiren, sik sik 403/rate-limit yiyen bu
+        # adim gereksiz gurultu uretiyordu.
         self.summary["stage1"] = {"status": "done", "target_ip": target_ip or "unknown", "waf_fingerprint": self.waf_fingerprint}
         checkpoint(self._cp("stage1_done"), [tgt], "stage1")
 
@@ -3437,7 +4057,12 @@ class ReconPipeline:
         out_files = []
         if tool_exists("subfinder"):
             f = d / "subfinder.txt"
-            run_cmd(f"subfinder -d {tgt} -all -o {f}",
+            # Not: subfinder cogunlukla ucuncu-parti pasif API'leri sorgular
+            # (hedefin kendisine degil) — Tor rotasyonu burada hedefin WAF'ini
+            # degil, olsa olsa o API'lerin rate-limit'ini etkiler; yine de
+            # tutarlilik icin diger araclarla ayni sekilde eklenir.
+            _sf_tor = " ".join(_tor_cli_flag("subfinder", self.cfg))
+            run_cmd(f"subfinder -d {tgt} -all {_sf_tor} -o {f}".replace("  ", " "),
                     timeout=T["subfinder"], log=self.log, label="subfinder", retries=2, retry_delay=5)
             out_files.append(f)
         else:
@@ -3481,7 +4106,7 @@ class ReconPipeline:
                 crt_timeout = int(_cfg_get(self.cfg, "tools", "crtsh_timeout", default=20))
                 crt_subs = _crtsh_enum(tgt, timeout=crt_timeout)
                 if crt_subs:
-                    info(f"crt.sh: {len(crt_subs):,} subdomain bulundu")
+                    info(f"crt.sh: {len(crt_subs):,} subdomains found")
                     existing = set(l.strip() for l in raw_f.read_text(errors="ignore").splitlines() if l.strip()) if raw_f.exists() else set()
                     with raw_f.open("a", encoding="utf-8") as fo:
                         for s in crt_subs:
@@ -3554,6 +4179,7 @@ class ReconPipeline:
             shot_flag = f"-screenshot -srd {shot_dir} "
             info("Screenshot mode active (settings.enable_screenshots=true) — this stage may be slower")
         ports_flag = "-ports 80,443,8080,8443,8000,8888,9090,3000,5000 " if probe_ports else ""
+        tor_flag = f"-http-proxy {_resolve_proxy(self.cfg)} " if _TOR_ACTIVE.is_set() else ""
         httpx_cmd = (
             f"{httpx_bin} -l {target_file} {noc_flag} "
             f"-threads {threads} -timeout 20 -retries 2 {fr_flag} "
@@ -3561,6 +4187,7 @@ class ReconPipeline:
             f"{fav_flag} "
             f"{ports_flag}"
             f"{shot_flag}"
+            f"{tor_flag}"
             + _hdr_args_httpx(headers)
             + f" {json_flag} -o {json_out}"
         )
@@ -3603,8 +4230,8 @@ class ReconPipeline:
             return
         httpx_bin = _pd_httpx()
         if not httpx_bin:
-            warn("httpx (ProjectDiscovery) bulunamadi — tum subdomain'ler "
-                 "alive kabul ediliyor")
+            warn("httpx (ProjectDiscovery) not found — treating every subdomain "
+                 "as alive")
             subs = [l.strip() for l in sub_file.read_text(errors="ignore").splitlines() if l.strip()]
             urls = sorted({f"https://{s}" if not s.startswith("http") else s for s in subs})
             n = checkpoint(self._cp("stage3_alive"), urls, "alive-nohttpx")
@@ -3785,6 +4412,7 @@ class ReconPipeline:
                     "-retry 2" if "-retry"  in kh else "",
                     f"-concurrency {conc}" if "-concurrency" in kh else "",
                     "-timeout 15" if "-timeout" in kh else "",
+                    " ".join(_tor_cli_flag("katana", self.cfg)),
                 ]))
                 kat_hdr_flags = ""
                 if self.has_auth():
@@ -3918,12 +4546,19 @@ class ReconPipeline:
         # limiting on CDN/ALB-fronted targets — when that happens the reflected
         # payloads come back inside 403/429 bodies and dalfox reports 0
         # findings even on a target it flagged fine a minute earlier. Tunable.
+        # v8.8: raised default/cap (25/40 -> 40/60) per user request for a
+        # faster scan — still well under dalfox's own 100-worker default, so
+        # the WAF-trip risk this cap was originally added for stays bounded.
+        # Lower tools.dalfox_workers back down if a specific target's WAF
+        # starts returning 403/429 bursts (visible as a suspiciously fast,
+        # 0-finding scan on a site you know is vulnerable).
         _dfx_workers = int(_cfg_get(self.cfg, "tools", "dalfox_workers",
-                                    default=_cfg_get(self.cfg, "settings", "threads", default=25)) or 25)
+                                    default=_cfg_get(self.cfg, "settings", "threads", default=40)) or 40)
         _dfx_delay = int(_cfg_get(self.cfg, "tools", "dalfox_delay_ms", default=0) or 0)
-        cmd += ["--worker", str(max(1, min(_dfx_workers, 40)))]
+        cmd += ["--worker", str(max(1, min(_dfx_workers, 60)))]
         if _dfx_delay > 0:
             cmd += ["--delay", str(_dfx_delay)]
+        cmd += _tor_cli_flag("dalfox", self.cfg)
 
         # v8.4-fix: dalfox v3.x (Rust rewrite) adds --state-file — it records
         # which targets FULLY finished and skips them on a re-run with the
@@ -4027,6 +4662,25 @@ class ReconPipeline:
         except Exception:
             pass
 
+        try:
+            # v8.7-fix: this config key was documented in config.example.yaml
+            # but never actually read anywhere — setting it silently had no
+            # effect. Wire it to dalfox's own -W/--mining-dict-word flag.
+            mdict = (_cfg_get(self.cfg, "tools", "dalfox_mining_dict", default="") or "")
+            if mdict:
+                mdict_path = Path(mdict)
+                if not mdict_path.exists() and not mdict_path.is_absolute():
+                    alt = BASE_DIR / mdict
+                    if alt.exists():
+                        mdict_path = alt
+                if mdict_path.exists():
+                    cmd += ["--mining-dict-word", str(mdict_path)]
+                    info(f"Using custom mining-dict wordlist: {mdict_path}")
+                else:
+                    warn(f"dalfox_mining_dict not found: {mdict}")
+        except Exception:
+            pass
+
         # v8.2-fix: this used to be a hardcoded 240s, then a configurable
         # 480s. Verified against dalfox's own source (cmd/file.go /
         # cmd/pipe.go): without --mass/--multicast, "dalfox file" scans
@@ -4048,9 +4702,9 @@ class ReconPipeline:
         # positive number in config.yaml if you want the old quiet-period
         # auto-kill back (e.g. for much smaller/faster scans).
         _dalfox_stall_sec = int(_cfg_get(self.cfg, "tools", "dalfox_stall_timeout_sec", default=0) or 0)
-        info(f"Dalfox {_count_lines(xss_file):,} hedef üzerinde çalışıyor "
-             f"— ilerleme aşağıda akacak, hedef sayısına göre sürebilir"
-             + ("" if _dalfox_stall_sec else " (zaman/ilerleme siniri yok — sadece 2 saatlik genel ust sinir gecerli)"))
+        info(f"Dalfox is running against {_count_lines(xss_file):,} targets "
+             f"— progress streams below, runtime scales with the target count"
+             + ("" if _dalfox_stall_sec else " (no stall limit — only the global 2h ceiling applies)"))
 
         # v8.3: live XSS-hit display. On dalfox v2.x (Go), DalLog("PRINT", ...)
         # writes each finding's raw JSON both to its -o output file AND to
@@ -4229,9 +4883,9 @@ class ReconPipeline:
             not findings and not killed and not res["tool_failed"]
             and res["duration_sec"] > 45 and (res.get("targets_count", 0) or 0) >= 3)
         if res["suspicious_empty"]:
-            warn("Dalfox 0 bulgu ile bitti ama gerçek süre harcadı — hedef muhtemelen "
-                 "payload akışını rate-limit'ledi (aynı IP'den çok tarama, CDN/ALB). "
-                 "Farklı bir zamanda / config'de tools.dalfox_workers'ı düşürerek tekrar dene.")
+            warn("Dalfox finished with 0 findings but spent real time — the target most "
+                 "likely rate-limited the payload stream (too many scans from one IP, CDN/ALB). "
+                 "Retry later, or lower tools.dalfox_workers in config.yaml.")
 
         # v8.1: dalfox artik dogrudan --format jsonl ile TEK dosyaya (json_f) yaziyor;
         # okunabilir .txt ozetini nuclei'deki ayni desenle biz kendimiz uretiyoruz.
@@ -4274,8 +4928,8 @@ class ReconPipeline:
         for u in targets:
             by_host.setdefault(urlparse(u).hostname or u, []).append(u)
         if len(by_host) < 2:
-            info("Dalfox: tek host — paralel çalıştırma atlandı (tek host'a paralel istek "
-                 "hedefin rate-limit/WAF'ına takılıp sonucu bozar), sıralı taranıyor")
+            info("Dalfox: single host — parallel execution skipped (parallel requests to one "
+                 "host trip its rate-limit/WAF and corrupt the result), scanning sequentially")
             return self._run_dalfox_once(xss_file, d, run_tag)
 
         host_groups = sorted(by_host.values(), key=len, reverse=True)
@@ -4284,8 +4938,8 @@ class ReconPipeline:
         for i, grp in enumerate(host_groups):     # largest-first round-robin
             chunks[i % jobs].extend(grp)
         chunks = [c for c in chunks if c]
-        info(f"Dalfox: {n} hedef / {len(by_host)} host, {len(chunks)} paralel işe bölündü "
-             f"(her iş ayrı host'lara gidiyor)")
+        info(f"Dalfox: {n} targets / {len(by_host)} hosts split into {len(chunks)} parallel jobs "
+             f"(each job hits a different set of hosts)")
 
         chunk_dir = d / f"dalfox_{run_tag}_chunks"
         chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -4361,14 +5015,14 @@ class ReconPipeline:
                 xss_file = c
                 break
         if xss_file is None:
-            warn("XSS hedef dosyasi bulunamadi (xss_targets/params yok) — stage atlandi")
+            warn("No XSS target file found (no xss_targets/params) — stage skipped")
             self.summary["stage6"] = {"status": "skipped", "reason": "no_target_file"}
             self.xss_results = {"findings": [], "file_txt": "", "file_json": "",
                                 "count": 0}
             return
 
         if not tool_exists("dalfox"):
-            warn("dalfox not installed — XSS stage atlandi")
+            warn("dalfox not installed — XSS stage skipped")
             self.summary["stage6"] = {"status": "skipped", "reason": "not_installed"}
             self.xss_results = {"findings": [], "file_txt": "", "file_json": "",
                                 "count": 0}
@@ -4418,13 +5072,18 @@ class ReconPipeline:
             # mining for near-zero XSS yield — drop them
             final = _param_urls[:_dfx_max]
         if not final:
-            final = [u for u in raw if u.startswith(("http://", "https://"))][:_dfx_max]
+            # v8.7-fix: this fallback used to skip the scope check applied in
+            # the `clean` loop above — re-apply it here too, otherwise an
+            # empty `clean`/`final` (e.g. every URL failing urlparse or the
+            # scope check) fed a raw, unfiltered slice straight to dalfox.
+            final = [u for u in raw
+                     if u.startswith(("http://", "https://")) and self._is_in_scope_url(u)][:_dfx_max]
         tested_f = d / "xss_targets_tested.txt"
         write_lines(tested_f, final)
         xss_file = tested_f
         if len(raw) > len(final):
-            sub(f"Dalfox hedefleri {len(raw)} → {len(final)} (temizlik + benzersiz injection "
-                f"noktası + tools.dalfox_max_targets={_dfx_max} kapağı)")
+            sub(f"Dalfox targets {len(raw)} → {len(final)} (cleanup + unique injection "
+                f"points + tools.dalfox_max_targets={_dfx_max} cap)")
 
         # v8.2: auto-provision a blind XSS OOB callback (interactsh) if the user
         # hasn't manually configured one. A manually-set config.blind_xss_callback
@@ -4508,15 +5167,15 @@ class ReconPipeline:
             "suspicious_empty": run.get("suspicious_empty", False),
         }
         if run.get("tool_failed"):
-            err(f"Dalfox HATA ILE SONLANDI — {run.get('tool_error','')} "
-                f"('0 finding' burada 'temiz' anlamina GELMEYEBILIR)")
+            err(f"Dalfox FAILED — {run.get('tool_error','')} "
+                f"('0 findings' here does NOT necessarily mean 'clean')")
         elif run.get("budget_hit"):
-            warn(f"Dalfox zaman butcesine ({run.get('duration_sec',0)}s) ulasti ve durduruldu — "
-                 f"o ana kadarki {run['findings']} bulgu kaydedildi, ancak tum hedefler taranmamis olabilir "
-                 f"(tools.dalfox_time_budget_sec ile artir)")
+            warn(f"Dalfox hit its time budget ({run.get('duration_sec',0)}s) and was stopped — "
+                 f"the {run['findings']} findings collected so far were saved, but not every target "
+                 f"was necessarily scanned (raise tools.dalfox_time_budget_sec)")
         elif run.get("interrupted"):
-            warn(f"Dalfox erken durduruldu ({run.get('duration_sec',0)}s, "
-                 f"{run.get('total_lines',0)} satir islendi) — bulgular EKSIK olabilir")
+            warn(f"Dalfox stopped early ({run.get('duration_sec',0)}s, "
+                 f"{run.get('total_lines',0)} lines processed) — findings may be INCOMPLETE")
         elif run["findings"]:
             ok(f"Dalfox found {run['findings']:,} findings")
         else:
@@ -4526,10 +5185,18 @@ class ReconPipeline:
     # Stage 7 — Nuclei Vulnerability Scan (alive hosts)
     # ══════════════════════════════════════════════════════════════════════════
     def _get_nuclei_template_path(self) -> str:
+        # v8.7-fix: memoization was lost in a refactor — discover_nuclei_
+        # templates() recursively walks up to 8 candidate directories, and
+        # this is called 3x per scan (fastpass, full nuclei, dast-dir pick).
+        # self._nuclei_tpl_path was still being initialized in __init__ but
+        # never read/written here, making it dead. Cache it again.
+        if self._nuclei_tpl_path is not None:
+            return self._nuclei_tpl_path
         override = _cfg_get(self.cfg, "tools", "nuclei_templates", default="") or ""
         if not override and self._nuclei_tpl_override:
             override = self._nuclei_tpl_override
-        return discover_nuclei_templates(override)
+        self._nuclei_tpl_path = discover_nuclei_templates(override)
+        return self._nuclei_tpl_path
 
     def _get_nuclei_dast_dir(self) -> str:
         """v8.6-fix: the fuzzing pass needs a `dast/` template dir that is
@@ -4660,11 +5327,12 @@ class ReconPipeline:
         if extra_tags:
             cmd += ["-tags", extra_tags]
         cmd += hdr_args
+        cmd += _tor_cli_flag("nuclei", self.cfg)
 
-        info(f"Nuclei {_count_lines(targets):,} hedef üzerinde çalışıyor "
+        info(f"Nuclei is running against {_count_lines(targets):,} targets "
              f"(templates={res['template_path']}"
-             f"{', tags=' + extra_tags if extra_tags else ''}) — ilerleme her "
-             f"{stats_interval}s'de bir aşağıda görünecek, sabırla bekleyin")
+             f"{', tags=' + extra_tags if extra_tags else ''}) — progress is printed "
+             f"every {stats_interval}s below")
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
             cmd, timeout=T["nuclei"], log=self.log, label="nuclei", line_cb=None,
@@ -4728,7 +5396,7 @@ class ReconPipeline:
         thr = float(_cfg_get(self.cfg, "settings", "adaptive_threshold", default=0.18))
         if rerun_on_block and rerun_max > 0 and lines and res["block_ratio"] >= thr \
                 and not killed and not res["tool_failed"] and not _INT.hard():
-            info(f"Nuclei block orani {res['block_ratio']:.2%} — uyarlanabilir tekrar basliyor (max={rerun_max})")
+            info(f"Nuclei block ratio {res['block_ratio']:.2%} — starting an adaptive re-run (max={rerun_max})")
             self._apply_adaptive("nuclei high block ratio")
             initial_f = d / f"nuclei_{run_tag}_initial.json"
             try:
@@ -4739,7 +5407,7 @@ class ReconPipeline:
             pause_sec = float(_cfg_get(self.cfg, "settings", "rerun_pause_sec", default=2))
             backoff = float(_cfg_get(self.cfg, "settings", "rerun_backoff", default=0.5))
             for idx in range(1, max(1, rerun_max) + 1):
-                if _INT.hard() or _INT.interrupted():
+                if _INT.stage_skip():
                     break
                 rerun_rate = self._tuned_rate(max(1, int(rate * (backoff ** idx))), 30)
                 rerun_f = d / f"nuclei_{run_tag}_rerun_{idx}.json"
@@ -4757,6 +5425,7 @@ class ReconPipeline:
                 if extra_tags:
                     rerun_cmd += ["-tags", extra_tags]
                 rerun_cmd += hdr_args
+                rerun_cmd += _tor_cli_flag("nuclei", self.cfg)
                 _rc2, _lines2, killed2, _stalled2 = _stream_tool(
                     rerun_cmd, timeout=T["nuclei"], log=self.log, label=f"nuclei-rerun-{idx}",
                     line_cb=None, stall_timeout=300
@@ -4845,7 +5514,7 @@ class ReconPipeline:
     def _collect_param_urls(self, limit=1500):
         """Every URL that carries at least one query parameter, deduped by
         (host, path, sorted-param-names) — the shape that actually matters for
-        injection fuzzing. Feeds nuclei -dast and stage 14 (sqlmap)."""
+        injection fuzzing. Feeds nuclei -dast."""
         srcs = [
             self._cp("stage5_params"),
             self.out / "05_categorized" / "params.txt",
@@ -4891,7 +5560,7 @@ class ReconPipeline:
         dast_max = int(_cfg_get(self.cfg, "tools", "nuclei_dast_max_urls", default=400) or 400)
         param_urls = self._collect_param_urls(limit=dast_max)
         if not param_urls:
-            sub("Nuclei DAST atlandı — parametreli URL yok")
+            sub("Nuclei DAST skipped — no parameterised URLs")
             return res
         tgt = d / "nuclei_dast_targets.txt"
         write_lines(tgt, param_urls)
@@ -4914,7 +5583,8 @@ class ReconPipeline:
             hdr_set = self._auth_headers(hdr_set)
         cmd += _hdr_args_nuclei(hdr_set)
         cmd += dns_resolver_args("nuclei")
-        info(f"Nuclei DAST (fuzzing) {len(param_urls):,} parametreli URL üzerinde — "
+        cmd += _tor_cli_flag("nuclei", self.cfg)
+        info(f"Nuclei DAST (fuzzing) on {len(param_urls):,} parameterised URLs — "
              f"XSS/SQLi/SSTI/LFI/cmdi/redirect fuzzing")
         _t0 = time.time()
         rc = lines = killed = stalled = None
@@ -4932,8 +5602,8 @@ class ReconPipeline:
             _empty = not (json_f.exists() and json_f.stat().st_size > 0)
             if killed or not _empty or _elapsed > 25 or _try == 2:
                 break
-            warn(f"Nuclei DAST bitti çok hızlı ({_elapsed:.0f}s) ve boş — hedef muhtemelen "
-                 f"kısa süreli rate-limit uyguladı (dalfox'tan hemen sonra). 15s bekleyip 1 kez tekrar deniyorum.")
+            warn(f"Nuclei DAST finished suspiciously fast ({_elapsed:.0f}s) and empty — the target "
+                 f"probably rate-limited briefly (right after dalfox). Waiting 15s and retrying once.")
             time.sleep(15)
         res["duration_sec"] = round(time.time() - _t0, 1)
         if not killed and rc not in (0, None):
@@ -4971,10 +5641,10 @@ class ReconPipeline:
         res["file_json"] = str(json_f)
         res["file_txt"] = str(txt_f)
         if findings:
-            ok(f"Nuclei DAST {len(findings):,} bulgu — "
+            ok(f"Nuclei DAST: {len(findings):,} findings — "
                f"{', '.join(f'{k}={v}' for k, v in sev_counts.items() if v)}")
         else:
-            ok("Nuclei DAST tamamlandı — bulgu yok")
+            ok("Nuclei DAST complete — no findings")
         return res
 
     def stage7_nuclei(self):
@@ -5018,13 +5688,13 @@ class ReconPipeline:
         tech_tags = self._nuclei_tech_tags() if fastpass_enabled else ""
         fastpass_run = None
         if tech_tags:
-            info(f"Teknoloji-bazli hizli on-tarama: tags={tech_tags}")
+            info(f"Technology-based fast pre-scan: tags={tech_tags}")
             fastpass_run = self._run_nuclei_once(tgt_file, d, "fastpass", extra_tags=tech_tags)
             if fastpass_run["findings"]:
-                ok(f"Hizli on-tarama {fastpass_run['findings']:,} bulgu buldu "
+                ok(f"Fast pre-scan found {fastpass_run['findings']:,} findings "
                    f"({', '.join(f'{k}={v}' for k,v in fastpass_run['severity_counts'].items() if v)})")
             else:
-                ok("Hizli on-tarama tamamlandi — bulgu yok")
+                ok("Fast pre-scan complete — no findings")
 
         run = self._run_nuclei_once(tgt_file, d, "scan")
 
@@ -5123,11 +5793,11 @@ class ReconPipeline:
         run["findings_dast"] = dast.get("findings", 0)
         self.nuclei_results = run
         if tool_failed:
-            err(f"Nuclei HATA ILE SONLANDI — {tool_error} "
-                f"('0 finding' burada 'temiz' anlamina GELMEYEBILIR)")
+            err(f"Nuclei FAILED — {tool_error} "
+                f"('0 findings' here does NOT necessarily mean 'clean')")
         elif interrupted:
-            warn(f"Nuclei erken durduruldu ({total_duration}s) — bulgular EKSIK olabilir, "
-                 f"tum hedefler taranmamis olabilir")
+            warn(f"Nuclei stopped early ({total_duration}s) — findings may be INCOMPLETE, "
+                 f"not every target was necessarily scanned")
         elif run["findings"]:
             ok(f"Nuclei found {run['findings']:,} findings — "
                f"{', '.join(f'{k}={v}' for k,v in run['severity_counts'].items() if v)}")
@@ -5159,7 +5829,7 @@ class ReconPipeline:
             ps_has_output = ("--output" in ph) or bool(re.search(r"\s-o\s", ph))
             ps_has_level  = bool(re.search(r"-l\s+LEVEL|-l\s+\d", ph))
             for dom in domains:
-                if _INT.hard():
+                if _INT.stage_skip():
                     break
                 dom_dir = pid / dom
                 dom_dir.mkdir(parents=True, exist_ok=True)
@@ -5193,9 +5863,9 @@ class ReconPipeline:
                 all_params.extend(txt_lines)
             if all_params:
                 write_lines(paramspider_all, all_params)
-                ok(f"paramspider: {len(all_params):,} parametreli URL")
+                ok(f"paramspider: {len(all_params):,} parameterised URLs")
             else:
-                warn("paramspider sonuc uretmedi")
+                warn("paramspider produced no results")
         else:
             sub("paramspider not found — skipping")
 
@@ -5212,10 +5882,10 @@ class ReconPipeline:
             max_hosts = int(_cfg_get(self.cfg, "tools", "arjun_max_hosts", default=10))
             ph_conf = int(_cfg_get(self.cfg, "tools", "arjun_timeout_per_host", default=180))
             per_host_t = min(max(30, ph_conf), T["arjun"])
-            info(f"arjun: ilk {min(len(hosts), max_hosts)} alive host deneniyor "
+            info(f"arjun: probing the first {min(len(hosts), max_hosts)} alive hosts "
                  f"({per_host_t}s/host)")
             for h in hosts[:max_hosts]:
-                if _INT.hard():
+                if _INT.stage_skip():
                     break
                 run_cmd(f"arjun -u {h} -oJ {arjun_out} -q",
                         timeout=per_host_t, log=self.log,
@@ -5249,14 +5919,14 @@ class ReconPipeline:
             sub("arjun not found — skipping")
 
         if not all_params:
-            sub("Param discovery sonuc uretmedi (yeni URL bulunamadi)")
+            sub("Param discovery produced no results (no new URLs found)")
             self.summary["stage9"] = {"status": "done", "count": 0}
             return
 
         n = checkpoint(self._cp("stage9_params"), all_params, "params-new")
         write_lines(d / "all.txt", all_params)
         self.summary["stage9"] = {"status": "done", "count": n}
-        ok(f"Param discovery complete — {n:,} yeni parametreli URL")
+        ok(f"Param discovery complete — {n:,} new parameterised URLs")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 10 — JS endpoint / secret analizi
@@ -5284,7 +5954,7 @@ class ReconPipeline:
             kw = dict(timeout=req_timeout, allow_redirects=True,
                       headers=self._auth_headers_for_url(js_url, pick_header_strategy(host, self.cfg)))
             kw["verify"] = False
-            proxy = str(_cfg_get(self.cfg, "settings", "proxy", default="") or "").strip()
+            proxy = _resolve_proxy(self.cfg)
             if proxy:
                 kw["proxies"] = {"http": proxy, "https": proxy}
             if is_cffi:
@@ -5357,7 +6027,7 @@ class ReconPipeline:
             })
 
     def stage10_js(self):
-        stage(10, "JS Endpoint / Secret Analizi")
+        stage(10, "JS Endpoint / Secret Analysis")
         d = self.out / "10_js_secrets"
         seen_js = set()
         details = []
@@ -5383,9 +6053,9 @@ class ReconPipeline:
                         seen_js.add(ln)
                         js_urls.append(ln)
 
-        info(f"{len(js_urls):,} JS dosyasi bulundu")
+        info(f"{len(js_urls):,} JS files found")
         if not js_urls:
-            sub("JS dosyasi bulunamadi")
+            sub("No JS files found")
             self.js_results = {"details": [], "endpoints": 0, "secrets": 0, "files": []}
             self.summary["stage10"] = {"status": "done", "endpoints": 0, "secrets": 0}
             return
@@ -5402,8 +6072,8 @@ class ReconPipeline:
         truncated = len(js_urls) > max_files
         js_urls_scan = js_urls[:max_files]
         if truncated:
-            sub(f"JS dosya sayisi ({len(js_urls):,}) sinira ({max_files}) takildi — "
-                f"ilk {max_files} dosya analiz edilecek (config: js_secrets_max_files)")
+            sub(f"JS file count ({len(js_urls):,}) hit the cap ({max_files}) — "
+                f"analysing the first {max_files} files (config: js_secrets_max_files)")
 
         # ── TruffleHog (varsa) — paralel indirme, ilk 40 dosya ──────────────────
         th_cap = min(40, len(js_urls_scan))
@@ -5421,7 +6091,7 @@ class ReconPipeline:
                     kw = dict(timeout=10, headers=self._auth_headers_for_url(
                         js_url, pick_header_strategy(host, self.cfg)))
                     kw["verify"] = False
-                    proxy = str(_cfg_get(self.cfg, "settings", "proxy", default="") or "").strip()
+                    proxy = _resolve_proxy(self.cfg)
                     if proxy:
                         kw["proxies"] = {"http": proxy, "https": proxy}
                     if is_cffi:
@@ -5483,15 +6153,15 @@ class ReconPipeline:
                 details.extend(local)
                 completed[0] += 1
 
-        info(f"JS analizi basliyor: {len(js_urls_scan):,} dosya, {concurrency} paralel, "
-             f"{budget_sec}s butce")
+        info(f"JS analysis starting: {len(js_urls_scan):,} files, {concurrency} in parallel, "
+             f"{budget_sec}s budget")
         ex = ThreadPoolExecutor(max_workers=concurrency)
         try:
             futures = {ex.submit(_worker, u): u for u in js_urls_scan}
             last_print = start_t
             for fut in as_completed(futures):
                 now = time.time()
-                if _INT.hard() or _INT.interrupted():
+                if _INT.stage_skip():
                     budget_hit[0] = True
                     break
                 if now - start_t > budget_sec:
@@ -5511,7 +6181,7 @@ class ReconPipeline:
             # thread kendi timeout'unda (en fazla ~request_timeout saniye)
             # arka planda sessizce biter, sonraki stage'i bloklamaz.
             ex.shutdown(wait=False, cancel_futures=True)
-        _INT.reset()
+        _INT.reset_op()
 
         # v8.3-fix: with the format-specific _SECRET_PATTERNS loop added above
         # (alongside the pre-existing generic keyword regex), the exact same
@@ -5560,8 +6230,8 @@ class ReconPipeline:
             "truncated": truncated or budget_hit[0],
         }
         elapsed = round(time.time() - start_t, 1)
-        ok(f"JS analizi tamam ({elapsed}s, {completed[0]:,}/{len(js_urls_scan):,} dosya) — "
-           f"{len(endpoints):,} endpoint, {len(secrets):,} secret")
+        ok(f"JS analysis complete ({elapsed}s, {completed[0]:,}/{len(js_urls_scan):,} files) — "
+           f"{len(endpoints):,} endpoints, {len(secrets):,} secrets")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 11 — Teknoloji bazli onceliklendirme
@@ -5673,7 +6343,7 @@ class ReconPipeline:
             "medium": medium,
         }
         if not ranked:
-            sub("Teknoloji bilgisi bulunamadi (httpx/whatweb yok)")
+            sub("No technology information available (httpx/whatweb missing)")
             return
         ok(f"Tech prioritisation: {len(ranked):,} host — {high} high, {medium} medium")
         for r in ranked[:5]:
@@ -5696,7 +6366,7 @@ class ReconPipeline:
             info(f"CORS testi: {len(alive_urls):,} alive host")
             jitter = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
             for i, u in enumerate(alive_urls):
-                if _INT.hard() or _INT.interrupted():
+                if _INT.stage_skip():
                     break
                 if i:
                     time.sleep(random.random() * jitter)  # v6.17-fix: hedef/yuk koruma
@@ -5705,11 +6375,11 @@ class ReconPipeline:
                     results["cors"].append(r)
             vuln_cors = [r for r in results["cors"] if r.get("vulnerable")]
             if vuln_cors:
-                ok(f"CORS: {len(vuln_cors)} olasi yanlis-yapilandirma bulundu")
+                ok(f"CORS: {len(vuln_cors)} possible misconfiguration(s) found")
             else:
-                ok("CORS: yanlis-yapilandirma bulunamadi")
+                ok("CORS: no misconfiguration found")
         else:
-            sub("CORS testi icin alive host yok — atlandi")
+            sub("No alive host to test CORS against — skipped")
 
         # ── Subdomain takeover — subdomain listesi uzerinde CNAME kontrolu ─────
         subs_file = self._cp("stage2_subdomains")
@@ -5717,10 +6387,10 @@ class ReconPipeline:
         if subs_file.exists() and subs_file.stat().st_size > 0:
             subs = [l.strip() for l in subs_file.read_text(errors="ignore").splitlines() if l.strip()]
         if subs and tool_exists("dig"):
-            info(f"Subdomain takeover testi: {len(subs):,} subdomain (CNAME bazli)")
+            info(f"Subdomain takeover check: {len(subs):,} subdomains (CNAME based)")
             jitter2 = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
             for i, s in enumerate(subs):
-                if _INT.hard() or _INT.interrupted():
+                if _INT.stage_skip():
                     break
                 if i:
                     time.sleep(random.random() * jitter2)  # v6.17-fix: hedef/yuk koruma
@@ -5729,11 +6399,11 @@ class ReconPipeline:
                     results["takeover"].append(r)
             vuln_tko = [r for r in results["takeover"] if r.get("vulnerable")]
             if vuln_tko:
-                ok(f"Subdomain takeover: {len(vuln_tko)} olasi devralinabilir subdomain!")
+                ok(f"Subdomain takeover: {len(vuln_tko)} potentially takeoverable subdomain(s)!")
             else:
-                ok("Subdomain takeover: risk bulunamadi")
+                ok("Subdomain takeover: no risk found")
         else:
-            sub("Subdomain takeover testi icin subdomain/dig yok — atlandi")
+            sub("No subdomains / no dig binary for the takeover check — skipped")
 
         # ── Cloud bucket exposure — kesfedilen URL/subdomain havuzunda ─────────
         candidate_files = [
@@ -5743,10 +6413,10 @@ class ReconPipeline:
         ]
         candidates = find_cloud_bucket_candidates(candidate_files)
         if candidates:
-            info(f"Cloud bucket testi: {len(candidates):,} aday")
+            info(f"Cloud bucket check: {len(candidates):,} candidates")
             jitter3 = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
             for i, (bucket_url, provider) in enumerate(candidates):
-                if _INT.hard() or _INT.interrupted():
+                if _INT.stage_skip():
                     break
                 if i:
                     time.sleep(random.random() * jitter3)  # v6.17-fix: hedef/yuk koruma
@@ -5754,11 +6424,11 @@ class ReconPipeline:
                 results["buckets"].append(r)
             public_buckets = [r for r in results["buckets"] if r.get("public_listing")]
             if public_buckets:
-                ok(f"Cloud bucket: {len(public_buckets)} genel erisime acik bucket!")
+                ok(f"Cloud bucket: {len(public_buckets)} publicly listable bucket(s)!")
             else:
-                ok("Cloud bucket: genel erisime acik bucket bulunamadi")
+                ok("Cloud bucket: no publicly listable bucket found")
         else:
-            sub("Cloud bucket adayi bulunamadi — atlandi")
+            sub("No cloud bucket candidates — skipped")
 
         (d / "extra_results.json").write_text(
             json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -5778,10 +6448,10 @@ class ReconPipeline:
         }
         total_vuln = n_cors_vuln + n_tko_vuln + n_bucket_vuln
         if total_vuln:
-            warn(f"Extra checks: toplam {total_vuln} olasi bulgu (CORS={n_cors_vuln}, "
+            warn(f"Extra checks: {total_vuln} possible finding(s) in total (CORS={n_cors_vuln}, "
                  f"Takeover={n_tko_vuln}, Bucket={n_bucket_vuln})")
         else:
-            ok("Extra checks tamamlandi — bulgu yok")
+            ok("Extra checks complete — no findings")
 
     # ── HTML Report ───────────────────────────────────────────────────────────
     def _read_text_safe(self, p: Path, limit_bytes: int = 50_000_000) -> str:
@@ -6285,6 +6955,10 @@ class ReconPipeline:
     # ── Report ────────────────────────────────────────────────────────────────
     def generate_report(self):
         stage("✦", "Generating Report")
+        # Delta against the previous completed scan of this target (--no-diff
+        # disables it). Runs before SUMMARY.json is written so the result can be
+        # embedded there as well as in DIFF.json.
+        self._compute_scan_diff()
         sf = self.out / "SUMMARY.json"
         try:
             # v8.6-fix: a partial run (--resume, -s 7, --stageN) only populated
@@ -6313,6 +6987,14 @@ class ReconPipeline:
                 "auth_status":         self.auth_status,
                 "auth_cookie_names":   list(self.auth_cookies.keys()),
                 "stages":              merged_stages,
+                "scan_diff":           self.scan_diff,
+                "resume": {
+                    "state_file":       str(self.state.path),
+                    "completed":        bool(self.state.data.get("completed")),
+                    "interrupted":      bool(self.state.data.get("interrupted")),
+                    "interrupt_reason": self.state.data.get("interrupt_reason", ""),
+                    "completed_stages": self.state.done_stages(),
+                },
                 "output_dir":          str(self.out)
             }
             sf.write_text(
@@ -6363,13 +7045,24 @@ class ReconPipeline:
         except Exception:
             pass
 
-        print(f"\n{C.CYAN}{C.BOLD}{'═'*60}\n  SCAN COMPLETE — {self.target}\n{'═'*60}{C.RESET}")
+        # Be honest in the closing banner: an interrupted run is NOT a complete
+        # scan, and saying so is the difference between "we found nothing" and
+        # "we stopped before looking".
+        _stopped = bool(self.state.data.get("interrupted")) or _INT.hard()
+        _col     = C.YELLOW if _stopped else C.CYAN
+        _title   = "SCAN STOPPED (resumable)" if _stopped else "SCAN COMPLETE"
+        print(f"\n{_col}{C.BOLD}{'═'*60}\n  {_title} — {self.target}\n{'═'*60}{C.RESET}")
         print(f"  {C.BLUE}Output      : {self.out}{C.RESET}")
         if report_path:
             print(f"  {C.BLUE}Report      : {report_path}{C.RESET}")
         if full_report:
             print(f"  {C.BLUE}FULL Report : {full_report}{C.RESET}")
-        print(f"  {C.BLUE}Log         : {self.out}/pipeline.log{C.RESET}\n")
+        print(f"  {C.BLUE}Log         : {self.out}/pipeline.log{C.RESET}")
+        if self.scan_diff:
+            print(f"  {C.BLUE}Delta       : {self.out}/DIFF.json{C.RESET}")
+        if _stopped:
+            print(f"  {C.YELLOW}Resume      : python3 reconX.py -d {self.target} --resume{C.RESET}")
+        print()
 
     # ── Stage 0 — URL seed ────────────────────────────────────────────────────
     def stage0_seed_urls(self):
@@ -6440,7 +7133,7 @@ class ReconPipeline:
     # ── Run ───────────────────────────────────────────────────────────────────
 
     def stage13_api_discovery(self):
-        """v8.0: GraphQL / Swagger / OpenAPI endpoint keşfi — passive URL havuzundan."""
+        """v8.0: GraphQL / Swagger / OpenAPI endpoint discovery — from the passive URL pool."""
         stage(13, "API Discovery (GraphQL/Swagger/OpenAPI)")
         d = self.out / "13_api"
         d.mkdir(parents=True, exist_ok=True)
@@ -6481,7 +7174,11 @@ class ReconPipeline:
             hdrs = self._auth_headers(hdrs)
         _imp = _cfg_get(self.cfg, "settings", "curl_cffi_impersonate", default="chrome120") or "chrome120"
         for base in base_hosts:
+            if _INT.stage_skip():
+                break
             for cand in swagger_candidates:
+                if _INT.stage_skip():
+                    break
                 cu = base + cand
                 probe_results.append(cu)
                 if client is None:
@@ -6489,6 +7186,9 @@ class ReconPipeline:
                 try:
                     kw = dict(timeout=10, headers=hdrs, allow_redirects=True)
                     kw["verify"] = False
+                    _tor_proxy = _resolve_proxy(self.cfg)
+                    if _tor_proxy:
+                        kw["proxies"] = {"http": _tor_proxy, "https": _tor_proxy}
                     if is_cffi:
                         kw["impersonate"] = _imp
                     if "graphql" in cand:
@@ -6531,229 +7231,244 @@ class ReconPipeline:
         else:
             ok(f"API discovery: {total} pattern hits, {len(probe_results)} candidates probed — none live")
 
-    # ── Stage 14 — SQL Injection (sqlmap) ─────────────────────────────────────
-    _SQLI_HOT_PARAMS = {
-        "id","uid","pid","cid","sid","gid","tid","aid","eid","nid","rid","mid",
-        "item","itemid","item_id","product","productid","product_id","cat","category",
-        "cat_id","categoryid","page","pageid","p","num","no","order","orderby","sort",
-        "sortby","dir","filter","group","having","limit","offset","start","from","to",
-        "user","userid","user_id","username","account","ref","year","month","day",
-        "view","type","key","query","q","search","s","keyword","name","code","status",
-        "lang","currency","country","region","store","branch","report","invoice",
+    # ══════════════════════════════════════════════════════════════════════════
+    # Checkpoint / resume helpers
+    # ══════════════════════════════════════════════════════════════════════════
+    def _restore_stage(self, n):
+        """Resume path for a stage already completed in an earlier run.
+
+        The stage is NOT executed again. Instead its stored summary block is
+        copied back into self.summary (so the report reflects the full scan,
+        not only the stages this invocation ran) and a short preview of the
+        artefacts it left on disk is printed, so the operator can see what is
+        already in hand before the pipeline moves on."""
+        rec   = self.state.stage_info(n)
+        saved = rec.get("summary") if isinstance(rec.get("summary"), dict) else {}
+        if saved:
+            self.summary[f"stage{n}"] = dict(saved)
+        title = rec.get("title") or STAGE_TITLES.get(n, "")
+        print(f"\n{C.GREEN}{C.BOLD}{'═'*60}\n"
+              f"  STAGE {n}: {title}  ·  RESTORED FROM CHECKPOINT\n"
+              f"{'═'*60}{C.RESET}", flush=True)
+        when = rec.get("finished") or rec.get("started") or "?"
+        dur  = f" in {rec['duration_sec']}s" if rec.get("duration_sec") else ""
+        ok(f"Already completed at {when}{dur} — skipping (use --fresh to force a new scan)")
+        for line in self._stage_result_preview(n, saved):
+            sub(line)
+
+    def _stage_result_preview(self, n, saved: dict) -> list:
+        """Human-readable recap of a restored stage: the numbers it recorded
+        plus the first few lines of the checkpoint files it produced."""
+        out = []
+        if isinstance(saved, dict) and saved:
+            bits = [f"{k}={v:,}" if isinstance(v, int) else f"{k}={v}"
+                    for k, v in saved.items()
+                    if isinstance(v, (int, str, float)) and k != "status" and v not in ("", 0)]
+            if bits:
+                out.append("Saved results: " + " · ".join(bits[:6]))
+        for cp_name in _STAGE_ARTEFACTS.get(n, []):
+            p = self._cp(cp_name)
+            if not (p.exists() and p.stat().st_size > 0):
+                continue
+            total = _count_lines(p)
+            out.append(f"{p.name}: {total:,} entries")
+            try:
+                head = [l.strip() for l in p.read_text(errors="ignore").splitlines() if l.strip()][:3]
+            except Exception:
+                head = []
+            for h in head:
+                out.append(f"  {C.DIM}· {h[:110]}{C.RESET}")
+            if total > len(head):
+                out.append(f"  {C.DIM}· ... +{total - len(head):,} more{C.RESET}")
+        if not out:
+            out.append("No stored artefacts for this stage (summary only)")
+        return out
+
+    def _print_resume_hint(self):
+        """Printed whenever a run stops early — tells the operator, in one
+        copy-pasteable line, how to pick the scan up where it left off."""
+        done = self.state.done_stages()
+        print(f"\n{C.YELLOW}{C.BOLD}{'─'*60}{C.RESET}")
+        print(f"  {C.YELLOW}{C.BOLD}SCAN INTERRUPTED — progress saved{C.RESET}")
+        print(f"  {C.BLUE}Completed stages : {', '.join(map(str, done)) if done else 'none'}{C.RESET}")
+        print(f"  {C.BLUE}Checkpoint file  : {self.state.path}{C.RESET}")
+        print(f"  {C.BLUE}Resume with      : python3 reconX.py -d {self.target} --resume{C.RESET}")
+        print(f"{C.YELLOW}{C.BOLD}{'─'*60}{C.RESET}\n")
+
+    # ── carry-forward for re-run stages ──────────────────────────────────────
+    # Checkpoints whose content is a DISCOVERED SET (pure accumulation): when a
+    # stage that was cut short is re-run, the second pass must never be allowed
+    # to SHRINK what the first one already found. Stage 3 (alive) and stage 4
+    # (URLs) are deliberately absent: they carry authoritative liveness/pruning
+    # semantics where a smaller answer can be the correct one, and both are
+    # recomputed from stage 2 anyway.
+    _UNION_SAFE_CP = {
+        2:  ["stage2_subdomains"],
+        5:  ["stage5_xss_targets", "stage5_params"],
+        8:  ["stage8_authenticated_urls"],
+        9:  ["stage9_params"],
+        13: ["stage13_api"],
     }
 
-    def _sqli_candidates(self, limit=200):
-        """Every parameterised URL, one row per (path, param), ranked by how
-        likely that parameter is a SQL-backed lookup. Plus any error/time-based
-        SQLi that nuclei -dast already flagged (those ARE evidence)."""
-        cands, seen = [], set()
-        for u in self._collect_param_urls(limit=limit * 3):
-            try:
-                pr = urlparse(u)
-                for k, v in parse_qsl(pr.query):
-                    key = (pr.hostname, pr.path, k.lower())
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    kl = k.lower()
-                    score = 0
-                    why = []
-                    if kl in self._SQLI_HOT_PARAMS:
-                        score += 5; why.append("common SQL param name")
-                    if v.isdigit():
-                        score += 3; why.append("numeric value")
-                    if re.search(r"(^|_)(id|key|no|num)$", kl):
-                        score += 2; why.append("id-shaped name")
-                    if any(s in pr.path.lower() for s in
-                           ("product", "catalog", "item", "article", "post", "news",
-                            "detail", "view", "profile", "account", "order", "invoice")):
-                        score += 2; why.append("DB-lookup path")
-                    cands.append({
-                        "url": u, "param": k, "value": v[:40], "score": score,
-                        "why": ", ".join(why) or "parameterised",
-                        "sqlmap_cmd": f"sqlmap -u {shlex.quote(u)} -p {shlex.quote(k)} "
-                                      f"--batch --level 3 --risk 2 --dbs",
-                        "source": "heuristic", "dast_template": "",
-                    })
-            except Exception:
-                continue
-        # fold in nuclei DAST SQLi hits
-        dast_j = self.out / "07_nuclei" / "nuclei_dast.json"
-        if dast_j.exists():
-            for line in dast_j.read_text(errors="ignore").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                tid = (rec.get("template-id") or "").lower()
-                if not any(s in tid for s in ("sqli", "sql-injection", "error-based", "time-based")):
-                    continue
-                murl = rec.get("matched-at") or rec.get("host") or ""
-                cands.insert(0, {
-                    "url": murl, "param": "(see nuclei)", "value": "", "score": 20,
-                    "why": f"nuclei DAST flagged: {rec.get('template-id','')}",
-                    "sqlmap_cmd": f"sqlmap -u {shlex.quote(murl)} --batch --level 3 --risk 2 --dbs",
-                    "source": "nuclei-dast",
-                    "dast_template": rec.get("template-id", ""),
-                })
-        cands.sort(key=lambda c: -c["score"])
-        return cands[:limit]
+    def _snapshot_stage_sets(self, n) -> dict:
+        """Contents of a stage's set-valued checkpoints BEFORE it (re-)runs."""
+        snap = {}
+        for cp in self._UNION_SAFE_CP.get(n, []):
+            existing = self._read_cp_set(self.out, cp)
+            if existing:
+                snap[cp] = existing
+        return snap
 
-    def stage14_sqli(self):
-        """v8.6: SQL injection.
-        By default (tools.sqli_active: false) this stage does NOT run sqlmap —
-        active testing is slow (10-30 min). Instead it lists every likely
-        injection point (ranked heuristic + any nuclei -dast SQLi hit) with a
-        ready-to-paste sqlmap command per row. Set tools.sqli_active: true, or
-        run `--stage14` explicitly, to also run sqlmap and get confirmed
-        DBMS-fingerprinted injections."""
-        stage(14, "SQL Injection — candidates" +
-              (" + active sqlmap" if (bool(_cfg_get(self.cfg, "tools", "sqli_active", default=False))
-                                      or getattr(self, "sqli_chosen", False)) else " (no active test)"))
-        d = self.out / "14_sqli"
-        d.mkdir(parents=True, exist_ok=True)
-        self.sqli_results = {"findings": [], "candidates": [], "targets_count": 0,
-                             "file_json": "", "file_txt": "", "tool_failed": False,
-                             "tool_error": "", "duration_sec": 0.0, "interrupted": False,
-                             "active_ran": False}
+    def _merge_stage_sets(self, n, snapshot: dict):
+        """Re-running a previously interrupted stage must not lose what that
+        partial pass already found. Without this, a second pass that a tool
+        timeout or a rate-limit cut even shorter would overwrite 29,000
+        subdomains with 6 — and every later stage would quietly work off the
+        truncated list. Only applied when the new pass is actually smaller."""
+        for cp, before in (snapshot or {}).items():
+            after = self._read_cp_set(self.out, cp)
+            if len(after) >= len(before):
+                continue                      # healthy re-run — leave it alone
+            merged = before | after
+            write_lines(self._cp(cp), sorted(merged))
+            sub(f"Carried forward {len(merged) - len(after):,} entries from the interrupted "
+                f"pass — {cp}.txt now holds {len(merged):,}")
+            key = f"stage{n}"
+            if isinstance(self.summary.get(key), dict) and "count" in self.summary[key]:
+                self.summary[key]["count"] = len(merged)
+                self.summary[key]["merged_with_partial"] = True
 
-        candidates = self._sqli_candidates()
-        (d / "sqli_candidates.json").write_text(
-            json.dumps(candidates, indent=2, ensure_ascii=False), encoding="utf-8")
+    # ══════════════════════════════════════════════════════════════════════════
+    # Global wall-clock budget (--max-time)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _budget_exceeded(self) -> bool:
+        return bool(self.deadline and time.time() >= self.deadline)
+
+    def _start_budget_watchdog(self):
+        """Without this, a single long-running tool (nuclei against thousands of
+        hosts) could blow straight through --max-time, since the deadline is only
+        re-checked between stages. The watchdog raises the same hard-stop flag
+        Ctrl+C option 3 raises, which kills the running child process."""
+        if not self.deadline:
+            return
+        self._wd_stop = threading.Event()
+
+        def _tick():
+            while not self._wd_stop.wait(5):
+                if self._budget_exceeded() and not self._budget_fired:
+                    self._budget_fired = True
+                    warn(f"Time budget of {self.max_time_min} min reached — stopping the "
+                         f"running tool and checkpointing.")
+                    _INT._hard = True
+                    _INT._raw_sigint.set()
+                    return
+
+        self._watchdog = threading.Thread(target=_tick, daemon=True, name="reconx-time-budget")
+        self._watchdog.start()
+
+    def _stop_budget_watchdog(self):
         try:
-            with (d / "sqli_candidates.txt").open("w", encoding="utf-8") as fo:
-                for c in candidates:
-                    fo.write("[score %2d] %-16s %s\n           %s\n           %s\n\n"
-                             % (c["score"], c["param"], c["why"], c["url"], c["sqlmap_cmd"]))
+            if getattr(self, "_wd_stop", None):
+                self._wd_stop.set()
         except Exception:
             pass
-        self.sqli_results["candidates"] = candidates
-        dast_hits = [c for c in candidates if c["source"] == "nuclei-dast"]
-        if candidates:
-            ok(f"SQLi candidates: {len(candidates)} injection point(s) listed"
-               + (f" ({len(dast_hits)} already flagged by nuclei DAST)" if dast_hits else "")
-               + " — each with a ready sqlmap command in the report")
-        else:
-            sub("SQLi candidates: parametreli URL yok")
 
-        active = (bool(_cfg_get(self.cfg, "tools", "sqli_active", default=False))
-                  or getattr(self, "sqli_chosen", False))
-        if not active:
-            self.summary["stage14"] = {
-                "status": "done", "mode": "candidates_only",
-                "candidates": len(candidates), "dast_hits": len(dast_hits),
-                "findings": 0, "findings_confirmed": 0,
-                "note": "active sqlmap disabled (tools.sqli_active: false) — "
-                        "run with --stage14 or set sqli_active: true to confirm",
-            }
-            return
-        if not tool_exists("sqlmap"):
-            warn("sqlmap not installed — sadece aday listesi üretildi (apt install sqlmap)")
-            self.summary["stage14"] = {"status": "done", "mode": "candidates_only",
-                                       "candidates": len(candidates), "dast_hits": len(dast_hits),
-                                       "findings": 0, "findings_confirmed": 0,
-                                       "reason": "not_installed"}
-            return
+    # ══════════════════════════════════════════════════════════════════════════
+    # Scan diff — what changed since the last completed scan of this target
+    # ══════════════════════════════════════════════════════════════════════════
+    # Continuous recon is only useful if you can see the delta. This compares the
+    # current session's checkpoint files against the newest *completed* earlier
+    # session for the same target and writes DIFF.json next to the report.
+    _DIFF_SETS = {
+        "subdomains":  "stage2_subdomains",
+        "alive_hosts": "stage3_alive",
+        "urls":        "stage4_urls",
+        "param_urls":  "stage9_params",
+    }
 
-        max_t = int(_cfg_get(self.cfg, "tools", "sqli_max_targets", default=25) or 25)
-        param_urls = list(dict.fromkeys(c["url"] for c in candidates))[:max_t]
-        if not param_urls:
-            self.summary["stage14"] = {"status": "done", "mode": "candidates_only",
-                                       "candidates": 0, "findings": 0, "findings_confirmed": 0}
-            return
-
-        tgt = d / "sqli_targets.txt"
-        write_lines(tgt, param_urls)
-        self.sqli_results["targets_count"] = len(param_urls)
-        self.sqli_results["active_ran"] = True
-        results_csv = d / "sqlmap_results.csv"
-        smd = d / "sqlmap_data"
-        level = str(int(_cfg_get(self.cfg, "tools", "sqli_level", default=3) or 3))
-        risk = str(int(_cfg_get(self.cfg, "tools", "sqli_risk", default=2) or 2))
-        technique = (_cfg_get(self.cfg, "tools", "sqli_technique", default="BEUST") or "BEUST").strip()
-        cmd = ["sqlmap", "-m", str(tgt), "--batch", "--random-agent",
-               "--disable-coloring", "--level", level, "--risk", risk,
-               "--threads", "4", "--technique", technique,
-               "--output-dir", str(smd), "--results-file", str(results_csv),
-               "--flush-session", "-v", "0",
-               "--answers=crack=N,dict=N,continue=Y,quit=N,keep testing=N"]
-        cookie = self._auth_headers().get("Cookie") if self.has_auth() else ""
-        if cookie:
-            cmd += ["--cookie", cookie]
-            sub("Using authenticated session for sqlmap")
-        timeout_s = int(_cfg_get(self.cfg, "tools", "sqli_timeout_sec", default=1800) or 1800)
-        info(f"sqlmap {len(param_urls):,} URL üzerinde çalışıyor (level={level}, risk={risk}) "
-             f"— aktif enjeksiyon testi, sabırla bekleyin")
-        _t0 = time.time()
-        rc, lines, killed, stalled = _stream_tool(
-            cmd, timeout=timeout_s, log=self.log, label="sqlmap",
-            line_cb=None, stall_timeout=0, ok_exit_codes=(0, 1, None))
-        self.sqli_results["duration_sec"] = round(time.time() - _t0, 1)
-        self.sqli_results["interrupted"] = bool(killed)
-
-        findings = []
-        if results_csv.exists():
-            try:
-                import csv as _csv
-                with results_csv.open("r", encoding="utf-8", errors="replace") as fh:
-                    for row in _csv.DictReader(fh):
-                        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-                        param = row.get("parameter", "")
-                        tech = row.get("technique(s)") or row.get("techniques") or row.get("technique", "")
-                        url = row.get("target url") or row.get("target", "")
-                        if not param and not tech:
-                            continue
-                        note = (row.get("note(s)") or row.get("notes", "") or "")
-                        shaky = any(w in note.lower() for w in
-                                    ("false positive", "unexploitable", "not injectable"))
-                        findings.append({
-                            "url": url, "param": param, "place": row.get("place", ""),
-                            "technique": tech, "note": note, "confirmed": not shaky,
-                            "severity": "high" if not shaky else "medium",
-                        })
-            except Exception as e:  # noqa: BLE001
-                self.log.warning(f"sqlmap csv parse failed: {e}")
-
-        txt_f = d / "sqli_findings.txt"
-        json_f = d / "sqli_findings.json"
+    def _read_cp_set(self, session_dir, cp_name) -> set:
+        p = Path(session_dir) / "checkpoints" / f"{cp_name}.txt"
         try:
-            json_f.write_text(json.dumps(findings, indent=2, ensure_ascii=False), encoding="utf-8")
-            with txt_f.open("w", encoding="utf-8") as fo:
-                for f in findings:
-                    fo.write(f"[SQLi/{f['technique']}] {f['param']} ({f['place']}) @ {f['url']}\n")
+            if not (p.exists() and p.stat().st_size > 0):
+                return set()
+            return {l.strip() for l in p.read_text(errors="ignore").splitlines() if l.strip()}
         except Exception:
-            pass
-        checkpoint(self._cp("stage14_sqli"), [f["url"] for f in findings], "sqli")
-        self.sqli_results.update({"findings": findings, "file_json": str(json_f), "file_txt": str(txt_f)})
-        if killed and rc not in (0, 1, None):
-            self.sqli_results["tool_failed"] = True
-            self.sqli_results["tool_error"] = f"sqlmap exited {rc} / early stop — sonuçlar eksik olabilir"
-        _confirmed = [f for f in findings if f.get("confirmed")]
-        self.summary["stage14"] = {
-            "status": "done" if not self.sqli_results["tool_failed"] else "tool_error",
-            "mode": "active", "candidates": len(candidates), "dast_hits": len(dast_hits),
-            "findings": len(findings), "findings_confirmed": len(_confirmed),
-            "targets_count": len(param_urls), "file_json": str(json_f), "file_txt": str(txt_f),
-            "tool_failed": self.sqli_results["tool_failed"],
-            "tool_error": self.sqli_results["tool_error"],
-            "interrupted": bool(killed), "duration_sec": self.sqli_results["duration_sec"],
-        }
-        if _confirmed:
-            err(f"sqlmap {len(_confirmed)} SQL injection point(s) CONFIRMED — "
-                f"{', '.join(sorted({f['param'] for f in _confirmed}))}"
-                + (f"  (+{len(findings) - len(_confirmed)} flagged possibly-FP)"
-                   if len(findings) > len(_confirmed) else ""))
-        elif findings:
-            warn(f"sqlmap flagged {len(findings)} point(s) as possibly false-positive "
-                 f"— verify by hand: {', '.join(sorted({f['param'] for f in findings}))}")
-        elif killed:
-            warn("sqlmap erken durduruldu — bulgular EKSIK olabilir")
-        else:
-            ok("sqlmap completed — no SQL injection confirmed (candidates still listed above)")
+            return set()
 
+    def _compute_scan_diff(self):
+        """Populate self.scan_diff + DIFF.json. Silent no-op on a first scan.
+
+        The baseline is resolved PER SET rather than per session: the newest
+        earlier session that actually produced that artefact wins. Without
+        that, one partial re-run (`-s 13`, which writes no subdomain file)
+        would become the baseline and hide every real delta."""
+        if not self.want_diff:
+            return
+        try:
+            here     = Path(self.out).resolve()
+            previous = [(d, st) for d, st in find_sessions(self._out_root, self._target_slug)
+                        if Path(d).resolve() != here]
+            if not previous:
+                return
+            diff = {"baselines": {}, "sets": {}}
+            any_change = False
+            for label, cp_name in self._DIFF_SETS.items():
+                now_set = self._read_cp_set(self.out, cp_name)
+                if not now_set:
+                    # This run never produced the artefact (partial re-run) —
+                    # calling the whole baseline "gone" would be a plain lie.
+                    continue
+                prev_dir = prev_state = None
+                prev_set = set()
+                for cand_dir, cand_state in previous:
+                    cand_set = self._read_cp_set(cand_dir, cp_name)
+                    if cand_set:
+                        prev_dir, prev_state, prev_set = cand_dir, cand_state, cand_set
+                        break
+                if not prev_set:
+                    continue
+                new_items  = sorted(now_set - prev_set)
+                gone_items = sorted(prev_set - now_set)
+                diff["baselines"][label] = {
+                    "session": Path(prev_dir).name,
+                    "date":    (prev_state or {}).get("updated") or (prev_state or {}).get("created") or "",
+                }
+                diff["sets"][label] = {
+                    "current":  len(now_set),
+                    "previous": len(prev_set),
+                    "new":      len(new_items),
+                    "gone":     len(gone_items),
+                    "new_items":  new_items[:200],   # capped: DIFF.json stays readable
+                    "gone_items": gone_items[:200],
+                }
+                any_change = any_change or bool(new_items or gone_items)
+            if not diff["sets"]:
+                return
+            self.scan_diff = diff
+            (self.out / "DIFF.json").write_text(
+                json.dumps(diff, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            print(f"\n{C.CYAN}{C.BOLD}{'─'*60}\n"
+                  f"  DELTA vs PREVIOUS SCAN\n"
+                  f"{'─'*60}{C.RESET}")
+            if not any_change:
+                ok("No change since the previous scan")
+            for label, d in diff["sets"].items():
+                base  = diff["baselines"].get(label, {})
+                arrow = f"{d['previous']:,} → {d['current']:,}"
+                line  = f"{label:<12} {arrow:<20}"
+                if d["new"]:
+                    line += f" {C.GREEN}+{d['new']:,} new{C.RESET}"
+                if d["gone"]:
+                    line += f" {C.DIM}-{d['gone']:,} gone{C.RESET}"
+                print(f"  {line}  {C.DIM}(vs {base.get('session', '?')}){C.RESET}", flush=True)
+                for item in d["new_items"][:5]:
+                    print(f"      {C.GREEN}+{C.RESET} {item[:110]}", flush=True)
+                if d["new"] > 5:
+                    print(f"      {C.DIM}... +{d['new'] - 5:,} more in DIFF.json{C.RESET}", flush=True)
+            ok(f"Delta written: {self.out / 'DIFF.json'}")
+        except Exception as e:
+            warn(f"Scan diff failed: {e}")
 
     def run(self, stages=None):
         all_s = {
@@ -6763,7 +7478,7 @@ class ReconPipeline:
             7: self.stage7_nuclei,     8: self.stage8_authenticated_crawl,
             9: self.stage9_params,     10: self.stage10_js,
             11: self.stage11_tech_priority, 12: self.stage12_extra_checks,
-            13: self.stage13_api_discovery, 14: self.stage14_sqli,
+            13: self.stage13_api_discovery,
         }
 
         wants_login = bool(self.login_url or self.raw_cookie or self.request_file)
@@ -6777,13 +7492,31 @@ class ReconPipeline:
         # zaten auth yoksa kendi icinde net bir mesajla guvenle atlaniyor, o
         # yuzden her zaman dahil etmek numarayi hep ardisik tutar.
         if self.url_targets:
-            if (not self.resume or not self._cp_ok("stage1_done")) and (not stages or 1 in stages):
-                self.stage1_recon()
-            if not self.resume or not self._cp_ok("stage3_alive"):
-                self.stage0_seed_urls()
-            run_stages = stages or [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            # URL-seed mode runs stage 1 and the seeder OUTSIDE the main loop, so
+            # they need their own state bookkeeping — otherwise stage 1 is never
+            # recorded as done and every --resume would pay for it again.
+            if (not stages or 1 in stages):
+                if self.resume and self.state.is_done(1):
+                    self._restore_stage(1)
+                else:
+                    self.state.start_stage(1)
+                    _t1 = time.time()
+                    try:
+                        self.stage1_recon()
+                    except Exception as e:
+                        err(f"Stage 1 crashed: {e}")
+                        self.log.exception("Stage 1 fatal")
+                        self.state.finish_stage(1, "failed", {"status": "failed", "error": str(e)},
+                                                time.time() - _t1)
+                    else:
+                        self.state.finish_stage(
+                            1, "partial" if (_INT.stage_skip() or _INT.hard()) else "done",
+                            self.summary.get("stage1"), time.time() - _t1)
+                    _INT.reset()
+            self.stage0_seed_urls()
+            run_stages = stages or [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         else:
-            run_stages = stages or [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            run_stages = stages or [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
         # -s ile acikca stage secildiyse kullanicinin secimi aynen kullanilir
         # (stage 8 istemeden zorla eklenmez); yalniz login/cookie verilip de
@@ -6807,83 +7540,300 @@ class ReconPipeline:
         if self.auto_mode:
             info("Auto mode (--auto): all stages will run without interactive prompts.")
 
+        # Record the plan so a later resume knows what the run was aiming at.
+        self.state.planned(run_stages)
+        self._start_budget_watchdog()
+
+        stopped_early = False
         try:
             for n in run_stages:
+                # ── global time budget (--max-time) ──────────────────────────
+                if self._budget_exceeded():
+                    warn(f"Time budget ({self.max_time_min} min) reached — stopping before stage {n}. "
+                         f"Resume later with: python3 reconX.py -d {self.target} --resume")
+                    self.state.mark_interrupted(f"time budget {self.max_time_min}min")
+                    stopped_early = True
+                    break
                 if _INT.hard():
-                    warn("Hard exit — writing report...")
+                    warn("Hard exit — checkpointing and writing report...")
+                    self.state.mark_interrupted("ctrl-c / hard stop")
+                    stopped_early = True
                     break
                 if n not in all_s:
                     warn(f"Unknown stage: {n}")
                     continue
 
+                # ── RESUME: never re-run a stage already marked "done" ───────
+                # Its artefacts are on disk and its summary lives in state.json,
+                # so restore + display them instead of burning the time again.
+                # "partial"/"failed" stages are deliberately NOT skipped: their
+                # output is incomplete by definition, so they run from scratch.
+                if self.resume and self.state.is_done(n):
+                    self._restore_stage(n)
+                    continue
+
                 if n == 6:
                     if interactive:
                         self.xss_asked = True
-                        if not ask_yes_no("Yüksek değerli URL'lerde XSS (Dalfox) taraması yapmak ister misiniz?", default="n"):
+                        if not ask_yes_no("Run an XSS (Dalfox) scan against the high-value URLs?", default="n"):
+                            self.state.finish_stage(n, "skipped", {"status": "skipped",
+                                                                   "reason": "declined"})
                             _INT.reset()
                             continue
                     self.xss_chosen = True
                 if n == 7:
                     if interactive:
                         self.nuclei_asked = True
-                        if not ask_yes_no("Alive hostlar üzerinde Nuclei zafiyet taraması yapmak ister misiniz?", default="n"):
+                        if not ask_yes_no("Run a Nuclei vulnerability scan against the alive hosts?", default="n"):
+                            self.state.finish_stage(n, "skipped", {"status": "skipped",
+                                                                   "reason": "declined"})
                             _INT.reset()
                             continue
                     self.nuclei_chosen = True
-                if n == 14:
-                    # Active sqlmap only when the user explicitly asked for
-                    # stage 14 (-s 14 / --stage14) or opted in interactively.
-                    # In the default --auto pipeline stage 14 just LISTS
-                    # candidates (fast) unless tools.sqli_active is set.
-                    explicit_14 = stages is not None and 14 in stages
-                    if explicit_14:
-                        self.sqli_chosen = True
-                    elif interactive:
-                        self.sqli_asked = True
-                        if ask_yes_no("Parametreli URL'lerde AKTİF SQLi (sqlmap) taraması da yapılsın mı? "
-                                      "(yavaş — 10-30 dk; hayır dersen sadece aday listesi çıkar)", default="n"):
-                            self.sqli_chosen = True
 
+                # ── run the stage, then persist its outcome immediately ──────
+                # _snap holds whatever a previous, interrupted pass of this same
+                # stage already wrote, so a shorter second pass cannot lose it.
+                _snap = self._snapshot_stage_sets(n) if self.resume else {}
+                self.state.start_stage(n)
+                _t0 = time.time()
                 try:
                     all_s[n]()
                 except SystemExit:
-                    warn("Force exit — writing report...")
+                    warn("Force exit — checkpointing and writing report...")
+                    self.state.finish_stage(n, "partial", self.summary.get(f"stage{n}"),
+                                            time.time() - _t0)
+                    self.state.mark_interrupted("force exit")
+                    stopped_early = True
                     break
                 except Exception as e:
                     err(f"Stage {n} crashed: {e}")
                     self.log.exception(f"Stage {n} fatal")
+                    self.state.finish_stage(n, "failed",
+                                            {"status": "failed", "error": str(e)},
+                                            time.time() - _t0)
                     warn("Continuing to next stage...")
+                else:
+                    if _snap:
+                        self._merge_stage_sets(n, _snap)
+                    # A stage that finished while a skip/hard flag was raised only
+                    # produced partial data — mark it so, so resume re-runs it.
+                    status = "partial" if (_INT.stage_skip() or _INT.hard()
+                                           or self._budget_exceeded()) else "done"
+                    self.state.finish_stage(n, status, self.summary.get(f"stage{n}"),
+                                            time.time() - _t0)
                 _INT.reset()
+                self.tor.reset_stage_counter()
+
+            if not stopped_early and not _INT.hard():
+                self.state.mark_completed()
         finally:
+            self._stop_budget_watchdog()
+            if stopped_early or _INT.hard():
+                self.state.mark_interrupted(self.state.data.get("interrupt_reason") or "interrupted")
+                self._print_resume_hint()
             self.generate_report()
 
 
-# ── Legal ─────────────────────────────────────────────────────────────────────
-def legal_warning(auto=False):
-    print(f"""{C.YELLOW}{C.BOLD}
-  ⚠  LEGAL WARNING
-  {'─'*56}
-  This tool may only be used on AUTHORIZED targets under
-  a valid bug bounty program. Unauthorized use is illegal.
-  Login/authenticated scanning requires that you own the
-  account or have explicit written authorization to test
-  with the provided credentials.
-  {'─'*56}{C.RESET}""")
-    # --auto: the operator already accepted this by passing the flag
-    # explicitly (see --help), so don't block on stdin waiting for a
-    # confirmation nobody is there to type — that's exactly the kind of
-    # hang --auto exists to avoid on a scheduler/CI/background run.
-    if auto:
-        ok("Auto mode (--auto): authorization confirmed automatically — no interactive prompt.")
-        return
+# ══════════════════════════════════════════════════════════════════════════════
+# Resume decision
+# ══════════════════════════════════════════════════════════════════════════════
+def target_slug(target: str) -> str:
+    """Filesystem-safe session-directory prefix for a target."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", (target or "").strip()).strip("._") or "target"
+
+
+def resolve_resume(out_root, target, force_resume=False, fresh=False, auto=False):
+    """Decide whether this invocation continues an interrupted scan.
+
+    Returns (resume: bool, session_dir: Path|None).
+
+    Interactive runs are shown exactly what the unfinished session already
+    produced and asked. Unattended runs (--auto, or no TTY) never silently
+    adopt an old session — stale recon data reused without anyone looking is
+    worse than a clean re-scan — they print the hint and start fresh unless
+    --resume was passed explicitly.
+    """
+    slug     = target_slug(target)
+    sessions = find_sessions(out_root, slug, completed=False)
+    if not sessions:
+        if force_resume:
+            warn("--resume: no unfinished session found for this target — starting a fresh scan.")
+        return False, None
+
+    session_dir, state = sessions[0]
+    if fresh:
+        info(f"--fresh: ignoring the unfinished session {Path(session_dir).name}")
+        return False, None
+
+    print_state_table(session_dir, state)
+
+    if force_resume:
+        ok("--resume: continuing this session — completed stages will be skipped.")
+        return True, Path(session_dir)
+
+    if auto or not sys.stdin.isatty():
+        warn("Unattended run — starting a FRESH scan. Add --resume to continue the session above.")
+        return False, None
+
+    if ask_yes_no("Resume this scan? (completed stages are skipped, their results are reloaded)",
+                  default="y"):
+        return True, Path(session_dir)
+    info("Starting a fresh scan instead.")
+    return False, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Preflight doctor (--doctor)
+# ══════════════════════════════════════════════════════════════════════════════
+# A recon pipeline that silently degrades is worse than one that refuses to
+# start: a missing subfinder does not crash anything, it just quietly produces
+# a scan with no subdomains. The doctor makes that visible up front — every
+# external binary, Python dependency and path the pipeline depends on, and what
+# specifically breaks when each is absent.
+#
+#   critical    -> a core stage produces nothing without it
+#   recommended -> a stage still runs, but with noticeably less coverage
+#   optional    -> a bonus capability (Tor rotation, OOB callbacks, ...)
+_TOOL_CHECKS = [
+    ("subfinder",         "critical",    "Stage 2 — main subdomain enumeration"),
+    ("httpx",             "critical",    "Stage 3/4/11 — alive-host validation + fingerprinting"),
+    ("katana",            "recommended", "Stage 4 — active crawling"),
+    ("gau",               "recommended", "Stage 4 — passive URL discovery"),
+    ("assetfinder",       "recommended", "Stage 2 — extra subdomain source"),
+    ("findomain",         "recommended", "Stage 2 — extra subdomain source"),
+    ("dnsx",              "recommended", "Stage 3 — DNS validation"),
+    ("dig",               "recommended", "Stage 12 — CNAME / subdomain-takeover checks"),
+    ("dalfox",            "critical",    "Stage 6 — XSS scanning"),
+    ("nuclei",            "critical",    "Stage 7 — vulnerability scan + DAST fuzzing"),
+    ("paramspider",       "recommended", "Stage 9 — parameter discovery"),
+    ("arjun",             "recommended", "Stage 9 — hidden parameter brute force"),
+    ("whatweb",           "recommended", "Stage 1/11 — technology fingerprinting"),
+    ("wafw00f",           "optional",    "Stage 1 — WAF fingerprinting"),
+    ("nmap",              "optional",    "Stage 1 — port/service scan"),
+    ("trufflehog",        "optional",    "Stage 10 — deeper JS secret detection"),
+    ("interactsh-client", "optional",    "Stage 6 — blind-XSS OOB callback"),
+    ("tor",               "optional",    "Automatic IP rotation when blocked"),
+]
+
+_PY_CHECKS = [
+    ("yaml",      "critical",    "config.yaml parsing"),
+    ("requests",  "critical",    "HTTP fallback client"),
+    ("curl_cffi", "recommended", "Primary HTTP client (Cloudflare-friendly TLS)"),
+    ("stem",      "optional",    "Tor control port — automatic IP rotation"),
+    ("flask",     "optional",    "Web control panel (reconx_web.py)"),
+    ("playwright","optional",    "Stage 6 — headless XSS proof screenshots"),
+]
+
+_SEV_STYLE = {
+    "critical":    (C.RED,    "CRITICAL"),
+    "recommended": (C.YELLOW, "RECOMMENDED"),
+    "optional":    (C.DIM,    "OPTIONAL"),
+}
+
+
+def _doctor_row(present, name, severity, why):
+    mark  = f"{C.GREEN}✓{C.RESET}" if present else (
+            f"{C.RED}✗{C.RESET}" if severity == "critical" else f"{C.YELLOW}○{C.RESET}")
+    color, label = _SEV_STYLE[severity]
+    tail = "" if present else f"  {color}[{label}]{C.RESET} {C.DIM}{why}{C.RESET}"
+    print(f"  {mark} {name:<20}{tail}", flush=True)
+
+
+def run_doctor(cfg, config_path=None) -> int:
+    """Print a full environment report. Exit code 1 if anything critical is
+    missing, so it is usable as a CI/pre-scan gate."""
+    print(f"\n{C.CYAN}{C.BOLD}{'═'*60}\n  RECONX DOCTOR — environment preflight\n{'═'*60}{C.RESET}")
+    missing_critical = []
+
+    print(f"\n{C.BOLD}External tools{C.RESET}")
+    for name, severity, why in _TOOL_CHECKS:
+        present = bool(_pd_httpx()) if name == "httpx" else tool_exists(name)
+        _doctor_row(present, name, severity, why)
+        if not present and severity == "critical":
+            missing_critical.append(name)
+
+    print(f"\n{C.BOLD}Python packages{C.RESET}")
+    for mod, severity, why in _PY_CHECKS:
+        try:
+            __import__(mod)
+            present = True
+        except Exception:
+            present = False
+        _doctor_row(present, mod, severity, why)
+        if not present and severity == "critical":
+            missing_critical.append(mod)
+
+    print(f"\n{C.BOLD}Configuration & paths{C.RESET}")
+    cfg_p = Path(config_path) if config_path else CFG_FILE
+    _doctor_row(cfg_p.exists(), cfg_p.name, "recommended",
+                "config.yaml missing — built-in defaults will be used")
+
+    out_root = Path((os.environ.get("RECONX_OUTPUT_DIR") or "").strip() or (BASE_DIR / "output"))
+    writable = True
     try:
-        ans = input(f"  {C.BOLD}I confirm I have authorization (yes/no): {C.RESET}").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\nCancelled.")
-        sys.exit(0)
-    if ans not in ("yes", "y", "evet", "e"):
-        print("Cancelled.")
-        sys.exit(0)
+        out_root.mkdir(parents=True, exist_ok=True)
+        probe = out_root / ".doctor_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception:
+        writable = False
+    _doctor_row(writable, "output dir", "critical", f"{out_root} is not writable")
+    if not writable:
+        missing_critical.append("output dir")
+
+    try:
+        free_gb = shutil.disk_usage(out_root).free / (1024 ** 3)
+        _doctor_row(free_gb >= 1.0, f"disk free ({free_gb:.1f} GB)", "recommended",
+                    "under 1 GB free — large scans may fail to write results")
+    except Exception:
+        pass
+
+    try:
+        tpl = discover_nuclei_templates(str(_cfg_get(cfg, "tools", "nuclei_templates", default="") or ""))
+    except Exception:
+        tpl = ""
+    _doctor_row(bool(tpl), "nuclei templates", "recommended",
+                "no populated template directory found — nuclei falls back to built-ins")
+
+    try:
+        import socket
+        socket.setdefaulttimeout(5)
+        socket.gethostbyname("example.com")
+        dns_ok = True
+    except Exception:
+        dns_ok = False
+    _doctor_row(dns_ok, "DNS resolution", "critical",
+                "cannot resolve names — see reconx_dns.py (DoH proxy) if UDP/53 is blocked")
+    if not dns_ok:
+        missing_critical.append("DNS")
+
+    print(f"\n{C.DIM}{'─'*60}{C.RESET}")
+    if missing_critical:
+        err(f"{len(missing_critical)} critical item(s) missing: {', '.join(missing_critical)}")
+        warn("Run ./install.sh (tools) and pip install -r requirements.txt (packages).")
+        return 1
+    ok("Environment looks good — every critical dependency is present.")
+    return 0
+
+
+def preflight_warn(cfg):
+    """Short, non-blocking version of the doctor, printed at scan start: only
+    names what is missing, so nobody discovers mid-run that stage 7 was a no-op."""
+    gaps = []
+    for name, severity, why in _TOOL_CHECKS:
+        if severity == "optional":
+            continue
+        present = bool(_pd_httpx()) if name == "httpx" else tool_exists(name)
+        if not present:
+            gaps.append((name, severity, why))
+    if not gaps:
+        return
+    crit = [g for g in gaps if g[1] == "critical"]
+    warn(f"Preflight: {len(gaps)} tool(s) missing — run --doctor for the full report")
+    for name, severity, why in (crit or gaps)[:6]:
+        color, label = _SEV_STYLE[severity]
+        sub(f"{color}{name}{C.RESET} — {why}")
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
@@ -6894,8 +7844,9 @@ def main():
             f"ReconX  ·  Sequential Bug-Bounty Scanner  ·  v{VERSION}",
             "",
             "Recon → Subs → Alive → URLs → Params → XSS/Dalfox",
-            "Nuclei + DAST fuzzing → SQLi/sqlmap → JS-Secrets",
-            "Tech-Priority → API Discovery   ·   14 stages",
+            "Nuclei + DAST fuzzing → JS-Secrets",
+            "Tech-Priority → API Discovery   ·   13 stages",
+            "Checkpoint/resume · scan diff · --doctor · --max-time",
             "",
             "linkedin.com/in/2u1fuk4r",
         ]
@@ -6917,18 +7868,34 @@ def main():
     p.add_argument("-U", "--url-file",  dest="url_file", metavar="FILE")
     p.add_argument("--single",          dest="single", metavar="TARGET")
     p.add_argument("-s", "--stages",    nargs="+", type=int)
-    for i in range(1, 15):
+    for i in range(1, 14):
         p.add_argument(f"--stage{i}", action="store_true", help=f"Run only stage {i}")
-    p.add_argument("--resume",          action="store_true")
+    # --resume and --fresh are opposite answers to the same question, so let
+    # argparse reject the contradiction instead of silently picking one.
+    res_grp = p.add_mutually_exclusive_group()
+    res_grp.add_argument("--resume",    action="store_true",
+                   help="Continue the most recent unfinished scan of this target: stages already "
+                        "marked done in its checkpoint file are skipped and their saved results "
+                        "are reloaded. Without this flag an interactive run still offers to resume.")
+    res_grp.add_argument("--fresh",     action="store_true",
+                   help="Never resume — always start a new session even if an unfinished one exists.")
+    p.add_argument("--doctor",          action="store_true",
+                   help="Check the environment (external tools, Python packages, paths, DNS) and "
+                        "exit. Exit code 1 when something critical is missing.")
+    p.add_argument("--max-time",        dest="max_time", type=int, default=0, metavar="MIN",
+                   help="Global wall-clock budget in minutes. When it runs out the running tool is "
+                        "stopped, the scan is checkpointed and a report is written — continue later "
+                        "with --resume. 0 (default) = unlimited.")
+    p.add_argument("--no-diff",         dest="no_diff", action="store_true",
+                   help="Skip the delta comparison against the previous completed scan of this target.")
     p.add_argument("--auto", "-y",      dest="auto", action="store_true",
-                   help="Fully unattended mode: skip the legal-authorization prompt AND the "
-                        "stage 6 (XSS/Dalfox) / stage 7 (Nuclei) 'run this?' confirmations — "
-                        "the complete pipeline runs with zero interactive input. Use this for "
-                        "scheduled tasks, CI, or any run where nobody is at the keyboard. By "
-                        "passing --auto you are confirming authorization the same way the "
-                        "interactive prompt does; only use it against targets you're already "
-                        "cleared to test.")
-    p.add_argument("--no-legal",        action="store_true")
+                   help="Fully unattended mode: skip the stage 6 (XSS/Dalfox) and stage 7 "
+                        "(Nuclei) 'run this?' confirmations and the resume prompt — the complete "
+                        "pipeline runs with zero interactive input. Use this for scheduled tasks, "
+                        "CI, or any run where nobody is at the keyboard.")
+    # Deprecated: the startup legal prompt was removed, this flag is accepted
+    # and ignored so existing wrappers (reconx_web.py, cron jobs) keep working.
+    p.add_argument("--no-legal",        action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--config",          default=str(CFG_FILE))
     p.add_argument("--nuclei-templates", dest="nuclei_templates", default=None,
                    help="Override nuclei template path (e.g. /root/nuclei-templates)")
@@ -6936,10 +7903,6 @@ def main():
                    help="Nuclei severity filter (e.g. critical,high,medium)")
     p.add_argument("--blind",           dest="blind_cb", default=None,
                    help="Blind XSS callback URL for Dalfox")
-    p.add_argument("--sqli-active",      dest="sqli_active", action="store_true",
-                   help="Stage 14: also run sqlmap to actively confirm SQLi candidates "
-                        "(slow, 10-30 min). Without this, stage 14 only lists candidates "
-                        "with a ready sqlmap command each.")
 
     auth_grp = p.add_argument_group("Authenticated scanning")
     auth_grp.add_argument("--login-url", dest="login_url", default=None,
@@ -6977,8 +7940,11 @@ def main():
         warn(f"DNS resilience check failed: {_dns_e}")
 
     cfg = load_config(Path(args.config))
-    if getattr(args, "sqli_active", False):
-        cfg.setdefault("tools", {})["sqli_active"] = True
+
+    # --doctor is a standalone environment report: no target needed, exits here.
+    if args.doctor:
+        sys.exit(run_doctor(cfg, config_path=args.config))
+
     default_scheme = (_cfg_get(cfg, "settings", "default_scheme", default="https") or "https").strip()
 
     url_targets = []
@@ -7000,7 +7966,7 @@ def main():
     url_targets = list(dict.fromkeys(url_targets))
 
     stage_flags = [i for i in range(1, 6) if getattr(args, f"stage{i}")]
-    for sf in (6, 7, 8, 9, 10, 11, 12, 13, 14):
+    for sf in (6, 7, 8, 9, 10, 11, 12, 13):
         if getattr(args, f"stage{sf}", False):
             stage_flags.append(sf)
     if stage_flags and args.stages:
@@ -7044,8 +8010,18 @@ def main():
         else:
             err("-d / --domain required (or -u/--single with a URL)"); sys.exit(1)
 
-    if not args.no_legal:
-        legal_warning(auto=args.auto)
+    # Non-blocking environment check — names any missing tool that would make a
+    # stage silently produce nothing. Full report: --doctor.
+    preflight_warn(cfg)
+
+    # ── checkpoint/resume decision ───────────────────────────────────────────
+    # Looks for the most recent unfinished session of this target, shows what it
+    # already completed and decides (flag or prompt) whether to continue it.
+    _out_root = Path((os.environ.get("RECONX_OUTPUT_DIR") or "").strip() or (BASE_DIR / "output"))
+    do_resume, resume_dir = resolve_resume(_out_root, domain,
+                                           force_resume=args.resume,
+                                           fresh=args.fresh,
+                                           auto=args.auto)
 
     extra_fields = {}
     for kv in (args.login_extra_fields or []):
@@ -7055,7 +8031,10 @@ def main():
 
     ReconPipeline(
         domain, cfg,
-        resume=args.resume,
+        resume=do_resume,
+        session_dir=resume_dir,
+        max_time_min=args.max_time,
+        scan_diff=not args.no_diff,
         auto_mode=args.auto,
         url_targets=url_targets if url_targets else None,
         login_url=args.login_url,

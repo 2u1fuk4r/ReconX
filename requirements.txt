@@ -5,6 +5,7 @@
 pyyaml>=6.0            # config.yaml
 requests>=2.31.0       # HTTP fallback client
 curl-cffi>=0.6.0       # primary HTTP client (Cloudflare-friendly TLS fingerprint)
+stem>=1.8.2            # Tor control-port client (settings.auto_tor block-triggered IP rotation)
 
 # Optional — only needed for XSS alert() verification screenshots (Stage 6):
 #   pip install playwright && playwright install chromium

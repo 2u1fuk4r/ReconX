@@ -16,6 +16,10 @@ trufflehog/
 .venv/
 venv/
 
+# v8.8: ReconX'in kendi yonettigi izole Tor sureci — torrc, control password,
+# veri/log dizini (auto_tor rotasyon ozelligi). Hicbir zaman commit edilmemeli.
+.tor_data/
+
 # Per-engagement artefacts (keep these out of the repo)
 request.txt
 *.oast.*

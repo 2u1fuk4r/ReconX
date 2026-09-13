@@ -56,7 +56,6 @@ def _parse_recon(d: Path) -> dict:
         "whatweb":   _read(d / "01_recon" / "whatweb.txt"),
         "wafw00f":   _read(d / "01_recon" / "wafw00f.txt"),
         "harvester": _read(d / "01_recon" / "theharvester.xml") or _read(d / "01_recon" / "theharvester.json"),
-        "shodan":    _read(d / "01_recon" / "shodan.txt"),
         "probe":     probe,
     }
 
@@ -464,8 +463,30 @@ def _parse_xss(d) -> dict:
     for u in tested_urls:
         key = _path_key(u)
         u_params = _params_of(u)
-        hits = [f for f in hits_by_path.get(key, [])
-                if not f.get("param") or f.get("param") in u_params]
+        hits = []
+        for f in hits_by_path.get(key, []):
+            fp = f.get("param") or ""
+            f_params = _params_of(f.get("url", ""))
+            if not fp:
+                # v8.7-fix: no injected param on this finding (path/DOM hit) —
+                # only attach it to the bare, query-less tested URL for this
+                # path, not to every ?a=1/?b=2 query variant that happens to
+                # share the same path.
+                if not u_params:
+                    hits.append(f)
+            elif f_params:
+                # v8.7-fix: the finding's own request URL carries a full query
+                # key set — require an EXACT match against this tested URL's
+                # keys, not just "the injected param is somewhere in there".
+                # Two crawled variants of the same path/param (e.g.
+                # index.jsp?uid=1 and index.jsp?uid=1&debug=true) would both
+                # satisfy the old "param in u_params" check and both get
+                # painted red for a single real hit; exact key-set equality
+                # tells them apart.
+                if f_params == u_params:
+                    hits.append(f)
+            elif fp in u_params:
+                hits.append(f)
         # one-piece PoC per hit: dalfox's "url" (its "data" field) IS the full
         # request URL with the payload already substituted into the parameter —
         # exactly what you paste into a browser. Dedup + keep payload alongside.
@@ -633,7 +654,7 @@ def _host_of(u: str) -> str:
         return ""
 
 
-def _build_vuln_map(nuc: dict, xss: dict, extra: dict, sqli: dict = None) -> dict:
+def _build_vuln_map(nuc: dict, xss: dict, extra: dict) -> dict:
     """Nuclei/XSS/Extra-checks bulgularini hostname'e gore birlestirip Threat Map'in
     zafiyet katmanini besler (high/medium/low/info + kumulatif sayim)."""
     order = {"high": 4, "medium": 3, "low": 2, "info": 1, "none": 0}
@@ -661,8 +682,6 @@ def _build_vuln_map(nuc: dict, xss: dict, extra: dict, sqli: dict = None) -> dic
     for r in (extra.get("buckets") or []):
         if r.get("public_listing"):
             _bump(_host_of(r.get("url", "")), "medium")
-    for f in ((sqli or {}).get("findings") or []):
-        _bump(_host_of(f.get("url", "")), "high")
     return vmap
 
 
@@ -709,11 +728,6 @@ def _code_block(text: str, max_lines: int = 400) -> str:
     shown = "\n".join(lines[:max_lines])
     extra = f"\n\n... {len(lines) - max_lines:,} more lines" if len(lines) > max_lines else ""
     return f'<pre class="code-block">{_safe_content(shown + extra)}</pre>'
-
-
-def _sh_quote(s: str) -> str:
-    s = s or ""
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _poc_field(value: str, label: str = "PoC URL") -> str:
@@ -796,8 +810,8 @@ def _tabs(items: list, prefix: str) -> str:
 # ── Stat helpers ───────────────────────────────────────────────────────────────
 # ── Section: Overview ─────────────────────────────────────────────────────────
 def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
-                      nuc=None, xss=None, js=None, tech=None, extra=None, sqli=None):
-    nuc = nuc or {}; xss = xss or {}; tech = tech or []; extra = extra or {}; sqli = sqli or {}
+                      nuc=None, xss=None, js=None, tech=None, extra=None):
+    nuc = nuc or {}; xss = xss or {}; tech = tech or []; extra = extra or {}
     sc_n    = len(subs["all"])
     alive_n = len(alive)
     url_n   = len(urls.get("_all", []))
@@ -839,13 +853,6 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
         extra_stats.append(_stat(len(nuc["findings"]), "Nuclei Findings", "red", "🧨"))
     if xss and xss.get("findings"):
         extra_stats.append(_stat(len(xss["findings"]), "XSS Findings", "orange", "💥"))
-    if sqli and sqli.get("findings"):
-        _sc = [f for f in sqli["findings"] if f.get("confirmed", True)]
-        extra_stats.append(_stat(len(_sc) or len(sqli["findings"]), "SQLi Confirmed", "red", "💉"))
-    elif sqli and sqli.get("candidates"):
-        _dh = sum(1 for c in sqli["candidates"] if c.get("source") == "nuclei-dast")
-        extra_stats.append(_stat(len(sqli["candidates"]), "SQLi Candidates",
-                                 "red" if _dh else "orange", "🎯"))
     if js and js.get("secrets"):
         extra_stats.append(_stat(len(js["secrets"]), "JS Secrets", "purple", "🔑"))
     if tech:
@@ -889,6 +896,53 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
         adapt_html = (f'<div class="info-banner info-{col}" style="margin-bottom:16px">'
                       f'<span>⚡ Block ratio: <strong>{pct}</strong> · Rate multiplier: <strong>{am:.2f}x</strong></span>'
                       f'</div>')
+
+    # v8.9: checkpoint/resume + scan-delta banners.
+    # An interrupted scan must never present itself as a finished one: "0
+    # findings" because a stage was cut short is a completely different claim
+    # from "0 findings" after the stage ran to the end. SUMMARY.json["resume"]
+    # is written by reconX.py's ScanState, ["scan_diff"] by its delta pass.
+    resume_meta = smry_json.get("resume") if isinstance(smry_json.get("resume"), dict) else {}
+    # Default True so reports from older scans (no "resume" block) stay green.
+    incomplete  = not bool(resume_meta.get("completed", True))
+    done_stages = list(resume_meta.get("completed_stages") or [])
+    state_badge = (_badge("SCAN INCOMPLETE", "orange") if incomplete
+                   else _badge("RECON COMPLETE", "green"))
+    resume_html = ""
+    if incomplete:
+        reason = _e(str(resume_meta.get("interrupt_reason") or "interrupted"))
+        done_txt = ", ".join(str(s) for s in done_stages) if done_stages else "none"
+        resume_html = (f'<div class="info-banner info-orange" style="margin-bottom:16px">'
+                       f'<span>⏸ This scan did not finish every stage '
+                       f'(<strong>{reason}</strong>) — stages fully completed: '
+                       f'<strong>{_e(done_txt)}</strong>. Anything missing below may simply '
+                       f'not have been scanned yet; resume with '
+                       f'<code>python3 reconX.py -d {_e(target)} --resume</code>.</span></div>')
+
+    diff_html = ""
+    sd = smry_json.get("scan_diff") if isinstance(smry_json.get("scan_diff"), dict) else {}
+    sd_sets = sd.get("sets") if isinstance(sd.get("sets"), dict) else {}
+    if sd_sets:
+        bits = []
+        for label, d in sd_sets.items():
+            if not isinstance(d, dict):
+                continue
+            piece = f"{_e(label.replace('_', ' '))} {d.get('previous', 0):,} → {d.get('current', 0):,}"
+            if d.get("new"):
+                piece += f' <strong style="color:#4ade80">+{d["new"]:,} new</strong>'
+            if d.get("gone"):
+                piece += f' <span style="opacity:.7">-{d["gone"]:,} gone</span>'
+            bits.append(piece)
+        base = ""
+        baselines = sd.get("baselines") if isinstance(sd.get("baselines"), dict) else {}
+        for _lbl, meta in baselines.items():
+            if isinstance(meta, dict) and meta.get("session"):
+                base = f" (baseline: <code>{_e(str(meta['session']))}</code>)"
+                break
+        if bits:
+            diff_html = (f'<div class="info-banner info-blue" style="margin-bottom:16px">'
+                         f'<span>📈 Delta vs previous scan{base}: '
+                         + " &nbsp;·&nbsp; ".join(bits) + '</span></div>')
 
     stages_tl = [
         ("Recon",      bool(recon["whois"] or recon["nmap"]), "🔍"),
@@ -972,7 +1026,7 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
     # reflected search box that echoes 20 payloads counted as 20 * 5 = 100,
     # which alone pushed a Medium-at-most site to "410 CRITICAL". Score the
     # XSS surface by verified findings (heavy) + unique unconfirmed injection
-    # points (light), and confirmed SQLi separately.
+    # points (light).
     _xf = xss.get("findings", []) if xss else []
     _verified_labels = {_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"]}
     xss_verified_n = sum(1 for f in _xf if f.get("type") in _verified_labels)
@@ -984,15 +1038,11 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
             pass
     xss_point_n = max(len(_xss_points), 1 if _xf else 0) - xss_verified_n
     xss_n = len(_xf)
-    _sqf = (sqli or {}).get("findings", []) if sqli else []
-    sqli_n = len([f for f in _sqf if f.get("confirmed", True)]) if _sqf else 0
-    # a nuclei-DAST SQLi hit is real evidence even without an active sqlmap run
-    sqli_n += sum(1 for c in (sqli or {}).get("candidates", []) if c.get("source") == "nuclei-dast")
     tech_high_n = sum(1 for t in tech if t.get("risk_label") == "high") if tech else 0
     extra_vuln_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("buckets", []) if r.get("public_listing")))
-    risk_score = (crit_n*10 + high_n*6 + med_n*3 + sqli_n*10
+    risk_score = (crit_n*10 + high_n*6 + med_n*3
                   + xss_verified_n*6 + max(0, xss_point_n)*2
                   + extra_vuln_n*7 + tech_high_n*2)
     if risk_score >= 40:
@@ -1045,10 +1095,12 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
         <h2>Dashboard</h2>
         <p class="sec-sub">Target: <code class="target-code">{_e(target)}</code> &nbsp;·&nbsp; {_e(ts)}</p>
       </div>
-      <div class="sec-hdr-badge">{_badge("RECON COMPLETE", "green")}</div>
+      <div class="sec-hdr-badge">{state_badge}</div>
     </div>
   </div>
   {exec_html}
+  {resume_html}
+  {diff_html}
   {adapt_html}
   <div class="stat-grid">{stats_html}</div>
 
@@ -1098,7 +1150,6 @@ def _section_recon(recon):
         ("whatweb", "WhatWeb",   _code_block(recon["whatweb"])),
         ("waf",     "WAF",       _code_block(recon["wafw00f"])),
         ("harvest", "Harvester", _code_block(recon["harvester"])),
-        ("shodan",  "Shodan",    _code_block(recon["shodan"])),
     ]
     tab_items = [(tid, lbl, c) for tid, lbl, c in items if c != _empty()]
     body = _tabs(tab_items, "recon") if tab_items else _empty()
@@ -1538,140 +1589,6 @@ def _section_api(api_data):
             f'<div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>API Discovery</h2>'
             f'<p class="sec-sub">{len(live_hits)} live · {total_hits} pattern hits · {len(probes)} probed — GraphQL / Swagger / OpenAPI</p>'
             f'</div></div></div>{body}</div>')
-
-def _parse_sqli(d) -> dict:
-    d = Path(d)
-    findings, candidates = [], []
-    jf = d / "14_sqli" / "sqli_findings.json"
-    if jf.exists():
-        try:
-            data = json.loads(jf.read_text(errors="ignore")) or []
-            if isinstance(data, list):
-                findings = [x for x in data if isinstance(x, dict)]
-        except Exception:
-            pass
-    cf = d / "14_sqli" / "sqli_candidates.json"
-    if cf.exists():
-        try:
-            data = json.loads(cf.read_text(errors="ignore")) or []
-            if isinstance(data, list):
-                candidates = [x for x in data if isinstance(x, dict)]
-        except Exception:
-            pass
-    sm = _parse_summary_json(d)
-    st14 = sm.get("stages", {}).get("stage14") or {}
-    meta = {
-        "status": st14.get("status", ""),
-        "mode": st14.get("mode", ""),
-        "tool_failed": bool(st14.get("tool_failed")),
-        "tool_error": st14.get("tool_error", ""),
-        "interrupted": bool(st14.get("interrupted")),
-        "duration_sec": st14.get("duration_sec", 0),
-        "targets_count": st14.get("targets_count", 0),
-        "dast_hits": st14.get("dast_hits", 0),
-        "reason": st14.get("reason", ""),
-        "note": st14.get("note", ""),
-        "active_ran": st14.get("mode") == "active",
-        "ran": st14.get("status") not in ("", "skipped", "not-run"),
-    }
-    return {"findings": findings, "candidates": candidates,
-            "raw_txt": _read(d / "14_sqli" / "sqli_findings.txt"), "meta": meta}
-
-
-def _section_sqli(sq):
-    findings = sq.get("findings", [])
-    candidates = sq.get("candidates", [])
-    meta = sq.get("meta", {})
-    active = bool(meta.get("active_ran"))
-    hdr = ('<div id="s-sqli" class="section">'
-           '<div class="sec-hdr"><div class="sec-hdr-inner"><div><h2>SQL Injection</h2>'
-           f'<p class="sec-sub">{len(candidates)} candidate injection point(s)'
-           + (f' · sqlmap ran on {meta.get("targets_count",0)} URL(s)'
-              + (f' · {round(meta.get("duration_sec",0)/60,1)} min' if meta.get("duration_sec") else '')
-              if active else ' · active sqlmap test NOT run (fast mode)')
-           + '</p></div></div></div>')
-
-    _TECH = {"B": "boolean-based blind", "E": "error-based", "U": "UNION query",
-             "S": "stacked queries", "T": "time-based blind", "Q": "inline query"}
-    def _tech_full(t):
-        return ", ".join(_TECH.get(c, c) for c in (t or "")) or "?"
-
-    if meta.get("tool_failed"):
-        return hdr + (f'<div class="alert-box alert-red" style="margin-bottom:14px">sqlmap did not finish cleanly — '
-                      f'{_e(meta.get("tool_error") or "unknown error")}. Candidates below still stand.</div>'
-                      + _sqli_candidates_html(candidates, _tech_full) + "</div>")
-
-    confirmed = [f for f in findings if f.get("confirmed", True)]
-    shaky = [f for f in findings if not f.get("confirmed", True)]
-
-    def _rows(fs):
-        return [[f.get("url", ""), f.get("param", ""), f.get("place", ""),
-                 _tech_full(f.get("technique", "")), f.get("note", "") or "—"] for f in fs]
-
-    out = hdr
-    dast_n = sum(1 for c in candidates if c.get("source") == "nuclei-dast")
-    stat = (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">'
-            f'{_stat(len(candidates), "Candidates", "orange", "🎯")}'
-            f'{_stat(dast_n, "Nuclei DAST hits", "red" if dast_n else "gray", "🧨")}'
-            + (f'{_stat(len(confirmed), "sqlmap Confirmed", "red", "💉")}'
-               f'{_stat(len(shaky), "Needs manual check", "yellow", "❔")}' if active else '')
-            + '</div>')
-    out += stat
-    if not active:
-        out += ('<div class="alert-box" style="margin-bottom:14px;background:rgba(59,130,246,.08);'
-                'border-color:rgba(59,130,246,.3);color:#93c5fd">'
-                'ℹ Active sqlmap testing is off (fast mode). Every likely injection point is listed '
-                'below with a ready-to-run <code>sqlmap</code> command. Re-run with '
-                '<code>--stage14</code> or set <code>tools.sqli_active: true</code> to confirm them.</div>')
-    if confirmed:
-        # one PoC card per confirmed point: the sqlmap resume command replays it
-        cards = ""
-        for f in confirmed:
-            cmd = f'sqlmap -u {_sh_quote(f.get("url",""))} -p {_sh_quote(f.get("param",""))} --batch --dbs'
-            cards += ('<div class="poc-card">'
-                      '<div class="poc-card-hd"><span class="tag">CONFIRMED</span>'
-                      f'{_e(_tech_full(f.get("technique","")))} &nbsp;·&nbsp; param '
-                      f'<code>{_e(f.get("param",""))}</code></div>'
-                      + _poc_field(f.get("url", ""), "Injectable URL")
-                      + _poc_field(cmd, "Reproduce")
-                      + '</div>')
-        out += ('<div class="alert-box alert-red" style="margin-bottom:14px"><b>'
-                f'{len(confirmed)} SQL injection point(s) confirmed by sqlmap.</b> '
-                'Each is a proven injection — reproduce with the command shown, then report.</div>'
-                + cards
-                + _vtable(["Target URL", "Parameter", "Place", "Technique(s)", "Note(s)"],
-                          _rows(confirmed), "vt-sqli", copy_cols=[0]))
-    if shaky:
-        out += ('<div class="subsection-label" style="margin:18px 0 8px">Flagged but unconfirmed '
-                '<span style="color:var(--muted);font-weight:400">(sqlmap itself marked these '
-                'possibly false-positive / unexploitable — verify by hand before reporting)</span></div>'
-                + _vtable(["Target URL", "Parameter", "Place", "Technique(s)", "sqlmap note"],
-                          _rows(shaky), "vt-sqli-shaky", copy_cols=[0]))
-    out += _sqli_candidates_html(candidates, _tech_full, skip_confirmed={f.get("url") for f in confirmed})
-    return out + "</div>"
-
-
-def _sqli_candidates_html(candidates, tech_full, skip_confirmed=None):
-    skip_confirmed = skip_confirmed or set()
-    rows = []
-    for c in candidates:
-        if c.get("url") in skip_confirmed:
-            continue
-        rows.append([
-            str(c.get("score", "")),
-            c.get("param", ""),
-            c.get("why", ""),
-            c.get("url", ""),
-            c.get("sqlmap_cmd", ""),
-        ])
-    if not rows:
-        return _empty("No parameterised URLs to flag as SQLi candidates.")
-    return ('<div class="subsection-label" style="margin:18px 0 8px">Candidate injection points '
-            '<span style="color:var(--muted);font-weight:400">(ranked by likelihood — '
-            'copy the sqlmap command to test one)</span></div>'
-            + _vtable(["Score", "Parameter", "Why flagged", "URL", "sqlmap command — click ⧉ to copy"],
-                      rows, "vt-sqli-cand", copy_cols=[3, 4]))
-
 
 def _section_nuclei(nuc):
     findings = nuc.get("findings", [])
@@ -2444,6 +2361,8 @@ body{
 .info-red{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.25);color:#ff9e9e}
 .info-orange{background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.25);color:#ffb86a}
 .info-yellow{background:rgba(234,179,8,.08);border-color:rgba(234,179,8,.25);color:#ffea80}
+.info-blue{background:rgba(59,130,246,.08);border-color:rgba(59,130,246,.25);color:#93c5fd}
+.info-green{background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.25);color:#86efac}
 /* Threat Map */
 .tm-legend{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
 .tm-leg-item{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:var(--surface1);padding:5px 10px;border-radius:20px;border:1px solid var(--border)}
@@ -3011,8 +2930,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
     tech     = _parse_tech(scan_dir)
     extra    = _parse_extra(scan_dir)
     api      = _parse_api(scan_dir)            # v6.13+: CORS / Takeover / Bucket
-    sqli     = _parse_sqli(scan_dir)           # v8.6: sqlmap-confirmed SQL injection
-    vuln_map = _build_vuln_map(nuc, xss, extra, sqli)   # feeds the Threat Map's severity layer
+    vuln_map = _build_vuln_map(nuc, xss, extra)   # feeds the Threat Map's severity layer
     extra_vuln_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("buckets", []) if r.get("public_listing")))
@@ -3053,7 +2971,6 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 <div class="nav-grp"><div class="nav-lbl">Findings</div>
   {_nav("🧨" if not nuc.get("meta",{}).get("tool_failed") else "⚠️","Nuclei","nuclei", len(nuc.get("findings",[])) if not nuc.get("meta",{}).get("tool_failed") else "ERR", "red")}
   {_nav("💥" if not xss.get("meta",{}).get("tool_failed") else "⚠️","XSS","xss", len(xss.get("findings",[])) if not xss.get("meta",{}).get("tool_failed") else "ERR", "orange" if not xss.get("meta",{}).get("tool_failed") else "red")}
-  {_nav("💉" if not sqli.get("meta",{}).get("tool_failed") else "⚠️","SQL Injection","sqli", (len(sqli.get("findings",[])) or len(sqli.get("candidates",[]))) if not sqli.get("meta",{}).get("tool_failed") else "ERR", "red" if (sqli.get("findings") or any(c.get("source")=="nuclei-dast" for c in sqli.get("candidates",[])) or sqli.get("meta",{}).get("tool_failed")) else None)}
   {_nav("🛡️","Extra Checks","extra", extra_vuln_n, "red" if extra_vuln_n else None)}
   {_nav("🔑","JS Secrets","js", len(js.get("secrets",[])), "purple")}
   {_nav("⚡","API Discovery","api", len(api.get("probes",[])) + sum(len(v) for v in api.get("found",{}).values()))}
@@ -3067,7 +2984,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 
     sections = "".join([
         _section_overview(target, ts, recon, subs, alive, urls, smry_json,
-                          nuc=nuc, xss=xss, js=js, tech=tech, extra=extra, sqli=sqli),
+                          nuc=nuc, xss=xss, js=js, tech=tech, extra=extra),
         _section_threatmap(target, subs, alive, vuln_map=vuln_map),
         _section_recon(recon),
         _section_subdomains(subs),
@@ -3077,7 +2994,6 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
         _section_categorised(urls),
         _section_nuclei(nuc),
         _section_xss(xss),
-        _section_sqli(sqli),
         _section_extra(extra),
         _section_api(api),
         _section_js(js),
