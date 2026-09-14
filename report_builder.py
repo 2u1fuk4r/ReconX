@@ -686,6 +686,19 @@ def _build_vuln_map(nuc: dict, xss: dict, extra: dict) -> dict:
 
 
 # ── HTML components ────────────────────────────────────────────────────────────
+# The report used to hard-code "v8.6" in two places, which silently went stale
+# as the scanner moved on. Read it from reconX.py instead.
+def _reconx_version() -> str:
+    try:
+        src = (Path(__file__).parent / "reconX.py").read_text(errors="ignore")
+        m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)', src, re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def _badge(text: str, color: str = "blue") -> str:
     colors = {
         "red":    ("rgba(239,68,68,.15)", "#f87171"),
@@ -1990,24 +2003,78 @@ def _section_xss(xss):
 
 
 # ── Section: JS Secrets ──────────────────────────────────────────────────────
+_VERDICT_STYLE = {
+    "REAL":    ("row-red",    "REAL — treat as leaked"),
+    "UNKNOWN": ("row-yellow", "unclassified — review"),
+    "PUBLIC":  ("row-blue",   "public by design"),
+    "FALSE":   ("row-dim",    "not a credential"),
+}
+_VERDICT_RANK = {"REAL": 0, "UNKNOWN": 1, "PUBLIC": 2, "FALSE": 3}
+
+
 def _section_js(js):
     endpoints = js.get("endpoints", [])
     secrets   = js.get("secrets", [])
-    body = (f'<div style="display:flex;margin-bottom:16px">'
+    detail    = [d for d in (js.get("detail") or []) if isinstance(d, dict)
+                 and d.get("type") == "secret"]
+    # reconx_secrets classified each candidate during stage 10 (REAL / PUBLIC /
+    # FALSE / UNKNOWN). Without this the section was one flat "Secrets" list in
+    # which a Stripe PUBLISHABLE key and a leaked AWS key looked identical.
+    graded = [d for d in detail if d.get("verdict")]
+    counts = {}
+    for d in graded:
+        counts[d["verdict"]] = counts.get(d["verdict"], 0) + 1
+
+    body = (f'<div style="display:flex;flex-wrap:wrap;margin-bottom:16px">'
             f'{_stat(len(endpoints), "Endpoints", "blue", "🔗")}'
-            f'{_stat(len(secrets), "Secrets", "purple", "🔑")}</div>')
+            f'{_stat(len(secrets), "Candidates", "purple", "🔑")}')
+    if counts:
+        body += _stat(counts.get("REAL", 0), "Real credentials", "red", "🚨")
+        body += _stat(counts.get("UNKNOWN", 0), "Unclassified", "yellow", "❓")
+    body += '</div>'
+
+    if graded:
+        body += ('<div class="info-banner info-blue" style="margin-bottom:14px"><span>'
+                 'Each candidate is graded by an auditable pattern table '
+                 '(<code>reconx_secrets.py</code>): <b>REAL</b> grants access, '
+                 '<b>public by design</b> is meant to ship in client-side JS '
+                 '(Stripe pk_, Google Maps/Firebase browser keys, reCAPTCHA site keys), '
+                 '<b>not a credential</b> is a hash/uuid/placeholder. Anything the table '
+                 'cannot identify stays <b>unclassified</b> rather than being guessed.'
+                 '</span></div>')
+
     tabs = []
+    if graded:
+        rows = []
+        for d in sorted(graded, key=lambda x: (_VERDICT_RANK.get(x.get("verdict"), 9),
+                                               x.get("value", ""))):
+            row_cls, label = _VERDICT_STYLE.get(d.get("verdict"),
+                                                ("row-dim", str(d.get("verdict", ""))))
+            rows.append([label,
+                         str(d.get("value", ""))[:160],
+                         str(d.get("verdict_reason", "")),
+                         str(d.get("source_js", ""))[:120],
+                         row_cls])            # last element = <tr> class, not shown
+        tabs.append(("graded", f"Graded ({len(rows)})",
+                     _vtable(["Verdict", "Value", "Why", "Source JS"], rows, "vt-js-graded",
+                             row_class=True, copy_cols=[1, 3])))
     if endpoints:
         tabs.append(("endpoints", f"Endpoints ({len(endpoints)})",
                      _vtable(["Endpoint"], [[e] for e in endpoints], "vt-js-ep")))
     if secrets:
-        tabs.append(("secrets", f"Secrets ({len(secrets)})",
+        tabs.append(("secrets", f"All candidates ({len(secrets)})",
                      _vtable(["Secret"], [[s] for s in secrets], "vt-js-sec")))
     body += _tabs(tabs, "js") if tabs else _empty("No JS secrets found")
+    sub_txt = "Endpoints &amp; secrets harvested from JavaScript"
+    if counts:
+        sub_txt += (f" &middot; {counts.get('REAL', 0)} real &middot; "
+                    f"{counts.get('UNKNOWN', 0)} unclassified &middot; "
+                    f"{counts.get('PUBLIC', 0)} public-by-design &middot; "
+                    f"{counts.get('FALSE', 0)} not a credential")
     return (f'<div id="s-js" class="section">'
             f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
             f'<h2>JS Secrets</h2>'
-            f'<p class="sec-sub">Endpoints &amp; secrets harvested from JavaScript</p>'
+            f'<p class="sec-sub">{sub_txt}</p>'
             f'</div></div></div>{body}</div>')
 
 
@@ -2370,6 +2437,12 @@ body{
 .cell-copy.copied{opacity:1;color:#4ade80;border-color:#4ade80}
 /* v8.3: row-level color coding for the XSS "all tested URLs" table — red for
    a URL dalfox actually flagged, green for one tested and found clean. */
+.row-yellow td{background:rgba(234,179,8,.09);border-bottom-color:rgba(234,179,8,.18)}
+.row-yellow td:first-child{border-left:3px solid #facc15;font-weight:600;color:#fde68a}
+.row-blue td{background:rgba(59,130,246,.07);border-bottom-color:rgba(59,130,246,.16)}
+.row-blue td:first-child{border-left:3px solid #60a5fa;color:#93c5fd}
+.row-dim td{opacity:.62}
+.row-dim td:first-child{border-left:3px solid var(--border)}
 .row-red td{background:rgba(239,68,68,.10);border-bottom-color:rgba(239,68,68,.18)}
 .row-red td:first-child{border-left:3px solid var(--red)}
 .row-red:hover td{background:rgba(239,68,68,.18) !important;color:#fff !important}
@@ -3067,6 +3140,7 @@ document.addEventListener('DOMContentLoaded',function(){
 def build_report(scan_dir, target: str, summary: dict = None) -> Path:
     scan_dir = Path(scan_dir)
     ts       = datetime.now().strftime("%Y-%m-%d %H:%M")
+    _RX_VER  = _reconx_version() or "?"
 
     recon    = _parse_recon(scan_dir)
     subs     = _parse_subdomains(scan_dir)
@@ -3128,7 +3202,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 <hr class="nav-hr">
 <div class="sb-hint">
   <kbd>/</kbd> to search &nbsp;·&nbsp; Virtual scroll<br>
-  Professional Edition v8.6
+  Professional Edition v{_RX_VER}
 </div>'''
 
     sections = "".join([
@@ -3199,7 +3273,7 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 <main class="main">
 {sections}
 <div class="footer">
-  ReconX Professional Edition v8.6 &nbsp;&middot;&nbsp; {_e(target)} &nbsp;&middot;&nbsp; {_e(ts)}<br>
+  ReconX Professional Edition v{_RX_VER} &nbsp;&middot;&nbsp; {_e(target)} &nbsp;&middot;&nbsp; {_e(ts)}<br>
   Use only on authorized targets under a valid bug bounty program.
 </div>
 </main>

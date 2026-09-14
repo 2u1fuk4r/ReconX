@@ -754,6 +754,14 @@ def discover_nuclei_templates(cfg_override: str = "") -> str:
     return ""
 
 
+# v8.10: verdicts for the secret candidates stage 10 finds. Optional: a missing
+# or broken reconx_secrets.py leaves the raw candidate list exactly as it was.
+try:
+    import reconx_secrets as _secret_triage
+except Exception:
+    _secret_triage = None
+
+
 # ── Interactive prompt ─────────────────────────────────────────────────────────
 def ask_yes_no(question, default="y"):
     is_yes = default.lower() in ("y", "e", "yes", "evet")
@@ -6356,13 +6364,34 @@ class ReconPipeline:
             deduped_details.append(x)
         details = deduped_details
 
+        # ── triage ───────────────────────────────────────────────────────────
+        # The regexes above answer "does this look like a key?", which on a real
+        # site is mostly noise: a Stripe PUBLISHABLE key, a Google Maps browser
+        # key and a reCAPTCHA site key all belong in client-side JS. Listing
+        # those next to a genuinely leaked AWS key teaches the operator to skip
+        # the section. reconx_secrets classifies each candidate as
+        # REAL / PUBLIC / FALSE / UNKNOWN so the report can lead with the ones
+        # that matter and still show the rest.
+        verdicts = {}
+        if _secret_triage is not None:
+            try:
+                verdicts = _secret_triage.summarise(details)
+            except Exception as _e:
+                warn(f"Secret triage failed ({_e}) — showing the raw candidate list")
+                verdicts = {}
+
         endpoints = list(dict.fromkeys(
             [x["value"] for x in details if x["type"] == "endpoint"]))
         secrets = list(dict.fromkeys(
             [x["value"] for x in details if x["type"] == "secret"]))
+        real_secrets = list(dict.fromkeys(
+            [x["value"] for x in details
+             if x["type"] == "secret" and x.get("verdict") == "REAL"]))
 
         write_lines(d / "endpoints.txt", endpoints)
         write_lines(d / "secrets.txt", secrets)
+        if real_secrets:
+            write_lines(d / "secrets_real.txt", real_secrets)
         (d / "secrets.json").write_text(
             json.dumps(details, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -6370,6 +6399,8 @@ class ReconPipeline:
             "details": details,
             "endpoints": len(endpoints),
             "secrets": len(secrets),
+            "secrets_real": len(real_secrets),
+            "verdicts": verdicts,
             "files": js_urls,
             "files_scanned": completed[0],
             "truncated": truncated or budget_hit[0],
@@ -6378,13 +6409,26 @@ class ReconPipeline:
             "status": "done",
             "endpoints": len(endpoints),
             "secrets": len(secrets),
+            "secrets_real": len(real_secrets),
+            "secret_verdicts": verdicts,
             "js_files": len(js_urls),
             "js_files_scanned": completed[0],
             "truncated": truncated or budget_hit[0],
         }
         elapsed = round(time.time() - start_t, 1)
         ok(f"JS analysis complete ({elapsed}s, {completed[0]:,}/{len(js_urls_scan):,} files) — "
-           f"{len(endpoints):,} endpoints, {len(secrets):,} secrets")
+           f"{len(endpoints):,} endpoints, {len(secrets):,} secret candidates")
+        if verdicts:
+            _r, _u = verdicts.get("REAL", 0), verdicts.get("UNKNOWN", 0)
+            _p, _f = verdicts.get("PUBLIC", 0), verdicts.get("FALSE", 0)
+            if _r:
+                err(f"  {_r} look like REAL credentials → {d / 'secrets_real.txt'}")
+                for _x in details:
+                    if _x.get("verdict") == "REAL":
+                        sub(f"{C.RED}{_x.get('verdict_reason','')}{C.RESET}: "
+                            f"{str(_x.get('value',''))[:60]}  {C.DIM}({_x.get('source_js','')[:70]}){C.RESET}")
+            sub(f"Triage: {_r} real · {_u} unclassified · {_p} public-by-design · "
+                f"{_f} not a credential")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 11 — Teknoloji bazli onceliklendirme
