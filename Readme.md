@@ -3,19 +3,123 @@
 ### Sequential Bug-Bounty Reconnaissance & Vulnerability Pipeline
 
 <p align="center">
-  <img src="docs/reconx-demo.gif" alt="ReconX: scan, interrupt with Ctrl+C, resume from the checkpoint, and open the report" width="100%">
+  <img src="docs/reconx-demo.gif" alt="ReconX local-lab run: terminal stages, then the report" width="100%">
 </p>
 
 <p align="center">
   <sub>
-    One local-lab run: the command, each stage’s result, then the report —
-    dashboard, threat map, XSS, open redirect, JS secrets, Scan Center.<br>
+    One local-lab run: the command, each stage’s result, then the report.<br>
     Numbers are from the harbor.lab session. Not a scan of a third party.
   </sub>
 </p>
 
-The same local lab, with every terminal stage and every report section:
-**[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)**.
+## Report, after the GIF
+
+Same session. Scroll on. Confirmed findings only: risk **84 / CRITICAL** from 12 XSS and 4 open redirects.
+
+### Dashboard
+
+Look here first groups XSS, the open redirect, then JS secrets.
+
+<p align="center"><img src="docs/screens/01-dashboard.png" alt="Dashboard" width="100%"></p>
+
+### Threat Map
+
+`api`, `dev` and `files` are high. `legacy` is alive and quiet.
+
+<p align="center"><img src="docs/screens/02-threat-map.png" alt="Threat Map" width="100%"></p>
+
+### Recon
+
+HTTP 200, `HarborSupply/1.0`, no WAF.
+
+<p align="center"><img src="docs/screens/03-recon.png" alt="Recon" width="100%"></p>
+
+### Subdomains
+
+Five names from `/etc/hosts`. Public resolvers returned none.
+
+<p align="center"><img src="docs/screens/04-subdomains.png" alt="Subdomains" width="100%"></p>
+
+### Alive Hosts
+
+All five answering on port 8088.
+
+<p align="center"><img src="docs/screens/05-alive.png" alt="Alive hosts" width="100%"></p>
+
+### All URLs
+
+84 URLs kept after the 404 prune.
+
+<p align="center"><img src="docs/screens/06-urls.png" alt="All URLs" width="100%"></p>
+
+### Parameters
+
+Parameters already on those URLs. arjun added none.
+
+<p align="center"><img src="docs/screens/07-parameters.png" alt="Parameters" width="100%"></p>
+
+### Categorised
+
+Admin, login, api, sensitive, reflection, XSS targets.
+
+<p align="center"><img src="docs/screens/08-categorised.png" alt="Categorised" width="100%"></p>
+
+### JS Secrets
+
+Lab fixtures planted in the test site, not credentials from a real engagement.
+
+<p align="center"><img src="docs/screens/09-js-secrets.png" alt="JS Secrets" width="100%"></p>
+
+### API Discovery
+
+<p align="center"><img src="docs/screens/10-api.png" alt="API Discovery" width="100%"></p>
+
+### Tech Priority
+
+Five hosts, all medium. This queue does not move the CRITICAL badge.
+
+<p align="center"><img src="docs/screens/11-tech-priority.png" alt="Tech Priority" width="100%"></p>
+
+### Scan Center
+
+XSS, Nuclei, Open Redirect and Network have a result. CORS, takeover and cloud bucket are still Run.
+
+<p align="center"><img src="docs/screens/12-scan-center.png" alt="Scan Center" width="100%"></p>
+
+### Nuclei
+
+0 findings. The pass was interrupted, so empty is not a finished clean scan.
+
+<p align="center"><img src="docs/screens/13-nuclei.png" alt="Nuclei" width="100%"></p>
+
+### XSS
+
+12 findings. 4 dialogs confirmed in a headless replay.
+
+<p align="center"><img src="docs/screens/14-xss.png" alt="XSS" width="100%"></p>
+
+### Open Redirect
+
+4 confirmed. `Location: https://s1ber.com`.
+
+<p align="center"><img src="docs/screens/15-open-redirect.png" alt="Open Redirect" width="100%"></p>
+
+### Extra Checks
+
+CORS, takeover and buckets were not started.
+
+<p align="center"><img src="docs/screens/16-extra-checks.png" alt="Extra Checks" width="100%"></p>
+
+### AI Analysis
+
+Nothing is sent until you press Run AI Analysis.
+
+<p align="center"><img src="docs/screens/17-ai-analysis.png" alt="AI Analysis" width="100%"></p>
+
+Stage-by-stage numbers for this run: **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)**.
+
+---
 
 ReconX is a stage-based, automation-first recon and scanning framework for
 **authorized** bug-bounty and penetration-testing engagements. One command
