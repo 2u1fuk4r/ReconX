@@ -15,7 +15,7 @@
 
 ## Report, after the GIF
 
-Same session. Scroll on. Confirmed findings only: risk **84 / CRITICAL** from 12 XSS and 4 open redirects.
+Same session. Confirmed findings only: risk **84 / CRITICAL** from 12 XSS and 4 open redirects.
 
 ### Dashboard
 
