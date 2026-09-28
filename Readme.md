@@ -15,6 +15,9 @@
   </sub>
 </p>
 
+The same local lab, with every terminal stage and every report section:
+**[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)**.
+
 ReconX is a stage-based, automation-first recon and scanning framework for
 **authorized** bug-bounty and penetration-testing engagements. One command
 takes a domain from zero to an interactive HTML report: subdomains, live
