@@ -8,10 +8,9 @@
 
 <p align="center">
   <sub>
-    One run: recon → live XSS hits → <b>Ctrl+C</b> → <b>--resume</b> picks up from the
-    checkpoint → the interactive report.<br>
-    Walkthrough of the workflow with sample findings, rendered through the real
-    report builder — not a recording of a scan against a live third party.
+    One local-lab run: the command, each stage’s result, then the report —
+    dashboard, threat map, XSS, open redirect, JS secrets, Scan Center.<br>
+    Numbers are from the harbor.lab session. Not a scan of a third party.
   </sub>
 </p>
 
