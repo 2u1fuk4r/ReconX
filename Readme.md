@@ -117,6 +117,37 @@ Nothing is sent until you press Run AI Analysis.
 
 <p align="center"><img src="docs/screens/17-ai-analysis.png" alt="AI Analysis" width="100%"></p>
 
+## Connect your Claude account
+
+The report button never stores a key. Sign in on the machine that runs ReconX. A subscription and API credit are billed separately; either one is enough.
+
+**Claude subscription (Pro, Max, Team, Enterprise).** Install Claude Code, then log in once in the browser. No API credit required.
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+claude auth login
+```
+
+**Anthropic API.** A key with credit, in the environment or in `api_keys.anthropic` inside `config.yaml`. That file is gitignored and is never committed.
+
+```bash
+export ANTHROPIC_API_KEY="your-key"
+```
+
+`ai.backend: auto` (the default) uses the API when a key is set, and falls back to the subscription when the API has no credit.
+
+A finished scan already opens the report with the button live. If you later open `report.html` as a plain file, the button is inert and the page prints this command:
+
+```bash
+python3 reconx_ai.py serve
+```
+
+That starts the local bridge and reopens the latest scan. The report itself prints the same command with the session directory filled in. To pick one by hand:
+
+```bash
+python3 reconx_ai.py serve output/example.com_20260101_120000
+```
+
 Stage-by-stage numbers for this run: **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)**.
 
 ---
