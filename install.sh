@@ -55,7 +55,7 @@ sudo apt-get install -y git curl wget unzip python3-pip python3-venv \
     nmap whatweb golang-go tor >/dev/null 2>&1
 
 # Python bagimliliklari
-python3 -m pip install --break-system-packages pyyaml curl-cffi stem 2>/dev/null \
+python3 -m pip install --break-system-packages pyyaml curl-cffi stem anthropic 2>/dev/null \
   || python3 -m pip install pyyaml stem >/dev/null 2>&1
 
 # Tor — engellenme ALGILANDIGINDA otomatik IP/devre rotasyonu icin (bkz.
@@ -82,6 +82,7 @@ go_need subfinder    "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 go_need nuclei       "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 go_need katana       "github.com/projectdiscovery/katana/cmd/katana"
 go_need dnsx         "github.com/projectdiscovery/dnsx/cmd/dnsx"
+go_need naabu        "github.com/projectdiscovery/naabu/v2/cmd/naabu"
 go_need gau          "github.com/lc/gau/v2/cmd/gau"
 go_need dalfox       "github.com/hahwul/dalfox/v2"
 go_need findomain    "github.com/Findomain/Findomain"
@@ -115,31 +116,6 @@ pipx_need arjun        "arjun"
 # interactsh-client — blind XSS OOB callback (Stage 6). Opsiyonel ama onerilir.
 go_need interactsh-client "github.com/projectdiscovery/interactsh/cmd/interactsh-client"
 
-# v8.8-fix: these three used a BARE "pip install" (no "python3 -m" / no
-# --break-system-packages). On Kali (and any PEP 668 "externally-managed-
-# environment" system) that fails INSTANTLY with "error: externally-managed-
-# environment" — verified directly on a real Kali box — which is exactly why
-# all three silently showed "kurulamadi" for every user on a stock Kali
-# install. pip_install() below matches the same --break-system-packages-
-# then-plain-pip fallback chain already used elsewhere in this script (see
-# pipx_need / the pyyaml+curl-cffi+stem line above).
-pip_install(){
-  python3 -m pip install --break-system-packages "$@" >/dev/null 2>&1 \
-    || python3 -m pip install "$@" >/dev/null 2>&1
-}
-
-# ParamSpider (git clone + pip)
-if ! command -v paramspider >/dev/null 2>&1; then
-  info "Kuruluyor: paramspider"
-  rm -rf /tmp/ParamSpider
-  git clone -q --depth 1 https://github.com/devanshbatham/ParamSpider /tmp/ParamSpider
-  pip_install /tmp/ParamSpider \
-    || (cd /tmp/ParamSpider && pip_install -r requirements.txt && pip_install .) \
-    || warn "paramspider kurulamadi"
-else
-  skip "paramspider"
-fi
-
 # --------------------------------------------------------------------------
 # Nuclei template guncellemesi
 if command -v nuclei >/dev/null 2>&1; then
@@ -154,7 +130,7 @@ fi
 echo
 info "Kurulum tamamlandi. Kurulu araclarin ozeti:"
 for c in httpx subfinder nuclei katana gau dnsx dalfox trufflehog \
-         findomain assetfinder wafw00f arjun paramspider \
+         findomain assetfinder wafw00f arjun \
          nmap whatweb interactsh-client tor; do
   if command -v "$c" >/dev/null 2>&1; then ok "$c"; else warn "$c — YOK"; fi
 done
@@ -168,6 +144,6 @@ echo
 info "Ornek kullanim:"
 echo "  python3 reconX.py -d example.com"
 echo "  python3 reconX.py -u https://example.com  (tek URL)"
-echo "  python3 reconx_web.py                    (web arayuz: http://127.0.0.1:8711)"
 echo "  python3 reconX.py -d example.com --auto   (tam otomatik, tum 13 stage)"
+echo "  python3 reconX.py --doctor               (ortam kontrolu)"
 echo "  python3 reconX.py --help                 (tum secenekler)"

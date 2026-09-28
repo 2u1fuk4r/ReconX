@@ -32,9 +32,9 @@ request.txt
 .idea/
 .vscode/
 
-# web panel log
-reconx_web.log
-
-# web panel runtime state
-output/.webui_stdout.log
-output/.reconx_web_running.json
+# Local-only tooling and clones. Not part of the scanner.
+node_modules/
+.playwright-mcp/
+claude-usage/
+package.json
+package-lock.json

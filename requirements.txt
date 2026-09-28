@@ -13,5 +13,7 @@ stem>=1.8.2            # Tor control-port client (settings.auto_tor block-trigge
 #   pip install selenium && sudo apt install -y chromium chromium-driver
 # selenium>=4.20.0
 
-# Web control panel (reconx_web.py) — optional
-flask>=3.0
+# AI Analysis panel in the report (reconx_ai.py) — optional.
+# Needs an API key too: export ANTHROPIC_API_KEY, or set api_keys.anthropic
+# in config.yaml. Without both, the report still builds; only the button is off.
+anthropic>=1.0

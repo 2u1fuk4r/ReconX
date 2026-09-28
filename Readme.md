@@ -1,4 +1,4 @@
-# 🔍 ReconX v8.9
+# 🔍 ReconX v9.4
 
 ### Sequential Bug-Bounty Reconnaissance & Vulnerability Pipeline
 
@@ -40,7 +40,245 @@ tool is itself the assertion that you have authorization.
 
 ---
 
-## ✨ What's new in v8.9
+## ✨ What's new in v9.4
+
+### The recon stays on the live corpus
+
+A large archive pull is mostly dead URLs. The old prune refused any result
+that dropped more than 70%, and treated that as rate-limiting — so a real
+scan kept **104,971** URLs after httpx had already shown **1,226** of them
+were live. Every later stage then worked on the dead list.
+
+The prune now keeps a high-removal result when the live URLs are spread
+through the list, or when the probe finished far too fast to have been a
+timeout storm. It still discards the result when survivors are piled at the
+start of the file: that is the rate-limit signature.
+
+### Param discovery is arjun
+
+ParamSpider is no longer part of the pipeline. Stage 9 discovers hidden
+parameters with arjun only.
+
+### The report shows the pipeline, and scans stay live
+
+The overview timeline reads `checkpoints/state.json`: each stage is done,
+partial, failed, or still running, with its duration. A default run includes
+XSS and Nuclei. Open redirect, port scan, CORS, takeover and cloud buckets
+stay on the Scan Center, and those runs stream a progress line every 20
+seconds instead of sitting on a blank console.
+
+---
+
+## 🕰️ Earlier — v9.3
+
+### 📺 The AI panel streams — you watch it think
+
+A full review of a large scan runs for ten minutes or more. Before this, the
+panel showed a spinner and an elapsed counter for that whole time, which is
+indistinguishable from a hang — the first thing anyone does is click again or
+give up.
+
+Now the analysis is streamed token by token into a live pane in the report:
+Claude's reasoning in dim italics, the answer as it is written, phase lines in
+between, with a blinking cursor and a running clock. When it finishes the pane
+collapses to `done` and the structured lead list renders underneath.
+
+Under the hood: `claude -p --output-format stream-json --include-partial-messages`
+→ newline-delimited JSON over a chunked POST response → `fetch()` +
+`body.getReader()` in the page. The auth token stays in a header (an
+`EventSource` cannot send one), and a cached result still returns instantly
+without streaming anything.
+
+---
+
+## 🕰️ Earlier — v9.2
+
+### ⏱️ Tools stop getting cut off
+
+A per-tool wall-clock ceiling that is too low doesn't look like an error: the
+tool is killed, the stage carries on, and the report reads *"0 findings"* —
+indistinguishable from a genuinely clean target. The ceilings are now sized for
+real estates:
+
+| | |
+|---|---|
+| nuclei | **6h** — since v9.0 it scans the full live-URL corpus, not a handful of host roots |
+| nuclei DAST | **4h** |
+| nmap · httpx · gau · katana · arjun · dalfox | **3h** each |
+| subfinder · extra checks | **2h** each |
+| whatweb · assetfinder · findomain | **1h** each |
+| whois · login · wafw00f · interactsh handshake | 5m / 3m / 15m / 1m |
+
+Those last four stay short on purpose. They are single request/response
+exchanges: they answer in seconds or they are broken, and a 3-hour ceiling on a
+broken one just hangs the stage for 3 hours before reaching the same
+conclusion.
+
+**Every value is now tunable from `config.yaml`** under `timeouts:`, no code
+edit needed. `--doctor` prints the effective table and marks anything you
+overrode, so you can always tell a quiet target from a truncated scan:
+
+```yaml
+timeouts:
+  katana: 14400      # 4h on this engagement
+  nuclei: 28800      # 8h
+```
+
+**The internal budgets were raised to match, which is the part that actually
+bit.** Several stages carry their own soft budget that caps the tool *below*
+its wall-clock ceiling — dalfox's was 40 minutes, so raising its ceiling to 3h
+alone would have changed nothing. Now: `dalfox_time_budget_sec` 40m → **3h**,
+`xss_verify_budget_sec` 15m → **1h**, `js_secrets_budget_sec` 4m → **30m**,
+`arjun_timeout_per_host` 3m → **10m**.
+
+Two limits still apply on top and are unaffected: `--max-time`, the global
+budget for the whole scan, and the stall watchdog, which stops a tool that has
+printed *nothing* for N seconds however much of its ceiling is left. That
+watchdog is what makes a 6-hour nuclei ceiling safe rather than reckless.
+
+---
+
+## 🕰️ Earlier — v9.1
+
+### ✨ AI Analysis — Claude reviews the whole scan
+
+When a scan finishes the report opens with an **AI Analysis** panel. One click
+and Claude reads *every* stage's output at once — alive hosts, the full URL
+corpus, nuclei and DAST findings, XSS candidates, JS secrets, tech
+fingerprints, CORS/takeover/bucket results — and returns a ranked list of
+**leads**: what to test, the exact command to test it with, what result proves
+it, and what would make it a false positive.
+
+It is an analyst, not a scanner. It finds the connections between stages that
+no single stage can report — the exposed actuator on the same host as the
+admin panel the crawl found, the parameter that appears on 40 endpoints, the
+leaked key class that matches the bucket already flagged open.
+
+```bash
+python3 reconX.py -d example.com     # scan → the report opens with the button already live
+python3 reconx_ai.py serve           # re-open the LAST scan with the button (no path needed)
+python3 reconx_ai.py analyze         # one-shot review, straight to the terminal
+python3 reconx_ai.py evidence        # see exactly what would be sent — no API call, no cost
+python3 reconx_ai.py prompt          # same review WITHOUT the API — see below
+```
+
+### Two backends — no API credit needed
+
+**A Claude Pro/Max subscription and the Anthropic API are billed separately.**
+The subscription funds claude.ai and Claude Code; the API is prepaid credit
+bought in the Console. An account can hold a perfectly valid API key and still
+get `400 credit balance is too low`.
+
+So ReconX has two backends, and `ai.backend: auto` (the default) picks one for
+you:
+
+| backend | runs on | needs |
+|---|---|---|
+| `api` | Anthropic API | an API key **with credit** |
+| `cli` | `claude -p` — **your Claude subscription** | Claude Code installed |
+| `auto` | the API if a key is set, **falling back to the CLI when the API has no credit** | either |
+
+That fallback is the point: "valid key, empty balance" is only discoverable by
+making the call, so `auto` makes it, notices, and retries through the
+subscription in the same run. **The in-report button works on either** — the
+bridge dispatches the same way.
+
+The CLI backend runs with every tool denied (`Bash`, `WebFetch`, `WebSearch`,
+file tools, subagents) and with `ANTHROPIC_API_KEY` stripped from its
+environment, so it can neither touch the target nor silently fall back to the
+out-of-credit API. It gets the same system prompt and the same
+`--json-schema`, so the result is identical in shape to the API's.
+
+Prefer to drive it yourself? `prompt` writes the whole thing — system prompt,
+evidence pack, task — to one self-contained file, with no API call and nothing
+billed:
+
+```bash
+python3 reconx_ai.py prompt
+claude "$(cat output/<dir>/ai_prompt.md)"
+```
+
+or open Claude Code in the scan folder and say *"read ai_prompt.md and follow
+it"*, or paste the file into claude.ai.
+
+Every subcommand takes an optional session directory; omit it and the most
+recent scan under `output/` is used.
+
+**Cheap by construction.** A finished scan is far too large to send raw, so the
+evidence pack compacts it first:
+
+| | |
+|---|---|
+| URLs | grouped as `(host, path-shape, param-names)` with a count and one example — `?id=1`, `?id=2`, `?id=3` and `/post/1`, `/post/2` are one testable surface, not five |
+| Nuclei | grouped by template-id with severity, CVE/CWE, tags and 3 example locations — 900 hits of one template is one row |
+| Parameters | a name histogram: a few hundred bytes, and the best single input for "where would IDOR/SSRF/LFI live here" |
+| Secrets | class + length + first/last characters. **Never the value** — the pack leaves your machine |
+| Truncation | every capped section records its real total, so the model says "you have 12,000 URLs, I saw 350 shapes" instead of reasoning as if the view were complete |
+
+Measured on a real 28 MB scan of a 21,663-subdomain estate: **a 59 KB evidence
+pack**. The system prompt and the pack are cached prompt prefixes, so follow-up
+questions ("expand lead #2", "what did the scan miss on `api.*`?") re-read
+~39 KB at roughly a tenth of the input cost instead of paying for it again.
+
+**The API key never touches the HTML.** A report gets shared; a key baked into
+it would travel along. Instead `reconx_ai.py` serves the report from
+`127.0.0.1` and keeps the key in its own process — same origin, no CORS, and a
+per-run token that only ever exists in the served copy. Opened later as a plain
+file, the report still shows everything the last run produced; only the button
+is inert, and it tells you the command to bring it back.
+
+Configure under `ai:` in `config.yaml` (model, effort, redaction, bridge idle
+timeout). `--no-ai` skips the bridge for one run.
+
+Needs `pip install anthropic` plus a key — `api_keys.anthropic` in
+`config.yaml` (which is gitignored) or `ANTHROPIC_API_KEY` in the environment.
+`--doctor` reports exactly which half is missing. Without them the report is
+unaffected; only the button is inert.
+
+> Everything the panel outputs is an **unverified lead**. Nothing is tested
+> against the target — ReconX collects, it does not exploit. Verify before you
+> report.
+
+---
+
+## 🕰️ Earlier — v9.0
+
+- **Nuclei now scans every live URL, not just the alive host roots.** Stage 7
+  used to hand nuclei a list of `https://host/` and nothing else, so any
+  template that matches on a *path* — an exposed `/.git/config`, an open
+  `/actuator/env`, a `/wp-json/` endpoint, a parameterised injection point —
+  could only ever fire if that path happened to be the site root. Everything
+  the crawl stages had just proven to be live was discarded before the scan.
+  The target list is now stage 4's pruned live-URL corpus + the categorised
+  parameterised URLs + any authenticated URLs, fed to nuclei as one `-l` file.
+  Two guards keep it bounded:
+  - **shape dedup** — `?id=1`, `?id=2`, `?id=3` and `/post/1`, `/post/2` are
+    the same template surface, so one representative per
+    `(scheme, host, path-shape, param-names)` is kept (`nuclei_dedup_url_shapes`);
+  - **a priority cap** — `nuclei_max_targets` (default 0, no cap) trims plain path
+    URLs first; host roots and parameterised URLs always survive it.
+- **CLI only.** The Flask web panel (`reconx_web.py`, `start-web.sh`) is gone
+  along with its dependency. One entry point: `reconX.py`.
+- **No more orphaned scanners.** Every external tool is started in its own
+  process group and stopped with a group-wide SIGTERM→SIGKILL. A timeout, a
+  stall watchdog or a Ctrl+C used to kill only the `/bin/sh` wrapper and leave
+  nuclei/dalfox/katana running — still hitting the target, invisible to the
+  pipeline that believed it had stopped them.
+- **Atomic checkpoint writes.** `checkpoints/*.txt` is the resume contract; a
+  Ctrl+C landing mid-write used to leave a truncated list that the next
+  `--resume` trusted, silently shrinking the URL corpus with no error anywhere.
+  Written via temp file + `os.replace` now.
+- **Smaller, faster nuclei output.** `-or`/`-ot` drop the raw request/response
+  pair and the encoded template body from the JSONL (nothing downstream ever
+  read them), `-nh` skips nuclei's own httpx pre-probe since every target is
+  already a full URL, and `-retries`/`-mhe`/`-ss` are wired to config.
+- `tools.nuclei_retries` was read from config but never passed to nuclei —
+  fixed. The main pass and the adaptive re-run now share one argv builder, so a
+  flag can no longer reach one and silently miss the other.
+
+---
+
+## 🕰️ Earlier — v8.9
 
 - **Stage checkpointing & resume** — every stage transition is flushed to
   `checkpoints/state.json` (atomically), so Ctrl+C, SIGTERM, a crash or the
@@ -68,7 +306,7 @@ tool is itself the assertion that you have authorization.
 
 ---
 
-## 🕰️ Earlier — v8.x
+## 🕰️ Earlier — v8.x (continued)
 
 - **Nuclei DAST pass** (`-dast`) — after the normal template scan, every
   parameterised URL is fuzzed for reflected/stored XSS, error- and time-based
@@ -102,13 +340,14 @@ tool is itself the assertion that you have authorization.
 | 4 | URL Discovery | gau (wayback/commoncrawl/otx/urlscan) + katana (+ dead-URL pruning) |
 | 5 | Categorisation | reflection detection, XSS-target prioritisation, param extraction |
 | 6 | XSS | Dalfox (standard + DOM mining + custom payloads + blind/interactsh) |
-| 7 | Nuclei | template scan (tech fastpass + severity filter) **+ DAST fuzzing pass** |
+| 7 | Nuclei | **template scan over every live URL** (tech fastpass + severity filter) **+ DAST fuzzing pass** |
 | 8 | Authenticated Crawl | re-crawl behind a logged-in session (if `--login`/`--cookie`) |
-| 9 | Param Discovery | paramspider + arjun (hidden parameters) |
+| 9 | Param Discovery | arjun (hidden parameters) |
 | 10 | JS Secrets | download + scan JS for keys/tokens/endpoints (trufflehog + regex) |
 | 11 | Tech Priority | normalise detected tech → risk-ranked summary |
 | 12 | Extra Checks | CORS misconfig, subdomain takeover, open cloud buckets |
 | 13 | API Discovery | GraphQL / Swagger / OpenAPI pattern match **+ live probe** |
+| ✦ | **AI Analysis** | Claude correlates every stage above into ranked, verifiable leads |
 
 ---
 
@@ -130,7 +369,7 @@ environment instead (`RECONX_CENSYS_KEY`, …).
 
 External tools used (installed by `install.sh`): `httpx`, `subfinder`,
 `assetfinder`, `findomain`, `dnsx`, `nuclei` (+ templates), `katana`, `gau`,
-`dalfox`, `arjun`, `paramspider`, `interactsh-client`, `trufflehog`, `nmap`,
+`dalfox`, `arjun`, `interactsh-client`, `trufflehog`, `nmap`,
 `whatweb`, `wafw00f`, `tor`.
 
 Run `python3 reconX.py --doctor` at any time to see which of them are present
@@ -144,21 +383,6 @@ fires). Uses Selenium against the system Chromium/Chrome:
 python3 -m pip install --break-system-packages selenium
 sudo apt install -y chromium chromium-driver     # or: chromedriver
 ```
-
----
-
-## 🖥️ Web control panel
-
-```bash
-python3 reconx_web.py            # http://127.0.0.1:8711
-# or, keep it running in the background:
-./start-web.sh                   # sudo ./start-web.sh for SYN nmap scans
-```
-
-Start / Stop / Pause / Resume scans from the browser, watch the log live,
-pick individual stages, fill the auth fields, browse past scans and open their
-reports, edit `config.yaml`, check which tools are installed. One scan at a
-time. Flask only.
 
 ---
 
@@ -221,11 +445,11 @@ settings:
   prune_dead_urls: true
 
 tools:
-  nuclei_severity: critical,high,medium
+  nuclei_severity: critical,high,medium,low
   nuclei_dast: true            # Stage 7 DAST fuzzing pass
   dalfox_custom_payload: ""    # "" = dalfox built-ins only (default, ~5x faster)
   blind_xss_auto: true         # auto-provision an interactsh OOB callback
-  dalfox_max_targets: 40       # hard cap on the dalfox target list
+  dalfox_max_targets: 0        # 0 = no cap; per-URL timeout still applies
   dalfox_time_budget_sec: 1500 # per-stage wall-clock budget for dalfox
 ```
 
@@ -274,7 +498,7 @@ Ctrl+C opens a menu instead of killing the run:
 | 2 | Skip only the running tool — the rest of the stage carries on |
 | 3 | Stop the tool — checkpoint everything and write a report |
 
-With no TTY (cron, the web panel, a pipe) a `SIGINT`/`SIGTERM` behaves as
+With no TTY (cron, a pipe) a `SIGINT`/`SIGTERM` behaves as
 choice 3. Either way the state file is current, so:
 
 ```bash

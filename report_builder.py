@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-import json, re, html
+import json, re, html, shlex
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, parse_qsl
@@ -308,7 +308,7 @@ def _risk_level_from_severity(sev_counts: dict) -> tuple:
 # itself catches the payload actually firing — see capture_xss_alert_
 # screenshots()'s confirmed_upgrade in reconx.py. Kept distinguishable from
 # dalfox's own "V" so the report is honest about who did the confirming.
-_DALFOX_TYPE_LABELS = {"V": "Verified (headless)", "R": "Reflected", "G": "Grep match",
+_DALFOX_TYPE_LABELS = {"V": "Verified (scanner)", "R": "Reflected", "G": "Grep match",
                         "RV": "Verified (ReconX replay)"}
 
 def _xss_rec(rec):
@@ -445,7 +445,7 @@ def _parse_xss(d) -> dict:
 
     def _params_of(u: str) -> set:
         try:
-            return {k for k, _ in parse_qsl(urlparse(u).query)}
+            return {k.lower() for k, _ in parse_qsl(urlparse(u).query) if k}
         except Exception:
             return set()
 
@@ -459,13 +459,19 @@ def _parse_xss(d) -> dict:
         hits_by_path.setdefault(_path_key(f.get("url", "")), []).append(f)
 
     _V = (_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"])
+    finished_set = set(_lines(xdir / "xss_targets_finished.txt"))
+    incomplete_set = set(_lines(xdir / "xss_targets_incomplete.txt"))
+    coverage_known = ((xdir / "xss_targets_finished.txt").exists()
+                      or (xdir / "xss_targets_incomplete.txt").exists())
+    scan_cut = bool(meta.get("interrupted") or meta.get("budget_hit")
+                    or meta.get("status") == "partial")
     tested = []
     for u in tested_urls:
         key = _path_key(u)
         u_params = _params_of(u)
         hits = []
         for f in hits_by_path.get(key, []):
-            fp = f.get("param") or ""
+            fp = (f.get("param") or "").lower()
             f_params = _params_of(f.get("url", ""))
             if not fp:
                 # v8.7-fix: no injected param on this finding (path/DOM hit) —
@@ -498,9 +504,22 @@ def _parse_xss(d) -> dict:
                 pocs.append({"poc_url": pu, "payload": h.get("payload", ""),
                              "param": h.get("param", ""), "type": h.get("type", ""),
                              "confirmed": h.get("type", "") in _V})
+        if hits:
+            coverage = "vulnerable"
+        elif u in finished_set:
+            coverage = "clean"
+        elif u in incomplete_set:
+            coverage = "incomplete"
+        elif coverage_known or scan_cut:
+            # No sidecar from an older run, or this URL was never started.
+            # A stopped scan must not paint the remainder green.
+            coverage = "not_scanned"
+        else:
+            coverage = "clean"
         tested.append({
             "url": u,
             "vulnerable": bool(hits),
+            "coverage": coverage,
             "confirmed": any(p["confirmed"] for p in pocs),
             "payloads": [h.get("payload", "") for h in hits],
             "pocs": pocs,
@@ -654,7 +673,7 @@ def _host_of(u: str) -> str:
         return ""
 
 
-def _build_vuln_map(nuc: dict, xss: dict, extra: dict) -> dict:
+def _build_vuln_map(nuc: dict, xss: dict, extra: dict, oredir: dict = None) -> dict:
     """Nuclei/XSS/Extra-checks bulgularini hostname'e gore birlestirip Threat Map'in
     zafiyet katmanini besler (high/medium/low/info + kumulatif sayim)."""
     order = {"high": 4, "medium": 3, "low": 2, "info": 1, "none": 0}
@@ -682,6 +701,8 @@ def _build_vuln_map(nuc: dict, xss: dict, extra: dict) -> dict:
     for r in (extra.get("buckets") or []):
         if r.get("public_listing"):
             _bump(_host_of(r.get("url", "")), "medium")
+    for f in ((oredir or {}).get("findings") or []):
+        _bump(_host_of(f.get("url") or f.get("test_url") or ""), "medium")
     return vmap
 
 
@@ -853,9 +874,259 @@ def _tabs(items: list, prefix: str) -> str:
 
 # ── Stat helpers ───────────────────────────────────────────────────────────────
 # ── Section: Overview ─────────────────────────────────────────────────────────
+def _fmt_dur(sec) -> str:
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return ""
+    if sec < 0:
+        return ""
+    if sec < 90:
+        return f"{sec:.0f}s"
+    minutes = int(sec // 60)
+    if minutes < 90:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _pipeline_timeline(scan_dir) -> str:
+    """Stage strip driven by checkpoints/state.json — status and duration,
+    not just 'this folder has a file'."""
+    steps = [
+        (1, "Recon", "🔍"), (2, "Subs", "🌐"), (3, "Alive", "💻"),
+        (4, "URLs", "🔗"), (5, "Sort", "📂"), (6, "XSS", "💥"),
+        (7, "Nuclei", "🧨"), (9, "Params", "⚙️"),
+        (10, "JS", "🔑"), (11, "Tech", "🧩"), (13, "API", "⚡"),
+    ]
+    stages = {}
+    try:
+        p = Path(scan_dir) / "checkpoints" / "state.json"
+        if p.exists():
+            data = json.loads(p.read_text(errors="ignore")) or {}
+            stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+    except Exception:
+        stages = {}
+    cls_for = {
+        "done": "tl-done", "partial": "tl-partial", "failed": "tl-fail",
+        "running": "tl-run", "skipped": "tl-skip",
+    }
+    tl = '<div class="timeline">'
+    for num, lbl, icon in steps:
+        rec = stages.get(str(num)) if isinstance(stages.get(str(num)), dict) else {}
+        status = str(rec.get("status") or "")
+        cls = cls_for.get(status, "tl-skip")
+        dur = _fmt_dur(rec.get("duration_sec"))
+        if status == "skipped":
+            dur = "skip"
+        elif status == "running":
+            dur = dur or "live"
+        tl += (f'<div class="tl-step {cls}"><div class="tl-dot">{icon}</div>'
+               f'<div class="tl-lbl">{_e(lbl)}</div>'
+               f'<div class="tl-dur">{_e(dur)}</div></div>')
+    tl += "</div>"
+    return tl
+
+
+def _retest_btn(url: str) -> str:
+    if not url:
+        return ""
+    return (f'<button class="btn-sm" type="button" data-retest="{_e(url)}" '
+            f'onclick="rxRetest(this)">Recheck</button>')
+
+
+def _priority_where(url: str, extra: str = "") -> str:
+    bits = []
+    if url:
+        bits.append(f'<span style="font-family:var(--mono);word-break:break-all">{_e(url)}</span>')
+    if extra:
+        bits.append(f'<span style="color:var(--muted)">{_e(extra)}</span>')
+    if not bits:
+        return '<span style="color:var(--muted)">see section</span>'
+    return " ".join(bits)
+
+
+def _priority_row(sev: str, title: str, url: str, section: str, extra: str = "") -> str:
+    return (
+        '<tr>'
+        f'<td style="padding:7px 10px">{_badge(sev.upper(), {"critical":"red","high":"red","medium":"orange","low":"yellow","info":"gray"}.get(sev,"gray"))}</td>'
+        f'<td style="padding:7px 10px;color:var(--text)">{_e(title)}</td>'
+        f'<td style="padding:7px 10px">{_priority_where(url, extra)}</td>'
+        f'<td style="padding:7px 10px">{_retest_btn(url)}</td>'
+        '</tr>')
+
+
+def _priority_group(icon: str, title: str, section: str, rows: list, cap: int = 8) -> str:
+    """One category block. The same finding copied onto every vhost stays one
+    row, and a long JS list cannot push XSS off the panel."""
+    if not rows:
+        return ""
+    shown, rest = rows[:cap], rows[cap:]
+    head = (
+        '<tr><td colspan="4" style="padding:12px 10px 4px">'
+        f'<a style="cursor:pointer;color:var(--text);font-weight:700;text-decoration:none" '
+        f'onclick="showSection(\'{section}\')">{icon} {_e(title)}</a>'
+        f'<span class="nav-cnt" style="margin-left:8px">{len(rows)}</span>'
+        '</td></tr>')
+    more = ""
+    if rest:
+        more = (
+            '<tr><td colspan="4" style="padding:2px 10px 8px;font-size:12px;color:var(--muted)">'
+            f'<a style="cursor:pointer;color:var(--accent2,#8ab4ff)" '
+            f'onclick="showSection(\'{section}\')">{len(rest):,} more in this section</a>'
+            '</td></tr>')
+    return head + "".join(shown) + more
+
+
+def _priority_panel(nuc, xss, oredir, js) -> str:
+    """Grouped short list. Each category is its own block, and a secret that
+    shows up in four copies of the same file is one row — not four."""
+    blocks = []
+
+    nuc_rows = []
+    groups = {}
+    for f in (nuc or {}).get("findings") or []:
+        sev = str(f.get("severity") or "info").lower()
+        key = (sev, f.get("template") or f.get("name") or "", f.get("source") or "template")
+        g = groups.setdefault(key, {"n": 0, "url": "", "name": f.get("name") or key[1]})
+        g["n"] += 1
+        if not g["url"]:
+            g["url"] = f.get("matched_at") or ""
+    for (sev, _tpl, src), g in sorted(groups.items(), key=lambda kv: ({"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(kv[0][0], 9), kv[0][1])):
+        label = g["name"] or _tpl or "template"
+        if src == "dast":
+            label = f"{label} · DAST"
+        extra = f"{g['n']} URLs" if g["n"] > 1 else ""
+        nuc_rows.append(_priority_row(sev, label, g["url"], "nuclei", extra))
+    blocks.append(_priority_group("🧨", "Nuclei", "nuclei", nuc_rows))
+
+    verified = {_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"]}
+    xss_g = {}
+    for f in (xss or {}).get("findings") or []:
+        url = f.get("url") or ""
+        param = f.get("param") or ""
+        typ = f.get("type") or "XSS"
+        try:
+            path = urlparse(url).path or "/"
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            path, host = "/", ""
+        g = xss_g.setdefault((typ, param, path), {"url": url, "hosts": set(), "type": typ, "param": param, "path": path})
+        if host:
+            g["hosts"].add(host)
+        if not g["url"]:
+            g["url"] = url
+    xss_rows = []
+    for g in sorted(xss_g.values(), key=lambda x: (0 if x["type"] in verified else 1, x["path"], x["param"])):
+        sev = "high" if g["type"] in verified else "medium"
+        title = g["type"] or "XSS"
+        if g["param"]:
+            title = f"{title} · {g['param']}"
+        if g["path"] and g["path"] != "/":
+            title = f"{title} · {g['path']}"
+        n_hosts = len(g["hosts"])
+        extra = f"{n_hosts} hosts" if n_hosts > 1 else ""
+        xss_rows.append(_priority_row(sev, title, g["url"], "xss", extra))
+    blocks.append(_priority_group("💥", "XSS", "xss", xss_rows))
+
+    redir_g = {}
+    for f in (oredir or {}).get("findings") or []:
+        url = f.get("test_url") or f.get("url") or ""
+        param = f.get("param") or "redirect"
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+        g = redir_g.setdefault(param, {"url": url, "hosts": set(), "param": param})
+        if host:
+            g["hosts"].add(host)
+        if not g["url"]:
+            g["url"] = url
+    redir_rows = []
+    for g in redir_g.values():
+        n_hosts = len(g["hosts"])
+        extra = f"{n_hosts} hosts" if n_hosts > 1 else ""
+        redir_rows.append(_priority_row("high", g["param"], g["url"], "openredirect", extra))
+    blocks.append(_priority_group("↪️", "Open redirect", "openredirect", redir_rows))
+
+    secret_g = {}
+    for d in (js or {}).get("detail") or []:
+        if not isinstance(d, dict) or d.get("type") != "secret":
+            continue
+        if d.get("verdict") not in ("REAL", "UNKNOWN"):
+            continue
+        value = str(d.get("value") or "")
+        reason = str(d.get("verdict_reason") or d.get("name") or d.get("rule") or d.get("verdict") or "secret")
+        g = secret_g.setdefault(value or reason, {
+            "verdict": d.get("verdict") or "",
+            "reason": reason,
+            "files": set(),
+        })
+        src = str(d.get("source_js") or "")
+        if src:
+            g["files"].add(src)
+    js_rows = []
+    ordered = sorted(secret_g.values(), key=lambda x: (0 if x["verdict"] == "REAL" else 1, x["reason"]))
+    for g in ordered:
+        sev = "high" if g["verdict"] == "REAL" else "low"
+        files = sorted(g["files"])
+        where = files[0] if len(files) == 1 else ""
+        extra = f"{len(files)} files" if len(files) > 1 else ""
+        js_rows.append(_priority_row(sev, g["reason"], where, "js", extra))
+    blocks.append(_priority_group("🔑", "JS secrets", "js", js_rows, cap=12))
+
+    blocks = [b for b in blocks if b]
+    if not blocks:
+        return ""
+    n_findings = len(nuc_rows) + len(xss_rows) + len(redir_rows) + len(js_rows)
+    return (
+        '<div class="panel" style="margin-bottom:16px">'
+        '<div class="panel-header"><span class="panel-icon">🎯</span>'
+        f'<h3>Look here first</h3><span style="margin-left:auto;color:var(--muted);font-size:12px">'
+        f'{n_findings:,}</span></div>'
+        '<div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        '<thead><tr style="text-align:left;color:var(--muted)">'
+        '<th style="padding:7px 10px">Severity</th>'
+        '<th style="padding:7px 10px">Finding</th><th style="padding:7px 10px">Where</th>'
+        '<th style="padding:7px 10px"></th></tr></thead>'
+        f'<tbody>{"".join(blocks)}</tbody></table></div></div>')
+
+
+def _coverage_note(smry) -> str:
+    stages = (smry or {}).get("stages") or {}
+    bits = []
+    targets = (stages.get("stage7") or {}).get("targets") or {}
+    if targets.get("capped"):
+        bits.append(f"Nuclei left out {int(targets['capped']):,} path URLs because a target cap was set")
+    dropped = int(targets.get("shape_deduped") or 0)
+    if dropped:
+        bits.append(f"{dropped:,} URLs collapsed as the same shape (?id=1 and ?id=2)")
+    inc = int((stages.get("stage6") or {}).get("targets_incomplete") or 0)
+    if inc:
+        bits.append(f"{inc:,} XSS URLs did not finish — they are not clean")
+    if not bits:
+        return ""
+    return ('<div class="info-banner info-orange" style="margin-bottom:16px"><span>'
+            + " &nbsp;·&nbsp; ".join(_e(b) for b in bits) + "</span></div>")
+
+
 def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
-                      nuc=None, xss=None, js=None, tech=None, extra=None):
+                      nuc=None, xss=None, js=None, tech=None, extra=None,
+                      scan_dir=None, oredir=None):
     nuc = nuc or {}; xss = xss or {}; tech = tech or []; extra = extra or {}
+    # One host is often stored twice (http and https). Technology priority is
+    # a queue of places to look, not a confirmed issue.
+    tech_high_hosts = set()
+    for _t in tech:
+        if _t.get("risk_label") != "high":
+            continue
+        try:
+            _host = (urlparse(_t.get("url") or "").hostname or "").lower()
+        except Exception:
+            _host = ""
+        if _host:
+            tech_high_hosts.add(_host)
+    tech_high_n = len(tech_high_hosts)
     sc_n    = len(subs["all"])
     alive_n = len(alive)
     url_n   = len(urls.get("_all", []))
@@ -899,10 +1170,8 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
         extra_stats.append(_stat(len(xss["findings"]), "XSS Findings", "orange", "💥"))
     if js and js.get("secrets"):
         extra_stats.append(_stat(len(js["secrets"]), "JS Secrets", "purple", "🔑"))
-    if tech:
-        high = sum(1 for t in tech if t.get("risk_label") == "high")
-        if high:
-            extra_stats.append(_stat(high, "Tech High-Risk", "orange", "⚙️"))
+    if tech_high_n:
+        extra_stats.append(_stat(tech_high_n, "Tech Priority", "gray", "⚙️"))
     if extra:
         _extra_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
@@ -950,8 +1219,8 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
     # Default True so reports from older scans (no "resume" block) stay green.
     incomplete  = not bool(resume_meta.get("completed", True))
     done_stages = list(resume_meta.get("completed_stages") or [])
-    state_badge = (_badge("SCAN INCOMPLETE", "orange") if incomplete
-                   else _badge("RECON COMPLETE", "green"))
+    state_badge = (_badge("STOPPED EARLY", "orange") if incomplete
+                   else _badge("SCAN COMPLETE", "green"))
     resume_html = ""
     if incomplete:
         reason = _e(str(resume_meta.get("interrupt_reason") or "interrupted"))
@@ -988,35 +1257,7 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
                          f'<span>📈 Delta vs previous scan{base}: '
                          + " &nbsp;·&nbsp; ".join(bits) + '</span></div>')
 
-    stages_tl = [
-        ("Recon",      bool(recon["whois"] or recon["nmap"]), "🔍"),
-        ("Subdomains", bool(subs["all"]),                     "🌐"),
-        ("Alive",      bool(alive),                           "💻"),
-        ("URLs",       bool(url_n),                           "🔗"),
-        ("Categorise", bool(par_n or refl_n),                 "📂"),
-    ]
-    tl = '<div class="timeline">'
-    for lbl, done, icon in stages_tl:
-        cls = "tl-done" if done else "tl-skip"
-        tl += (f'<div class="tl-step {cls}"><div class="tl-dot">{icon}</div>'
-               f'<div class="tl-lbl">{_e(lbl)}</div></div>')
-    tl += "</div>"
-
-    # URL kaynak bar chart
-    src_max = max(src_counts.values()) if any(src_counts.values()) else 1
-    src_colors = {"gau":"#fb923c","wayback":"#60a5fa","katana":"#4ade80","hakrawler":"#c084fc",
-                  "gospider":"#facc15","commoncrawl":"#22d3ee","urlscan":"#f472b6","otx":"#f87171"}
-    src_bars = ""
-    for k, v in sorted(src_counts.items(), key=lambda x: -x[1]):
-        if v == 0: continue
-        pct = max(4, int(v / src_max * 100))
-        col = src_colors.get(k, "#60a5fa")
-        src_bars += (f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
-                     f'<div style="width:90px;font-size:12px;color:var(--muted);text-align:right">{_e(k)}</div>'
-                     f'<div style="flex:1;background:var(--surface3);border-radius:4px;height:14px;overflow:hidden">'
-                     f'<div style="width:{pct}%;background:{col};height:100%;border-radius:4px;opacity:.85"></div></div>'
-                     f'<div style="width:52px;font-size:12px;font-family:var(--mono);color:var(--text-dim);text-align:right">{v:,}</div>'
-                     f'</div>')
+    tl = _pipeline_timeline(scan_dir) if scan_dir else ""
 
     # URL kategori bar chart
     cat_data = {
@@ -1065,7 +1306,8 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
 
     # ── v6.13+: Executive risk summary — Nuclei + XSS + Extra-checks + Tech ─────
     sev = nuc.get("severity_counts", {}) if nuc else {}
-    crit_n = int(sev.get("critical", 0)); high_n = int(sev.get("high", 0)); med_n = int(sev.get("medium", 0))
+    crit_n = int(sev.get("critical", 0)); high_n = int(sev.get("high", 0))
+    med_n = int(sev.get("medium", 0)); low_n = int(sev.get("low", 0))
     # v8.6-fix: the score used the RAW dalfox finding count for XSS — one
     # reflected search box that echoes 20 payloads counted as 20 * 5 = 100,
     # which alone pushed a Medium-at-most site to "410 CRITICAL". Score the
@@ -1082,13 +1324,16 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
             pass
     xss_point_n = max(len(_xss_points), 1 if _xf else 0) - xss_verified_n
     xss_n = len(_xf)
-    tech_high_n = sum(1 for t in tech if t.get("risk_label") == "high") if tech else 0
     extra_vuln_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("buckets", []) if r.get("public_listing")))
+    oredir_n = len((oredir or {}).get("findings") or [])
+    # Confirmed findings only. A technology fingerprint (Azure Front Door,
+    # CloudFront, PHP) used to add 2 points per host, so a clean Lenovo scan
+    # with ~70 such hosts scored 260 and the dashboard said CRITICAL.
     risk_score = (crit_n*10 + high_n*6 + med_n*3
                   + xss_verified_n*6 + max(0, xss_point_n)*2
-                  + extra_vuln_n*7 + tech_high_n*2)
+                  + extra_vuln_n*7 + oredir_n*6)
     if risk_score >= 40:
         risk_lvl, risk_col, risk_bg = "CRITICAL", "#dc2626", "rgba(220,38,38,.12)"
     elif risk_score >= 20:
@@ -1123,9 +1368,10 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
       <strong style="color:{risk_col}">{_e(risk_lvl)}</strong>
       <span class="risk-pct">&nbsp;&middot; risk score {risk_score} / 60+</span>
       <div style="font-size:12px;color:var(--muted);margin-top:4px">
-        Nuclei: {crit_n} critical &middot; {high_n} high &middot; {med_n} medium &nbsp;|&nbsp;
+        Nuclei: {crit_n} critical &middot; {high_n} high &middot; {med_n} medium &middot; {low_n} low &nbsp;|&nbsp;
         XSS: {xss_n} &nbsp;|&nbsp; CORS/Takeover/Bucket: {extra_vuln_n} &nbsp;|&nbsp;
-        High-risk technology: {tech_high_n} host(s)
+        Open redirect: {oredir_n}
+        {f' &nbsp;|&nbsp; Tech priority: {tech_high_n} host(s) — not a finding' if tech_high_n else ''}
       </div>
     </div>
   </div>
@@ -1146,17 +1392,13 @@ def _section_overview(target, ts, recon, subs, alive, urls, smry_json,
   {resume_html}
   {diff_html}
   {adapt_html}
+  {_coverage_note(smry_json)}
+  {_priority_panel(nuc, xss, oredir, js)}
   <div class="stat-grid">{stats_html}</div>
 
-  <div class="two-col" style="margin-top:20px">
-    <div class="panel">
-      <div class="panel-header"><span class="panel-icon">🚀</span><h3>Pipeline Status</h3></div>
-      {tl}
-    </div>
-    <div class="panel">
-      <div class="panel-header"><span class="panel-icon">📡</span><h3>URL Sources</h3></div>
-      <div style="margin-top:14px">{src_bars if src_bars else "<div style='color:var(--muted);font-size:13px'>No URL source data yet</div>"}</div>
-    </div>
+  <div class="panel panel-pipeline" style="margin-top:20px">
+    <div class="panel-header"><span class="panel-icon">🚀</span><h3>Pipeline Status</h3></div>
+    {tl}
   </div>
 
   <div class="two-col" style="margin-top:14px">
@@ -1329,20 +1571,23 @@ def _section_urls(urls, prune=None):
         note = (f'<div class="info-banner info-orange" style="margin-bottom:14px">'
                 f'<span>⚠ Dead-URL pruning was <strong>discarded</strong>: it reported '
                 f'{prune.get("removed",0):,} of {prune.get("before",0):,} URLs '
-                f'({prune.get("removed_pct",0)}%) as dead, which is far more than a real '
-                f'corpus loses — the target most likely rate-limited the liveness probe. '
+                f'({prune.get("removed_pct",0)}%) as dead. '
+                f'{_e(prune.get("reject_reason") or "The target most likely rate-limited the liveness probe.")} '
                 f'The <strong>full unpruned list</strong> is shown below, so it may include '
                 f'dead/404 URLs. Lower <code>settings.threads</code> or set '
                 f'<code>settings.prune_dead_urls: false</code> if this repeats.</span></div>')
     elif prune.get("enabled"):
         if prune.get("ran") and prune.get("removed", 0) > 0:
+            why = ""
+            if prune.get("trusted_high_removal") and prune.get("trust_reason"):
+                why = f' {_e(prune.get("trust_reason"))}.'
             note = (f'<div style="font-size:11px;color:var(--muted);margin-bottom:14px;padding:8px 12px;'
                     f'background:var(--surface2);border-radius:6px;border-left:3px solid var(--border)">'
                     f'✓ Dead-URL pruning: {prune.get("before",0):,} URLs collected &rarr; '
                     f'<strong style="color:var(--text-dim)">{prune.get("removed",0):,} removed</strong> '
                     f'(filtered: {_e(prune.get("filter_codes","404"))} or unreachable) &rarr; '
-                    f'{prune.get("after",0):,} live URLs remain below. '
-                    f'<span style="opacity:.7">(tools.prune_dead_urls in config.yaml)</span></div>')
+                    f'{prune.get("after",0):,} live URLs remain below.{why} '
+                    f'<span style="opacity:.7">(settings.prune_dead_urls in config.yaml)</span></div>')
         elif not prune.get("ran"):
             note = (f'<div style="font-size:11px;color:var(--muted);margin-bottom:14px;padding:8px 12px;'
                     f'background:var(--surface2);border-radius:6px;border-left:3px solid var(--border)">'
@@ -1487,10 +1732,13 @@ def _section_threatmap(target: str, subs: dict, alive: list, vuln_map: dict = No
     # haritasi. Daha once bu her zaman bos birakiliyordu; harita hep notr renkte
     # goruniyordu. Artik zafiyetli subdomain'ler kirmizi/turuncu olarak isaretleniyor.
     vuln_map = vuln_map or {}
+    _root_hit = vuln_map.get(target) or {}
 
     MAX_DIRECT = 300
     nodes = [{"id": target, "type": "root", "label": target,
-               "alive": True, "severity": "none", "vuln_count": 0}]
+               "alive": True,
+               "severity": _root_hit.get("severity", "none"),
+               "vuln_count": _root_hit.get("count", 0)}]
     links = []
 
     group_map: dict = {}
@@ -1565,8 +1813,11 @@ def _section_threatmap(target: str, subs: dict, alive: list, vuln_map: dict = No
     <span class="tm-leg-item"><span class="tm-dot" style="background:#3b82f6"></span>Root</span>
     <span class="tm-leg-item"><span class="tm-dot" style="background:#1e3a50;border:1px dashed #3b82f6"></span>Group</span>
     <span class="tm-leg-item"><span class="tm-dot" style="background:#374151"></span>Collapsed</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#22c55e"></span>Alive</span>
-    <span class="tm-leg-item"><span class="tm-dot" style="background:#475569"></span>Dead</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#f87171"></span>High</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#fb923c"></span>Medium</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#facc15"></span>Low</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#4ade80"></span>Alive</span>
+    <span class="tm-leg-item"><span class="tm-dot" style="background:#64748b"></span>Quiet</span>
   </div>
   <div class="tm-toolbar">
     <button class="btn-sm" onclick="tmResetZoom()">⊙ Reset</button>
@@ -1663,8 +1914,10 @@ def _section_nuclei(nuc):
     sev_order = ["critical", "high", "medium", "low", "info"]
     sev_color = {"critical": "red", "high": "red", "medium": "orange",
                  "low": "yellow", "info": "gray"}
-    badges = " ".join(_badge(f"{s.upper()} {sev.get(s,0)}", sev_color.get(s, "gray"))
-                      for s in sev_order if sev.get(s, 0))
+    # Always print every severity the scan records, including a zero. A run
+    # that only matched "high" used to hide critical/medium/low entirely.
+    badges = " ".join(_badge(f"{s.upper()} {int(sev.get(s, 0) or 0)}", sev_color.get(s, "gray"))
+                      for s in sev_order)
 
     body = ""
     if tool_failed:
@@ -1687,7 +1940,8 @@ def _section_nuclei(nuc):
     body += (f'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;'
             f'margin-bottom:14px">{"".join(stat_row)}{" " + badges if badges else ""}</div>')
     body += ('<div class="cat-desc" style="margin-bottom:16px">'
-             'Nuclei vulnerability scan on alive hosts</div>')
+             'Nuclei vulnerability scan over the full live URL corpus '
+             '(alive host roots + every live URL found by the crawl)</div>')
 
     if ran:
         parts = [f"status: {_e(meta.get('status',''))}"]
@@ -1706,16 +1960,57 @@ def _section_nuclei(nuc):
     if findings:
         # v8.1: CVE/CVSS/tags artik nuclei'nin kendi info.classification blogundan
         # gerekten okunuyor (bkz. _parse_nuclei) — tabloya ekleniyor.
-        rows = [[(str(f.get("severity") or "info").upper()),
-                 ("DAST" if f.get("source") == "dast" else "tpl"),
-                 (f.get("name") or "")[:80],
-                 (f.get("matched_at") or "")[:140],
-                 (f.get("template") or "")[:60],
-                 ", ".join(f.get("cve") or [])[:60],
-                 (f"{f['cvss_score']:.1f}" if f.get("cvss_score") else ""),
-                 ", ".join(f.get("tags") or [])[:60]]
-                for f in findings]
-        body += _vtable(["Severity", "Source", "Name", "Matched At", "Template", "CVE", "CVSS", "Tags"], rows, "vt-nuclei")
+        # One table per severity so a long high list cannot push medium and
+        # low off the first screen.
+        grouped = {s: [] for s in sev_order}
+        other = []
+        for f in findings:
+            s = str(f.get("severity") or "info").lower()
+            (grouped[s] if s in grouped else other).append(f)
+        def _nuc_table(items, uid):
+            groups = {}
+            for f in items:
+                key = (f.get("template") or f.get("name") or "", f.get("source") or "template")
+                g = groups.setdefault(key, {"n": 0, "f": f, "urls": []})
+                g["n"] += 1
+                if f.get("matched_at"):
+                    g["urls"].append(f["matched_at"])
+            trs = []
+            for (_tpl, src), g in groups.items():
+                f = g["f"]
+                example = g["urls"][0] if g["urls"] else ""
+                extra_n = f" <span style='color:var(--muted)'>+{g['n'] - 1}</span>" if g["n"] > 1 else ""
+                trs.append(
+                    '<tr>'
+                    f'<td style="padding:8px 10px">{_e((f.get("severity") or "info").upper())}</td>'
+                    f'<td style="padding:8px 10px">{_e("DAST" if src == "dast" else "tpl")}</td>'
+                    f'<td style="padding:8px 10px;color:var(--text)">{_e((f.get("name") or "")[:80])}</td>'
+                    f'<td style="padding:8px 10px;font-family:var(--mono);word-break:break-all">{_e(example[:180])}{extra_n}</td>'
+                    f'<td style="padding:8px 10px;font-family:var(--mono)">{_e((f.get("template") or "")[:60])}</td>'
+                    f'<td style="padding:8px 10px">{g["n"]}</td>'
+                    f'<td style="padding:8px 10px">{_retest_btn(example)}</td>'
+                    '</tr>')
+            return (
+                f'<div style="overflow:auto" id="{_e(uid)}"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+                '<thead><tr style="text-align:left;color:var(--muted)">'
+                '<th style="padding:8px 10px">Severity</th><th style="padding:8px 10px">Source</th>'
+                '<th style="padding:8px 10px">Name</th><th style="padding:8px 10px">Example</th>'
+                '<th style="padding:8px 10px">Template</th><th style="padding:8px 10px">Hits</th>'
+                '<th style="padding:8px 10px"></th></tr></thead>'
+                f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+        for s in sev_order:
+            items = grouped[s]
+            if not items:
+                continue
+            n_groups = len({(f.get("template") or f.get("name") or "", f.get("source") or "") for f in items})
+            body += (f'<div class="subsection-label" style="margin-top:16px">'
+                     f'{_e(s.upper())} &middot; {len(items):,} hits &middot; {n_groups:,} templates</div>')
+            body += _nuc_table(items, f"nuc-{s}")
+        if other:
+            body += (f'<div class="subsection-label" style="margin-top:16px">'
+                     f'OTHER &middot; {len(other):,}</div>')
+            body += _nuc_table(other, "nuc-other")
         cve_n = sum(1 for f in findings if f.get("cve"))
         if cve_n:
             body += (f'<div style="font-size:11px;color:var(--muted);margin-top:8px">'
@@ -1761,8 +2056,11 @@ def _section_xss(xss):
                   _DALFOX_TYPE_LABELS["R"]: 1, _DALFOX_TYPE_LABELS["G"]: 2}
     findings = sorted(findings, key=lambda f: _TYPE_RANK.get(f.get("type", ""), 1))
 
-    verified_n  = sum(1 for f in findings if f.get("type") in (_DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"]))
-    unconfirmed_n = len(findings) - verified_n
+    _dialog_urls = {s.get("url") for s in (meta.get("screenshots") or [])
+                    if (s.get("dialog_confirmed") or s.get("confirmed_upgrade")) and s.get("url")}
+    dialog_n = sum(1 for f in findings if f.get("type") == _DALFOX_TYPE_LABELS["RV"] or f.get("url") in _dialog_urls)
+    scanner_n = sum(1 for f in findings if f.get("type") == _DALFOX_TYPE_LABELS["V"] and f.get("url") not in _dialog_urls)
+    unconfirmed_n = len(findings) - dialog_n - scanner_n
 
     body = ""
     if tool_failed:
@@ -1783,15 +2081,16 @@ def _section_xss(xss):
 
     body += (f'<div style="display:flex;gap:8px;margin-bottom:16px">'
             f'{_stat(len(findings), "XSS Findings", "orange", "💥")}'
-            f'{_stat(verified_n, "Verified (real execution proven)", "red", "✅")}'
+            f'{_stat(dialog_n, "Dialog confirmed", "red", "✅")}'
+            f'{_stat(scanner_n, "Scanner verified (no dialog capture)", "orange", "🔴")}'
             f'{_stat(unconfirmed_n, "Unconfirmed (reflected/grep only)", "gray", "❔")}'
             f'{_stat(risk_label, "Risk Level", risk_color, "🎯")}</div>'
             f'<div class="cat-desc" style="margin-bottom:16px">'
-            f'Reflected &amp; DOM XSS candidates from dalfox scan. <strong>Verified</strong> means dalfox '
-            f'itself (or ReconX, replaying it in a real headless browser) caught the payload actually '
-            f'executing — treat these as real. <strong>Reflected/Grep match</strong> only means the payload '
-            f'text came back unescaped somewhere in the response — dalfox did not confirm it runs, so double '
-            f'check the context (e.g. open the PoC URL yourself) before reporting one as a finding.</div>')
+            f'Reflected &amp; DOM XSS candidates from dalfox scan. <strong>Dialog confirmed</strong> means a '
+            f'headless replay actually fired a dialog. <strong>Scanner verified</strong> means dalfox marked '
+            f'the payload as breaking out of context, but this run has no dialog screenshot. '
+            f'<strong>Reflected/Grep match</strong> only means the payload text came back unescaped — open '
+            f'the PoC URL yourself before reporting it.</div>')
 
     if ran:
         parts = [f"status: {_e(meta.get('status',''))}"]
@@ -1850,16 +2149,20 @@ def _section_xss(xss):
             g["sev"].add(f.get("severity") or "")
             if f.get("evidence") and not g["evidence"]:
                 g["evidence"] = f["evidence"]
-            if f.get("url") in _confirmed_urls or f.get("type") in (
-                    _DALFOX_TYPE_LABELS["V"], _DALFOX_TYPE_LABELS["RV"]):
+            if f.get("url") in _dialog_urls or f.get("type") == _DALFOX_TYPE_LABELS["RV"]:
                 g["confirmed"] = True
+                g["dialog"] = True
+                g["poc"] = f.get("url") or g["poc"]
+            elif f.get("type") == _DALFOX_TYPE_LABELS["V"]:
+                g["scanner"] = True
                 g["poc"] = f.get("url") or g["poc"]
         grows = []
         for (base, param), g in sorted(_grp.items(),
-                                       key=lambda kv: (0 if kv[1]["confirmed"] else 1,
+                                       key=lambda kv: (0 if kv[1].get("dialog") else (1 if kv[1].get("scanner") else 2),
                                                        -len(kv[1]["payloads"]))):
             grows.append([
-                "✅ CONFIRMED" if g["confirmed"] else "unconfirmed — check context",
+                ("✅ CONFIRMED (dialog fired)" if g.get("dialog")
+                 else ("scanner verified" if g.get("scanner") else "unconfirmed — check context")),
                 param,
                 base,
                 str(len(g["payloads"])),
@@ -1868,9 +2171,9 @@ def _section_xss(xss):
             ])
         body += ('<div class="subsection-label" style="margin:18px 0 8px">Injection points '
                  f'<span style="color:var(--muted);font-weight:400">({len(_grp)} unique · '
-                 f'{len(findings)} raw payload hits — ✅ = a real dialog fired on headless replay; '
-                 f'"unconfirmed" = payload reflected but did not execute on replay, check the '
-                 f'evidence column for context)</span></div>'
+                 f'{len(findings)} raw payload hits — dialog fired only when a headless replay proved it; '
+                 f'"scanner verified" has no dialog capture; "unconfirmed" is a reflection, check the '
+                 f'evidence column)</span></div>'
                  + _vtable(["Status", "Parameter", "URL", "# payloads", "Reflection context (dalfox evidence)",
                             "PoC URL — click ⧉ to copy"],
                            grows, "vt-xss-grp", copy_cols=[5]))
@@ -1944,8 +2247,11 @@ def _section_xss(xss):
     # findings table alone (which only ever lists hits).
     tested = xss.get("tested") or []
     if tested:
-        vuln = [t for t in tested if t["vulnerable"]]
-        vuln_n, clean_n = len(vuln), len(tested) - len([t for t in tested if t["vulnerable"]])
+        vuln = [t for t in tested if t.get("coverage") == "vulnerable" or t["vulnerable"]]
+        clean_n = sum(1 for t in tested if t.get("coverage") == "clean")
+        incomplete_n = sum(1 for t in tested if t.get("coverage") == "incomplete")
+        not_scanned_n = sum(1 for t in tested if t.get("coverage") == "not_scanned")
+        vuln_n = len(vuln)
 
         # ── VULNERABLE — one row per ready-to-open PoC URL (full, one-piece) ──
         poc_rows, _seen_poc = [], set()
@@ -1955,8 +2261,14 @@ def _section_xss(xss):
                 if not pu or pu in _seen_poc:
                     continue
                 _seen_poc.add(pu)
-                st = ("✅ CONFIRMED (dialog fired)" if p["confirmed"]
-                      else "🔴 reflected — verify context")
+                p = dict(p)
+                p["dialog"] = pu in _dialog_urls
+                if p.get("dialog"):
+                    st = "✅ CONFIRMED (dialog fired)"
+                elif p["confirmed"]:
+                    st = "🔴 scanner verified (no dialog capture)"
+                else:
+                    st = "🔴 reflected — verify context"
                 poc_rows.append([st, p.get("param", ""), p.get("payload", ""), pu, "row-red"])
         # sort confirmed first
         poc_rows.sort(key=lambda r: 0 if r[0].startswith("✅") else 1)
@@ -1970,20 +2282,30 @@ def _section_xss(xss):
                                poc_rows, "vt-xss-poc", row_class=True, copy_cols=[2, 3]))
 
         # ── all tested (was it even scanned?) ──
+        _cov_label = {
+            "vulnerable": "🔴 VULNERABLE",
+            "clean": "🟢 clean",
+            "incomplete": "🟡 time ran out — this URL did not finish",
+            "not_scanned": "⚪ not started",
+        }
+        _cov_row = {"vulnerable": "row-red", "clean": "row-green"}
         rows_t = []
         for t in tested:
-            status = "🔴 VULNERABLE" if t["vulnerable"] else "🟢 clean"
-            rows_t.append([t["url"], status, "; ".join(p for p in t["payloads"] if p),
+            cov = t.get("coverage") or ("vulnerable" if t["vulnerable"] else "clean")
+            rows_t.append([t["url"], _cov_label.get(cov, cov),
+                           "; ".join(p for p in t["payloads"] if p),
                            ", ".join(t["types"]), ", ".join(t["severities"]),
-                           "row-red" if t["vulnerable"] else "row-green"])
+                           _cov_row.get(cov, "")])
         body += (f'<div class="subsection-label" style="margin-top:20px;margin-bottom:8px">'
-                 f'All tested URLs <span style="color:var(--muted);font-weight:400">'
-                 f'({len(tested):,} sent to dalfox — '
+                 f'All targeted URLs <span style="color:var(--muted);font-weight:400">'
+                 f'({len(tested):,} queued — '
                  f'<span style="color:var(--red)">{vuln_n:,} vulnerable</span> / '
-                 f'<span style="color:var(--green)">{clean_n:,} clean</span>)</span></div>'
-                 f'<div class="cat-desc" style="margin-bottom:10px">Every URL dalfox scanned, so you '
-                 f'can see what was covered. The copyable per-payload PoC URLs are in the red table '
-                 f'above.</div>')
+                 f'<span style="color:var(--green)">{clean_n:,} clean</span> / '
+                 f'{incomplete_n:,} time ran out / {not_scanned_n:,} not started)'
+                 f'</span></div>'
+                 f'<div class="cat-desc" style="margin-bottom:10px">Only a URL dalfox finished with '
+                 f'no finding is clean. If the time budget hit mid-URL, that row says the URL did not '
+                 f'finish. A URL the scan never reached says not started.</div>')
         body += _vtable(["Base URL", "Status", "Payload(s) that hit", "Type", "Severity"],
                         rows_t, "vt-xss-all", row_class=True, copy_cols=[0, 2])
 
@@ -2079,6 +2401,67 @@ def _section_js(js):
 
 
 # ── Section: Tech Priority ───────────────────────────────────────────────────
+def _parse_ai(d) -> dict:
+    """A previous run's AI analysis, if one was saved next to the report."""
+    f = Path(d) / "ai_analysis.json"
+    if f.exists() and f.stat().st_size > 0:
+        try:
+            data = json.loads(f.read_text(errors="replace"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _section_ai(ai_result: dict, scan_dir) -> str:
+    """The AI Analysis panel.
+
+    Rendering happens in JS, from JSON, for both paths — the result baked into
+    this file by an earlier run and a live one fetched from the bridge. One
+    renderer means the two can't drift, and it keeps every model-authored
+    string going through textContent instead of an f-string into innerHTML.
+    """
+    cached = _safe_json(ai_result or {})
+    cmd = f"python3 reconx_ai.py serve {shlex.quote(str(scan_dir))}"
+    n_leads = len(((ai_result or {}).get("leads")) or [])
+    sub_txt = (f"{n_leads} lead(s) from the last run" if ai_result
+               else "Claude reviews every stage's output and ranks what to test")
+    return f'''<div id="s-ai" class="section">
+<div class="sec-hdr"><div class="sec-hdr-inner"><div>
+<h2>AI Analysis</h2>
+<p class="sec-sub">{_e(sub_txt)}</p>
+</div></div></div>
+<div class="ai-bar">
+  <button class="ai-btn" id="ai-run" onclick="aiRun(false)">✨ Run AI Analysis</button>
+  <button class="ai-btn ai-btn-ghost" id="ai-rerun" onclick="aiRun(true)" hidden>Re-run</button>
+  <span class="ai-status" id="ai-status"></span>
+</div>
+<div class="ai-note" id="ai-offline" hidden>
+  This report is open as a plain file, so the button has no backend to call —
+  the Anthropic API key deliberately never gets written into the HTML.
+  Start the local bridge and it reopens this report with the button live:
+  <div style="margin-top:9px"><code>{_e(cmd)}</code></div>
+</div>
+<div class="ai-note" style="border-color:var(--border);font-size:12.5px">
+  Everything below is an <strong>unverified lead</strong> — a hypothesis with a way to
+  settle it. Nothing here was tested against the target. Verify before you report.
+</div>
+<div class="ai-term" id="ai-term">
+  <div class="ai-term-hd">
+    <span class="ai-term-dot"></span><span id="ai-term-lbl">analysing</span>
+    <span class="ai-term-el" id="ai-term-el">0s</span>
+  </div>
+  <div class="ai-term-body" id="ai-term-body"></div>
+</div>
+<div id="ai-out"></div>
+<div class="ai-ask" id="ai-ask" hidden>
+  <input id="ai-q" placeholder="Ask about this scan — e.g. &quot;expand lead #2&quot; or &quot;what did the scan miss on api.*?&quot;">
+  <button class="ai-btn ai-btn-ghost" onclick="aiAsk()">Ask</button>
+</div>
+<script>window.__RECONX_AI_RESULT = {cached};</script>
+</div>'''
+
+
 def _section_tech(tech):
     if not tech:
         return (f'<div id="s-tech" class="section">'
@@ -2295,6 +2678,23 @@ body{
 }
 .nav-cnt.cnt-red{background:rgba(239,68,68,.15);color:#ff8f8f;border-color:rgba(239,68,68,.25)}
 .nav-cnt.cnt-orange{background:rgba(249,115,22,.15);color:#ffb86a;border-color:rgba(249,115,22,.25)}
+.nav-cnt.cnt-green{background:rgba(34,197,94,.15);color:#6ee7a2;border-color:rgba(34,197,94,.25)}
+.nav-cnt.cnt-blue{background:rgba(59,130,246,.15);color:#8ab4ff;border-color:rgba(59,130,246,.25)}
+/* ── On-demand Scan Center ── */
+.scan-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin:16px 0}
+.scan-card{background:var(--surface1);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px;transition:border-color .2s,box-shadow .2s}
+.scan-card:hover{border-color:var(--border2)}
+.scan-card.scan-flash{border-color:var(--accent);box-shadow:0 0 0 3px rgba(96,165,250,.18)}
+.scan-card h4{margin:0;font-size:14px;display:flex;align-items:center;gap:8px}
+.scan-card .scan-desc{font-size:12px;color:var(--muted);line-height:1.5;flex:1}
+.scan-card .scan-res{font-size:12px;color:var(--text-dim);font-family:var(--mono)}
+.scan-card .scan-actions{display:flex;gap:8px;align-items:center;margin-top:4px}
+.btn-run{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+.btn-run:hover{filter:brightness(1.08)}
+.btn-run:disabled{opacity:.45;cursor:not-allowed}
+.btn-stop{background:rgba(239,68,68,.14);color:#ff8f8f;border:1px solid rgba(239,68,68,.3);border-radius:7px;padding:7px 12px;font-size:12.5px;font-weight:600;cursor:pointer}
+.scan-console{background:#0b0f19;border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-family:var(--mono);font-size:11.5px;line-height:1.55;color:#c8d3e6;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;margin-top:10px}
+.scan-stat-badge{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;font-family:var(--mono)}
 .nav-hr{border:none;border-top:1px solid var(--border);margin:10px 14px;opacity:.6}
 .sb-hint{
   padding:12px 18px 16px;color:var(--muted);font-size:11px;line-height:1.6;
@@ -2341,6 +2741,7 @@ body{
 .panel-header h3{font-family:var(--display);font-size:13px;font-weight:600;color:var(--text);letter-spacing:-.2px}
 .panel-icon{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.15)}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.panel-pipeline{overflow:visible}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
 .stat-card{
   background:var(--surface1);border:1px solid var(--border);border-radius:var(--radius-sm);
@@ -2355,14 +2756,19 @@ body{
 .stat-val{font-family:var(--display);font-size:22px;font-weight:700;color:#fff;line-height:1;letter-spacing:-.5px}
 .stat-lbl{font-size:11px;color:var(--muted);margin-top:5px;font-weight:500;text-transform:uppercase;letter-spacing:.5px}
 /* Timeline */
-.timeline{display:flex;align-items:center;gap:0;margin-top:6px;overflow-x:auto;padding:8px 0}
-.tl-step{display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;min-width:58px;position:relative}
-.tl-step::after{content:'';position:absolute;top:14px;left:55%;right:-45%;height:2px;background:var(--border)}
+.timeline{display:flex;align-items:flex-start;width:100%;margin-top:6px;padding:8px 0 2px}
+.tl-step{display:flex;flex-direction:column;align-items:center;gap:6px;flex:1 1 0;min-width:0;position:relative}
+.tl-step::after{content:'';position:absolute;top:14px;left:50%;width:100%;height:2px;background:var(--border)}
 .tl-step:last-child::after{display:none}
 .tl-dot{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;border:2px solid var(--border);background:var(--surface2);z-index:1}
 .tl-step.tl-done .tl-dot{background:var(--green-bg);border-color:var(--green);color:var(--green);box-shadow:0 0 10px rgba(34,197,94,.3)}
-.tl-step.tl-skip .tl-dot{opacity:.5}
-.tl-lbl{font-size:10px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.tl-step.tl-partial .tl-dot{background:rgba(249,115,22,.15);border-color:#fb923c;color:#fb923c}
+.tl-step.tl-fail .tl-dot{background:rgba(239,68,68,.15);border-color:#f87171;color:#f87171}
+.tl-step.tl-run .tl-dot{background:rgba(56,189,248,.12);border-color:var(--accent);color:var(--accent);animation:tlpulse 1.4s ease-in-out infinite}
+.tl-step.tl-skip .tl-dot{opacity:.45}
+.tl-lbl{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.2px;white-space:nowrap;text-align:center}
+.tl-dur{font-size:9px;color:var(--text-dim);font-family:var(--mono);letter-spacing:0}
+@keyframes tlpulse{50%{box-shadow:0 0 12px var(--accent-glow)}}
 /* Code block */
 .code-block{
   background:#0a0f1e;border:1px solid var(--border);border-radius:10px;
@@ -2498,8 +2904,30 @@ body{
 .tm-leg-item{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);background:var(--surface1);padding:5px 10px;border-radius:20px;border:1px solid var(--border)}
 .tm-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .tm-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px}
-.tm-wrap{background:var(--surface1);border:1px solid var(--border);border-radius:var(--radius-sm);height:520px;position:relative;overflow:hidden;box-shadow:var(--shadow-sm)}
-#tm-svg{width:100%;height:100%;display:block}
+.tm-wrap{
+  background:
+    radial-gradient(circle at 50% 48%, rgba(56,189,248,.12), transparent 42%),
+    linear-gradient(rgba(148,163,184,.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148,163,184,.045) 1px, transparent 1px),
+    var(--surface1);
+  background-size: auto, 56px 56px, 56px 56px, auto;
+  border:1px solid var(--border);border-radius:var(--radius-sm);height:640px;
+  position:relative;overflow:hidden;box-shadow:var(--shadow-sm);
+}
+.tm-wrap::before,.tm-wrap::after{
+  content:"";position:absolute;left:50%;top:48%;transform:translate(-50%,-50%);
+  border-radius:50%;pointer-events:none;
+}
+.tm-wrap::before{
+  width:min(78%,560px);height:min(78%,560px);
+  border:1px solid rgba(56,189,248,.16);
+  box-shadow:inset 0 0 80px rgba(56,189,248,.05);
+}
+.tm-wrap::after{
+  width:min(46%,320px);height:min(46%,320px);
+  border:1px dashed rgba(125,211,252,.14);
+}
+#tm-svg{width:100%;height:100%;display:block;position:relative;z-index:1}
 .tm-tooltip{position:absolute;pointer-events:none;background:var(--surface2);border:1px solid var(--border2);padding:10px 12px;border-radius:10px;font-size:12px;color:var(--text);box-shadow:var(--shadow);opacity:0;transition:opacity .15s;max-width:280px;z-index:10}
 /* Risk gauge */
 .risk-gauge{display:flex;align-items:center;gap:16px;padding:14px;background:var(--surface2);border-radius:12px;border:1px solid var(--border);margin-bottom:14px}
@@ -2578,6 +3006,154 @@ body{
 .cmdk-list{max-height:320px;overflow:auto;padding:6px}
 .cmdk-item{padding:9px 12px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-dim)}
 .cmdk-item:hover,.cmdk-item.active{background:var(--surface2);color:var(--text)}
+
+/* ── AI Analysis ───────────────────────────────────────────────────────── */
+/* The panel toggles controls with the `hidden` attribute, but a class that
+   sets `display` outranks the UA stylesheet's [hidden]{display:none} — so
+   .ai-btn (inline-flex) and .ai-ask (flex) stayed visible while hidden. That
+   showed a dead "Re-run" button and an ask box with no backend on a report
+   opened as a plain file. Re-assert it for these elements. */
+.ai-btn[hidden],.ai-ask[hidden],.ai-note[hidden]{display:none !important}
+.ai-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.ai-btn{
+  display:inline-flex;align-items:center;gap:9px;padding:11px 20px;border:none;
+  border-radius:var(--radius-sm);cursor:pointer;font-family:var(--sans);
+  font-size:13.5px;font-weight:600;color:#06121f;
+  background:linear-gradient(135deg,var(--accent2),var(--accent) 55%,var(--purple));
+  box-shadow:0 4px 18px var(--accent-glow);transition:transform .12s,box-shadow .12s;
+}
+.ai-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 26px var(--accent-glow)}
+.ai-btn:disabled{opacity:.55;cursor:default;transform:none}
+.ai-btn-ghost{
+  background:var(--surface2);color:var(--text-dim);border:1px solid var(--border2);
+  box-shadow:none;font-weight:500;
+}
+.ai-btn-ghost:hover:not(:disabled){background:var(--surface3);color:var(--text);transform:none;box-shadow:none}
+.ai-status{font-size:12.5px;color:var(--muted);font-family:var(--mono)}
+.ai-spin{
+  display:inline-block;width:12px;height:12px;margin-right:7px;vertical-align:-1px;
+  border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;
+  animation:ai-rot .7s linear infinite;
+}
+@keyframes ai-rot{to{transform:rotate(360deg)}}
+.ai-note{
+  border:1px solid var(--border2);background:var(--surface1);border-radius:var(--radius-sm);
+  padding:14px 16px;font-size:13px;color:var(--text-dim);line-height:1.65;margin-bottom:18px;
+}
+.ai-note code{
+  font-family:var(--mono);font-size:12px;background:var(--surface3);
+  padding:2px 7px;border-radius:5px;color:var(--accent2);
+}
+.ai-note-err{border-color:var(--red);background:var(--red-bg);color:#fca5a5}
+.ai-verdict{
+  border:1px solid var(--border2);border-left:3px solid var(--accent);
+  background:linear-gradient(135deg,rgba(56,189,248,.07),transparent 60%);
+  border-radius:var(--radius-sm);padding:16px 18px;margin-bottom:18px;
+  font-size:14.5px;line-height:1.7;color:var(--text);
+}
+.ai-block-lbl{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted2);margin:22px 0 10px;
+}
+.ai-gaps{
+  border:1px solid var(--orange);background:var(--orange-bg);border-radius:var(--radius-sm);
+  padding:13px 18px;margin-bottom:6px;
+}
+.ai-gaps li,.ai-plain li{font-size:13px;line-height:1.75;color:var(--text-dim);margin-left:18px}
+.ai-lead{
+  border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface1);
+  margin-bottom:12px;overflow:hidden;
+}
+.ai-lead-hd{
+  display:flex;align-items:center;gap:11px;padding:13px 16px;cursor:pointer;
+  border-left:3px solid var(--muted2);
+}
+.ai-lead-hd:hover{background:var(--surface2)}
+.ai-lead[data-sev="critical"] .ai-lead-hd{border-left-color:var(--red)}
+.ai-lead[data-sev="high"]     .ai-lead-hd{border-left-color:var(--red)}
+.ai-lead[data-sev="medium"]   .ai-lead-hd{border-left-color:var(--orange)}
+.ai-lead[data-sev="low"]      .ai-lead-hd{border-left-color:var(--yellow)}
+.ai-lead[data-sev="info"]     .ai-lead-hd{border-left-color:var(--muted2)}
+.ai-rank{font-family:var(--mono);font-size:12px;color:var(--muted2);min-width:26px}
+.ai-sev{
+  font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.08em;
+  padding:3px 8px;border-radius:5px;text-transform:uppercase;
+}
+.ai-sev-critical,.ai-sev-high{background:var(--red-bg);color:#fca5a5;border:1px solid var(--red)}
+.ai-sev-medium{background:var(--orange-bg);color:#fdba74;border:1px solid var(--orange)}
+.ai-sev-low{background:rgba(234,179,8,.12);color:#fde047;border:1px solid var(--yellow)}
+.ai-sev-info{background:var(--surface3);color:var(--muted);border:1px solid var(--border2)}
+.ai-lead-ttl{font-size:14px;font-weight:600;color:var(--text);flex:1;min-width:0}
+.ai-conf{font-family:var(--mono);font-size:10.5px;color:var(--muted2);white-space:nowrap}
+.ai-caret{color:var(--muted2);font-size:11px;transition:transform .15s}
+.ai-lead.open .ai-caret{transform:rotate(90deg)}
+.ai-lead-bd{display:none;padding:2px 18px 18px;border-top:1px solid var(--border)}
+.ai-lead.open .ai-lead-bd{display:block}
+.ai-row{display:flex;gap:14px;padding:9px 0;border-bottom:1px dashed var(--border);font-size:13px}
+.ai-row:last-child{border-bottom:none}
+.ai-row-k{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted2);min-width:96px;padding-top:2px;flex-shrink:0;
+}
+.ai-row-v{color:var(--text-dim);line-height:1.7;min-width:0;flex:1;word-break:break-word}
+.ai-ev{
+  font-family:var(--mono);font-size:11.5px;color:var(--text-dim);background:var(--surface2);
+  border-radius:6px;padding:7px 10px;margin-bottom:5px;word-break:break-all;
+}
+.ai-cmd{
+  display:flex;align-items:flex-start;gap:8px;font-family:var(--mono);font-size:11.5px;
+  color:var(--green);background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.22);
+  border-radius:6px;padding:8px 10px;margin-bottom:5px;word-break:break-all;
+}
+.ai-cmd button{
+  margin-left:auto;flex-shrink:0;background:var(--surface3);border:1px solid var(--border2);
+  color:var(--muted);border-radius:5px;padding:2px 8px;font-size:10px;cursor:pointer;
+  font-family:var(--mono);
+}
+.ai-cmd button:hover{color:var(--text);background:var(--surface4)}
+.ai-dismissed{font-size:12.5px;color:var(--muted);line-height:1.8}
+.ai-dismissed b{color:var(--text-dim);font-weight:500}
+.ai-ask{display:flex;gap:9px;margin-top:26px}
+.ai-ask input{
+  flex:1;padding:11px 14px;background:var(--surface1);border:1px solid var(--border2);
+  border-radius:var(--radius-sm);color:var(--text);font-family:var(--sans);font-size:13px;outline:none;
+}
+.ai-ask input:focus{border-color:var(--accent)}
+.ai-answer{
+  border:1px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface1);
+  padding:16px 18px;margin-top:12px;font-size:13.5px;line-height:1.75;color:var(--text-dim);
+  white-space:pre-wrap;word-break:break-word;
+}
+.ai-usage{font-family:var(--mono);font-size:11px;color:var(--muted2);margin-top:20px}
+
+/* Live stream pane — the analysis as it is produced */
+.ai-term{
+  display:none;border:1px solid var(--border2);border-radius:var(--radius-sm);
+  background:#04070d;margin-bottom:18px;overflow:hidden;
+}
+.ai-term.on{display:block}
+.ai-term-hd{
+  display:flex;align-items:center;gap:8px;padding:8px 13px;
+  background:var(--surface1);border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;color:var(--muted);
+}
+.ai-term-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 8px var(--green);animation:ai-pulse 1.4s ease-in-out infinite}
+@keyframes ai-pulse{50%{opacity:.35}}
+.ai-term-el{margin-left:auto;color:var(--muted2)}
+.ai-term-body{
+  max-height:340px;overflow-y:auto;padding:12px 15px;
+  font-family:var(--mono);font-size:11.5px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-word;
+}
+.ai-term-body .th{color:var(--muted2);font-style:italic}
+.ai-term-body .tx{color:var(--text-dim)}
+.ai-term-body .st{color:var(--accent);display:block;margin:4px 0}
+.ai-term-cur{
+  display:inline-block;width:7px;height:13px;background:var(--accent);
+  vertical-align:-2px;animation:ai-blink .9s step-end infinite;
+}
+@keyframes ai-blink{50%{opacity:0}}
 """
 _JS = r"""
 function showSection(id, el) {
@@ -2915,7 +3491,10 @@ function aliveCSV(){
 // Threat Map
 var _TM={initialized:false,W:0,H:0};
 function initThreatMap(){
+  if(_TM.initialized) return;
   if(!window._TM_DATA||typeof d3==='undefined') return;
+  var wrap0=document.querySelector('.tm-wrap');
+  if(!wrap0 || wrap0.clientWidth<20) return;
   _TM.initialized=true;
   var wrap=document.querySelector('.tm-wrap');
   var svg=d3.select('#tm-svg');
@@ -2925,46 +3504,95 @@ function initThreatMap(){
   var zoom=d3.zoom().scaleExtent([0.15,6]).on('zoom',function(e){ g.attr('transform',e.transform); });
   svg.call(zoom);
   var data=window._TM_DATA;
+  function nodeColor(d){
+    if(d.type==='root') return '#7dd3fc';
+    if(d.type==='group') return '#1e3a5f';
+    if(d.type==='collapsed') return '#334155';
+    if(d.severity==='high') return '#f87171';
+    if(d.severity==='medium') return '#fb923c';
+    if(d.severity==='low') return '#facc15';
+    if(d.severity==='info') return '#60a5fa';
+    return d.alive ? '#4ade80' : '#64748b';
+  }
+  function nodeR(d){ return d.type==='root'?18:d.type==='group'?13:d.type==='collapsed'?9:8; }
+  function shortName(d){
+    if(d.type!=='subdomain') return d.label.length>24 ? d.label.slice(0,24)+'…' : d.label;
+    var root=data.nodes.filter(function(n){ return n.type==='root'; })[0];
+    var base=root ? root.label : '';
+    if(base && d.label.slice(-(base.length+1))==='.'+base) return d.label.slice(0,-(base.length+1));
+    return d.label.length>24 ? d.label.slice(0,24)+'…' : d.label;
+  }
+  var rootN=data.nodes.filter(function(d){ return d.type==='root'; })[0];
+  var ringed=data.nodes.length<=28 && rootN;
+  if(ringed){
+    var cx=W/2, cy=H*0.48, R=Math.min(W,H)*0.32;
+    rootN.fx=cx; rootN.fy=cy;
+    data.nodes.filter(function(d){ return d!==rootN; }).forEach(function(d,i,arr){
+      var a=-Math.PI/2 + (i/arr.length)*Math.PI*2;
+      d.fx=cx+Math.cos(a)*R; d.fy=cy+Math.sin(a)*R;
+    });
+  }
+  var defs=svg.append('defs');
+  var glow=defs.append('filter').attr('id','tmGlow').attr('x','-80%').attr('y','-80%').attr('width','260%').attr('height','260%');
+  glow.append('feGaussianBlur').attr('stdDeviation','4').attr('result','blur');
+  var merge=glow.append('feMerge');
+  merge.append('feMergeNode').attr('in','blur');
+  merge.append('feMergeNode').attr('in','SourceGraphic');
   var sim=d3.forceSimulation(data.nodes)
-    .force('link', d3.forceLink(data.links).id(function(d){return d.id}).distance(70))
-    .force('charge', d3.forceManyBody().strength(-220))
-    .force('center', d3.forceCenter(W/2,H/2))
-    .force('collide', d3.forceCollide().radius(22));
+    .force('link', d3.forceLink(data.links).id(function(d){return d.id}).distance(ringed?90:78))
+    .force('charge', d3.forceManyBody().strength(ringed?-40:-240))
+    .force('center', d3.forceCenter(W/2,H*0.48))
+    .force('collide', d3.forceCollide().radius(function(d){ return nodeR(d)+16; }));
   var link=g.append('g').selectAll('line').data(data.links).enter().append('line')
-    .attr('stroke','rgba(255,255,255,.12)').attr('stroke-width',1);
+    .attr('stroke','rgba(125,211,252,.28)').attr('stroke-width',1.25);
+  var halo=g.append('g').selectAll('circle').data(data.nodes).enter().append('circle')
+    .attr('r',function(d){ return nodeR(d)+8; })
+    .attr('fill','none')
+    .attr('stroke',nodeColor)
+    .attr('stroke-opacity',0.35)
+    .attr('stroke-width',1)
+    .style('pointer-events','none');
   var node=g.append('g').selectAll('circle').data(data.nodes).enter().append('circle')
-    .attr('r',function(d){ return d.type==='root'?16:d.type==='group'?12:d.type==='collapsed'?9:7; })
-    .attr('fill',function(d){
-      if(d.type==='root') return '#38bdf8';
-      if(d.type==='group') return '#1e3a5f';
-      if(d.type==='collapsed') return '#334155';
-      if(d.severity==='high') return '#ef4444';
-      if(d.severity==='medium') return '#f97316';
-      if(d.severity==='low') return '#eab308';
-      return d.alive ? '#22c55e' : '#475569';
-    })
-    .attr('stroke','rgba(255,255,255,.15)').attr('stroke-width',1)
+    .attr('r',nodeR)
+    .attr('fill',nodeColor)
+    .attr('filter','url(#tmGlow)')
+    .attr('stroke','rgba(255,255,255,.22)').attr('stroke-width',1.25)
     .style('cursor',function(d){ return (d.type==='subdomain'||d.type==='root') ? 'pointer' : 'default'; })
     .on('click',function(e,d){
       if (d.type==='subdomain' || d.type==='root') { jumpToHost(d.label); }
     })
-    .call(d3.drag().on('start',function(e,d){ if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }).on('drag',function(e,d){ d.fx=e.x; d.fy=e.y; }).on('end',function(e,d){ if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+    .call(d3.drag()
+      .on('start',function(e,d){ if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag',function(e,d){ d.fx=e.x; d.fy=e.y; })
+      .on('end',function(e,d){ if(!e.active) sim.alphaTarget(0); if(!ringed){ d.fx=null; d.fy=null; } }));
   var label=g.append('g').selectAll('text').data(data.nodes).enter().append('text')
-    .text(function(d){ return d.label.length>22 ? d.label.slice(0,22)+'…' : d.label; })
-    .attr('font-size',10).attr('dx',12).attr('dy',4).attr('fill','rgba(230,237,245,.85)').style('pointer-events','none').style('font-family','JetBrains Mono, monospace');
+    .text(shortName)
+    .attr('text-anchor','middle')
+    .attr('font-size',function(d){ return d.type==='root'?12:11; })
+    .attr('font-weight',function(d){ return d.type==='root'?600:500; })
+    .attr('dy',function(d){ return nodeR(d)+16; })
+    .attr('fill','rgba(226,232,240,.92)')
+    .style('pointer-events','none')
+    .style('font-family','JetBrains Mono, monospace');
   var tip=document.getElementById('tm-tooltip');
   node.on('mouseenter',function(e,d){
-    tip.style.opacity='1'; tip.innerHTML='<b>'+d.label+'</b><br><span style="color:#7a92b0">type: '+d.type+' | alive: '+(d.alive?'yes':'no')+' | severity: '+(d.severity||'none')+' | vuln: '+(d.vuln_count||0)+'</span>';
+    var sev=d.severity&&d.severity!=='none' ? d.severity : (d.alive?'alive':'quiet');
+    tip.style.opacity='1';
+    tip.innerHTML='<b style="font-family:JetBrains Mono,monospace">'+d.label+'</b><br><span style="color:#94a3b8">'+sev+' · '+(d.vuln_count||0)+' finding'+(d.vuln_count===1?'':'s')+'</span>';
   }).on('mousemove',function(e){ tip.style.left=(e.offsetX+14)+'px'; tip.style.top=(e.offsetY+14)+'px'; }).on('mouseleave',function(){ tip.style.opacity='0'; });
   sim.on('tick',function(){
     link.attr('x1',function(d){return d.source.x}).attr('y1',function(d){return d.source.y}).attr('x2',function(d){return d.target.x}).attr('y2',function(d){return d.target.y});
+    halo.attr('cx',function(d){return d.x}).attr('cy',function(d){return d.y});
     node.attr('cx',function(d){return d.x}).attr('cy',function(d){return d.y});
     label.attr('x',function(d){return d.x}).attr('y',function(d){return d.y});
   });
   window.tmResetZoom=function(){ svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity); };
   window.tmToggleLabels=function(){ var v=label.style('display'); label.style('display', v==='none'?'block':'none'); };
-  window.tmFilterAlive=function(){ node.style('opacity',function(d){ return d.alive||d.type==='root' ? 1 : 0.15; }); label.style('opacity',function(d){ return d.alive||d.type==='root' ? 1 : 0.15; }); };
-  window.tmFilterAll=function(){ node.style('opacity',1); label.style('opacity',1); };
+  window.tmFilterAlive=function(){
+    var show=function(d){ return d.alive||d.type==='root' ? 1 : 0.12; };
+    node.style('opacity',show); halo.style('opacity',show); label.style('opacity',show);
+  };
+  window.tmFilterAll=function(){ node.style('opacity',1); halo.style('opacity',1); label.style('opacity',1); };
   window.tmSearch=function(){
     var q=(document.getElementById('tm-search')||{}).value||''; q=q.toLowerCase().trim();
     node.attr('stroke',function(d){ return q && d.label.toLowerCase().includes(q) ? '#38bdf8' : 'rgba(255,255,255,.15)'; }).attr('stroke-width',function(d){ return q && d.label.toLowerCase().includes(q) ? 2.5 : 1; });
@@ -3134,7 +3762,731 @@ document.addEventListener('DOMContentLoaded',function(){
   // _vscroll(); adding a second listener here ran the whole windowed render
   // twice per scroll event.
 });
+
+/* ══════════════════════════════════════════════════════════════════════════
+   AI Analysis panel
+
+   Everything rendered here comes from a model that read data collected from a
+   third-party target, so every string goes in through textContent / a text
+   node and never through innerHTML. One renderer serves both paths: the
+   result baked into this file by a previous run, and a live one from the
+   bridge.
+   ══════════════════════════════════════════════════════════════════════════ */
+function aiBridge(){ return (window.__RECONX_AI && window.__RECONX_AI.live) ? window.__RECONX_AI : null; }
+
+function aiEl(tag, cls, text){
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+
+function aiCopy(btn, text){
+  try {
+    navigator.clipboard.writeText(text);
+    var old = btn.textContent; btn.textContent = 'copied';
+    setTimeout(function(){ btn.textContent = old; }, 1200);
+  } catch(e) { /* clipboard blocked (file://, no permission) — nothing to do */ }
+}
+
+function aiRow(key, buildValue){
+  var r = aiEl('div','ai-row');
+  r.appendChild(aiEl('div','ai-row-k', key));
+  var v = aiEl('div','ai-row-v');
+  buildValue(v);
+  r.appendChild(v);
+  return r;
+}
+
+function aiRenderLead(ld){
+  var sev = String(ld.severity || 'info').toLowerCase();
+  var wrap = aiEl('div','ai-lead');
+  wrap.setAttribute('data-sev', sev);
+
+  var hd = aiEl('div','ai-lead-hd');
+  hd.appendChild(aiEl('span','ai-rank','#' + (ld.rank != null ? ld.rank : '?')));
+  hd.appendChild(aiEl('span','ai-sev ai-sev-' + sev, sev));
+  hd.appendChild(aiEl('span','ai-lead-ttl', ld.title || '(untitled)'));
+  hd.appendChild(aiEl('span','ai-conf', 'confidence ' + (ld.confidence || '?')));
+  hd.appendChild(aiEl('span','ai-caret','▶'));
+  hd.onclick = function(){ wrap.classList.toggle('open'); };
+  wrap.appendChild(hd);
+
+  var bd = aiEl('div','ai-lead-bd');
+  bd.appendChild(aiRow('Asset', function(v){ v.appendChild(aiEl('span','', ld.asset || '—')); }));
+  bd.appendChild(aiRow('Class', function(v){
+    v.appendChild(document.createTextNode(ld.vuln_class || '—'));
+  }));
+  bd.appendChild(aiRow('Why', function(v){ v.appendChild(document.createTextNode(ld.why || '')); }));
+
+  if (ld.evidence && ld.evidence.length){
+    bd.appendChild(aiRow('Evidence', function(v){
+      ld.evidence.forEach(function(e){ v.appendChild(aiEl('div','ai-ev', e)); });
+    }));
+  }
+  if (ld.verify && ld.verify.length){
+    bd.appendChild(aiRow('Verify', function(v){
+      ld.verify.forEach(function(c){
+        var row = aiEl('div','ai-cmd');
+        row.appendChild(aiEl('span','', c));
+        var b = aiEl('button','','copy');
+        b.onclick = function(ev){ ev.stopPropagation(); aiCopy(b, c); };
+        row.appendChild(b);
+        v.appendChild(row);
+      });
+    }));
+  }
+  bd.appendChild(aiRow('Proves it', function(v){
+    v.appendChild(document.createTextNode(ld.proves_it || ''));
+  }));
+  bd.appendChild(aiRow('N/A if', function(v){
+    v.appendChild(document.createTextNode(ld.false_positive_if || ''));
+  }));
+  wrap.appendChild(bd);
+  return wrap;
+}
+
+function aiRender(res){
+  var out = document.getElementById('ai-out');
+  if (!out) return;
+  out.textContent = '';
+
+  if (res.kind === 'answer'){
+    out.appendChild(aiEl('div','ai-block-lbl', 'Answer'));
+    out.appendChild(aiEl('div','ai-answer', res.answer || ''));
+    aiUsage(out, res.meta);
+    return;
+  }
+
+  if (res.verdict) out.appendChild(aiEl('div','ai-verdict', res.verdict));
+
+  var gaps = res.coverage_gaps || [];
+  if (gaps.length){
+    out.appendChild(aiEl('div','ai-block-lbl','Coverage gaps — what this scan did NOT establish'));
+    var g = aiEl('div','ai-gaps'), gl = aiEl('ul');
+    gaps.forEach(function(x){ gl.appendChild(aiEl('li','', x)); });
+    g.appendChild(gl); out.appendChild(g);
+  }
+
+  var leads = res.leads || [];
+  out.appendChild(aiEl('div','ai-block-lbl',
+    leads.length ? ('Leads (' + leads.length + ') — unverified hypotheses, ranked')
+                 : 'Leads — none'));
+  if (!leads.length){
+    out.appendChild(aiEl('div','ai-note',
+      'Nothing in the evidence supported a lead worth testing. That is an answer, not a failure.'));
+  }
+  leads.forEach(function(ld){ out.appendChild(aiRenderLead(ld)); });
+  if (leads.length === 1) out.querySelector('.ai-lead').classList.add('open');
+
+  var dis = res.dismissed || [];
+  if (dis.length){
+    out.appendChild(aiEl('div','ai-block-lbl','Dismissed (' + dis.length + ') — checked and ruled out'));
+    var d = aiEl('div','ai-dismissed');
+    dis.forEach(function(x){
+      var line = aiEl('div');
+      var b = aiEl('b','', x.item || ''); line.appendChild(b);
+      line.appendChild(document.createTextNode(' — ' + (x.why || '')));
+      d.appendChild(line);
+    });
+    out.appendChild(d);
+  }
+
+  var nxt = res.next_recon || [];
+  if (nxt.length){
+    out.appendChild(aiEl('div','ai-block-lbl','Next recon'));
+    var n = aiEl('div','ai-plain'), nl = aiEl('ul');
+    nxt.forEach(function(x){ nl.appendChild(aiEl('li','', x)); });
+    n.appendChild(nl); out.appendChild(n);
+  }
+  aiUsage(out, res.meta, res.cached);
+}
+
+function aiUsage(out, meta, cached){
+  if (!meta) return;
+  var u = meta.usage || {};
+  var parts = [meta.model || '', (meta.duration_sec || '?') + 's'];
+  // Which backend answered: the API, or the claude CLI on a subscription.
+  if (meta.backend === 'claude-cli') parts.splice(1, 0, 'via claude CLI (subscription)');
+  if (u.input_tokens != null) parts.push('in ' + u.input_tokens.toLocaleString());
+  if (u.cache_read_input_tokens) parts.push('cache read ' + u.cache_read_input_tokens.toLocaleString());
+  if (u.output_tokens != null) parts.push('out ' + u.output_tokens.toLocaleString());
+  if (meta.evidence_bytes) parts.push('evidence ' + Math.round(meta.evidence_bytes/1024) + 'KB');
+  if (meta.generated) parts.push(meta.generated);
+  if (cached) parts.push('cached result');
+  out.appendChild(aiEl('div','ai-usage', parts.filter(Boolean).join('  ·  ')));
+}
+
+var _aiTimer = null;
+function aiBusy(on, label){
+  var btn = document.getElementById('ai-run');
+  var re  = document.getElementById('ai-rerun');
+  var st  = document.getElementById('ai-status');
+  if (btn) btn.disabled = on;
+  if (re)  re.disabled = on;
+  if (_aiTimer) { clearInterval(_aiTimer); _aiTimer = null; }
+  if (!st) return;
+  st.textContent = '';
+  if (!on) return;
+  var t0 = Date.now();
+  var tick = function(){
+    var s = Math.round((Date.now() - t0) / 1000);
+    st.textContent = '';
+    st.appendChild(aiEl('span','ai-spin'));
+    st.appendChild(document.createTextNode((label || 'analysing') + '… ' + s + 's'));
+  };
+  tick();
+  _aiTimer = setInterval(tick, 1000);
+}
+
+function aiError(msg){
+  var out = document.getElementById('ai-out');
+  if (!out) return;
+  out.textContent = '';
+  var e = aiEl('div','ai-note ai-note-err');
+  e.appendChild(aiEl('strong','','AI analysis failed: '));
+  e.appendChild(document.createTextNode(msg));
+  out.appendChild(e);
+}
+
+/* ── Live stream pane ────────────────────────────────────────────────────
+   A full review runs for minutes. Without live output the panel is a spinner
+   and a counter, which reads as a hang — so the analysis is streamed token by
+   token and shown as it is produced. */
+var _aiTerm = {on:false, t0:0, timer:null, last:null};
+
+function aiTermOpen(label){
+  var box = document.getElementById('ai-term');
+  var body = document.getElementById('ai-term-body');
+  var lbl = document.getElementById('ai-term-lbl');
+  if (!box || !body) return;
+  body.textContent = '';
+  box.classList.add('on');
+  if (lbl) lbl.textContent = label || 'analysing';
+  _aiTerm.on = true; _aiTerm.t0 = Date.now(); _aiTerm.last = null;
+  var cur = aiEl('span','ai-term-cur'); body.appendChild(cur);
+  if (_aiTerm.timer) clearInterval(_aiTerm.timer);
+  _aiTerm.timer = setInterval(function(){
+    var el = document.getElementById('ai-term-el');
+    if (el) el.textContent = Math.round((Date.now() - _aiTerm.t0)/1000) + 's';
+  }, 1000);
+}
+
+function aiTermWrite(kind, text){
+  var body = document.getElementById('ai-term-body');
+  if (!body) return;
+  var cur = body.querySelector('.ai-term-cur');
+  var cls = kind === 'thinking' ? 'th' : (kind === 'status' ? 'st' : 'tx');
+  // Append into the previous run of the same kind so the DOM does not grow a
+  // node per token on a 40k-token answer.
+  if (_aiTerm.last && _aiTerm.last.className === cls){
+    _aiTerm.last.appendChild(document.createTextNode(text));
+  } else {
+    var span = aiEl('span', cls, text);
+    body.insertBefore(span, cur || null);
+    _aiTerm.last = span;
+  }
+  var near = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  if (near) body.scrollTop = body.scrollHeight;
+}
+
+function aiTermClose(){
+  if (_aiTerm.timer) { clearInterval(_aiTerm.timer); _aiTerm.timer = null; }
+  var cur = document.querySelector('#ai-term-body .ai-term-cur');
+  if (cur) cur.remove();
+  var dot = document.querySelector('.ai-term-dot');
+  if (dot) dot.style.animation = 'none';
+  var lbl = document.getElementById('ai-term-lbl');
+  if (lbl) lbl.textContent = 'done';
+  _aiTerm.on = false;
+}
+
+function aiStream(body, label){
+  var br = aiBridge();
+  if (!br) return;
+  aiBusy(true, label);
+  aiTermOpen(label);
+  var out = document.getElementById('ai-out');
+  if (out) out.textContent = '';
+
+  fetch(br.base + '/api/analyze/stream', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-ReconX-Token': br.token},
+    body: JSON.stringify(body)
+  }).then(function(r){
+    if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || ('HTTP ' + r.status)); });
+    var reader = r.body.getReader();
+    var dec = new TextDecoder();
+    var buf = '';
+    function pump(){
+      return reader.read().then(function(res){
+        if (res.done) { aiBusy(false); aiTermClose(); return; }
+        buf += dec.decode(res.value, {stream:true});
+        var lines = buf.split('\n');
+        buf = lines.pop();
+        lines.forEach(function(line){
+          if (!line.trim()) return;
+          var ev;
+          try { ev = JSON.parse(line); } catch(e) { return; }
+          if (ev.t === 'thinking' || ev.t === 'text') aiTermWrite(ev.t, ev.v);
+          else if (ev.t === 'status') aiTermWrite('status', '\n' + ev.v + '\n');
+          else if (ev.t === 'error') { aiBusy(false); aiTermClose(); aiError(ev.v); }
+          else if (ev.t === 'done') {
+            aiBusy(false); aiTermClose(); aiRender(ev.v);
+            var re = document.getElementById('ai-rerun');
+            var ask = document.getElementById('ai-ask');
+            if (re) re.hidden = false;
+            if (ask) ask.hidden = false;
+          }
+        });
+        return pump();
+      });
+    }
+    return pump();
+  }).catch(function(e){
+    aiBusy(false); aiTermClose();
+    aiError('could not reach the local AI bridge (' + e.message + ')');
+  });
+}
+
+function aiPost(body, label){
+  var br = aiBridge();
+  if (!br) return;
+  aiBusy(true, label);
+  fetch(br.base + '/api/analyze', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-ReconX-Token': br.token},
+    body: JSON.stringify(body)
+  }).then(function(r){
+    return r.json().then(function(j){ return {ok: r.ok, body: j}; });
+  }).then(function(r){
+    aiBusy(false);
+    if (!r.ok || r.body.error) { aiError(r.body.error || ('HTTP ' + r.status)); return; }
+    aiRender(r.body);
+    var re = document.getElementById('ai-rerun');
+    var ask = document.getElementById('ai-ask');
+    if (re) re.hidden = false;
+    if (ask) ask.hidden = false;
+  }).catch(function(e){
+    aiBusy(false);
+    aiError('could not reach the local AI bridge (' + e + ')');
+  });
+}
+
+function aiRun(refresh){
+  // A cached result comes straight back; anything that really runs is streamed.
+  if (!refresh && window.__RECONX_AI_RESULT && Object.keys(window.__RECONX_AI_RESULT).length){
+    aiPost({refresh:false}, 'loading');
+    return;
+  }
+  aiStream({refresh:true}, refresh ? 're-analysing' : 'analysing');
+}
+
+function aiAsk(){
+  var inp = document.getElementById('ai-q');
+  if (!inp || !inp.value.trim()) return;
+  var q = inp.value.trim();
+  inp.value = '';
+  aiStream({question: q}, 'thinking');
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  var cached = window.__RECONX_AI_RESULT;
+  var live = aiBridge();
+  var offline = document.getElementById('ai-offline');
+  var run = document.getElementById('ai-run');
+  var re = document.getElementById('ai-rerun');
+  var ask = document.getElementById('ai-ask');
+
+  if (cached && Object.keys(cached).length){
+    cached.cached = true;
+    aiRender(cached);
+    if (re && live) re.hidden = false;
+    if (ask && live) ask.hidden = false;
+    if (run) run.textContent = live ? '✨ Run AI Analysis again' : '✨ Run AI Analysis';
+  }
+  if (!live){
+    if (run) run.disabled = true;
+    if (offline) offline.hidden = false;
+  }
+  var q = document.getElementById('ai-q');
+  if (q) q.addEventListener('keydown', function(e){ if (e.key === 'Enter') aiAsk(); });
+});
+
+// ── On-demand Scan Center ───────────────────────────────────────────────────
+function scanBridge(){ return (window.__RECONX_AI && window.__RECONX_AI.live) ? window.__RECONX_AI : null; }
+function rxRetest(btn){
+  var url = btn.getAttribute('data-retest') || '';
+  var br = (typeof scanBridge === 'function') ? scanBridge() : null;
+  if (!br){
+    btn.textContent = 'open via bridge';
+    return;
+  }
+  var old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
+  fetch(br.base + '/api/retest', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-ReconX-Token': br.token},
+    body: JSON.stringify({url: url})
+  }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res){
+      btn.disabled = false;
+      if (!res.ok){ btn.textContent = res.j.error || 'failed'; return; }
+      var loc = res.j.location ? (' → ' + res.j.location) : '';
+      btn.textContent = 'HTTP ' + res.j.status + loc;
+    }).catch(function(){ btn.disabled = false; btn.textContent = old; });
+}
+function scanFocus(t){
+  showSection('scans');
+  var c = document.getElementById('scard-' + t);
+  if (c){ c.scrollIntoView({behavior:'smooth', block:'center'});
+          c.classList.add('scan-flash'); setTimeout(function(){ c.classList.remove('scan-flash'); }, 1300); }
+}
+function scanLog(s){ var c = document.getElementById('scan-console'); if(!c) return; c.textContent += s + '\n'; c.scrollTop = c.scrollHeight; }
+function scanBadge(t, txt, cls){
+  ['sbadge-','cbadge-'].forEach(function(p){ var b = document.getElementById(p + t);
+    if (b){ b.textContent = txt; b.className = 'nav-cnt ' + (cls || ''); } });
+}
+function scanBusy(active, on){
+  var stop = document.getElementById('sstop-' + active);
+  if (stop) stop.hidden = !on;
+  document.querySelectorAll('[data-srun]').forEach(function(b){
+    b.disabled = on && b.getAttribute('data-srun') !== active; });
+}
+function scanStart(t){
+  var br = scanBridge();
+  if (!br){ alert('This report is open as a static file.\\nRun scans by opening it through the local bridge:\\n\\n  python3 reconx_ai.py serve <session-dir>'); return; }
+  scanFocus(t);
+  var live = document.getElementById('scan-live'); if (live) live.hidden = false;
+  var cons = document.getElementById('scan-console'); if (cons) cons.textContent = '';
+  var stt = document.getElementById('scan-status'); if (stt) stt.textContent = 'running ' + t + '…';
+  var res = document.getElementById('sres-' + t); if (res) res.textContent = 'running…';
+  scanBusy(t, true); scanBadge(t, '…', 'cnt-blue');
+  fetch(br.base + '/api/scan/start', {
+    method:'POST', headers:{'Content-Type':'application/json','X-ReconX-Token': br.token},
+    body: JSON.stringify({type: t})
+  }).then(function(r){
+    if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || ('HTTP ' + r.status)); });
+    var reader = r.body.getReader(), dec = new TextDecoder(), buf = '';
+    function pump(){ return reader.read().then(function(res){
+      if (res.done){ scanBusy(t, false); return; }
+      buf += dec.decode(res.value, {stream:true});
+      var lines = buf.split('\n'); buf = lines.pop();
+      lines.forEach(function(line){ if (!line.trim()) return; var ev;
+        try { ev = JSON.parse(line); } catch(e){ return; }
+        if (ev.t === 'log') scanLog(ev.v);
+        else if (ev.t === 'status') scanLog('=== ' + ev.v + ' ===');
+        else if (ev.t === 'error'){ scanLog('[error] ' + ev.v); scanBusy(t, false);
+          scanBadge(t, 'ERR', 'cnt-red'); var s2 = document.getElementById('scan-status'); if (s2) s2.textContent = 'error'; }
+        else if (ev.t === 'done') scanDone(t, ev.v);
+      });
+      return pump();
+    }); }
+    return pump();
+  }).catch(function(e){
+    scanBusy(t, false); scanLog('[bridge error] ' + e.message);
+    var s3 = document.getElementById('scan-status'); if (s3) s3.textContent = 'bridge error';
+    scanBadge(t, 'ERR', 'cnt-red');
+  });
+}
+function scanDone(t, v){
+  scanBusy(t, false);
+  var n = (v && v.state) ? (v.state.findings || 0) : 0;
+  var err = (v && v.state && v.state.tool_error);
+  scanBadge(t, err ? 'ERR' : (n ? String(n) : '✓'), err ? 'cnt-red' : (n ? 'cnt-red' : 'cnt-green'));
+  var stt = document.getElementById('scan-status'); if (stt) stt.textContent = 'done — reloading to show results…';
+  scanLog('=== scan finished (rc=' + (v ? v.rc : '?') + ') — reloading report ===');
+  setTimeout(function(){ location.reload(); }, 1600);
+}
+function scanStop(){
+  var br = scanBridge(); if (!br) return;
+  fetch(br.base + '/api/scan/stop', {
+    method:'POST', headers:{'Content-Type':'application/json','X-ReconX-Token': br.token}, body:'{}'
+  }).then(function(r){ return r.json(); }).then(function(){ scanLog('=== stop requested ==='); }).catch(function(){});
+}
+function scanRefreshState(){
+  var br = scanBridge(); if (!br) return;
+  fetch(br.base + '/api/scan/state', {headers:{'X-ReconX-Token': br.token}})
+  .then(function(r){ return r.json(); }).then(function(j){
+    var s = j.scans || {};
+    Object.keys(s).forEach(function(t){ var it = s[t];
+      if (it.running) scanBadge(t, '…', 'cnt-blue');
+      else if (it.tool_error) scanBadge(t, 'ERR', 'cnt-red');
+      else if (it.ran) scanBadge(t, it.findings ? String(it.findings) : '✓', it.findings ? 'cnt-red' : 'cnt-green');
+    });
+    if (j.active){ var live = document.getElementById('scan-live'); if (live) live.hidden = false; scanBusy(j.active, true); }
+  }).catch(function(){});
+}
+document.addEventListener('DOMContentLoaded', function(){ try { scanRefreshState(); } catch(e){} });
 """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Scan Center — XSS and Nuclei already run in the default pass; these cards
+# re-run them or start the scans that stay off that pass (ports, redirect, CORS,
+# takeover, buckets) through the local bridge. Keep this list aligned with
+# reconx_ai.SCAN_TYPES.
+# ══════════════════════════════════════════════════════════════════════════════
+#          type          icon   label                 summary-key  metric-key         description
+SCAN_UI = [
+    ("xss",          "💥", "XSS (Dalfox)",        "stage6",  "findings",
+     "Reflected / stored XSS on the high-value URLs, with headless alert proof."),
+    ("nuclei",       "🧨", "Nuclei",              "stage7",  "findings",
+     "CVE + DAST templates over the full live-URL corpus."),
+    ("openredirect", "↪️", "Open Redirect",       "stage15", "findings",
+     "nuclei redirect templates on URLs whose params look like a redirect sink."),
+    ("network",      "📡", "Network / Port",      "stage14", "open_ports_total",
+     "naabu port discovery, then nmap -sV service/version on the open ports."),
+    ("cors",         "🌐", "CORS",                "stage12", "cors_vulnerable",
+     "Cross-origin resource-sharing misconfiguration on the alive hosts."),
+    ("takeover",     "🪝", "Subdomain Takeover",  "stage12", "takeover_vulnerable",
+     "Dangling-CNAME takeover check across the discovered subdomains."),
+    ("bucket",       "🪣", "Cloud Bucket",        "stage12", "bucket_public",
+     "Public S3 / GCS / Azure bucket exposure from the discovered assets."),
+]
+# scans whose full findings live in their own report section (link "View details")
+_SCAN_SECTION = {"xss": "xss", "nuclei": "nuclei", "openredirect": "openredirect",
+                 "cors": "extra", "takeover": "extra", "bucket": "extra"}
+
+
+def _parse_network(d: Path) -> dict:
+    """stage14 naabu/nmap results — {hosts:[{host,ports:[{port,service,...}]}]}."""
+    p = Path(d) / "14_network" / "network_results.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(errors="ignore")) or {"hosts": []}
+        except Exception:
+            pass
+    return {"hosts": []}
+
+
+def _parse_openredirect(d: Path) -> dict:
+    """stage15 OpenRedireX + canary-verification results."""
+    p = Path(d) / "15_open_redirect" / "open_redirect_results.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(errors="ignore")) or {}
+        except Exception:
+            pass
+    return {}
+
+
+def _scan_status_map(smry_json: dict) -> dict:
+    """Per-scan-type status for the Scan Center cards + sidebar badges, from the
+    session SUMMARY.json (regenerated after every stage run)."""
+    stages = (smry_json or {}).get("stages") or {}
+    out = {}
+    for t, icon, label, skey, mkey, desc in SCAN_UI:
+        s = stages.get(skey) or {}
+        status = s.get("status") or ""
+        if skey == "stage12" and status == "done":
+            chk = {"cors": "cors_checked", "takeover": "takeover_checked",
+                   "bucket": "bucket_checked"}[t]
+            ran = int(s.get(chk, 0) or 0) > 0
+        else:
+            ran = status in ("done", "tool_error", "partial")
+        out[t] = {
+            "icon": icon, "label": label, "desc": desc,
+            "ran": bool(ran), "status": status or "available",
+            "findings": int(s.get(mkey, 0) or 0) if ran else 0,
+            "tool_error": bool(s.get("tool_failed")),
+            "interrupted": bool(s.get("interrupted")),
+            "duration": s.get("duration_sec", 0),
+        }
+    return out
+
+
+def _scan_badge_attrs(st: dict):
+    """(text, css-color-class) for a scan's status badge."""
+    if st.get("tool_error"):
+        return "ERR", "cnt-red"
+    if not st.get("ran"):
+        return "•", ""
+    n = st.get("findings", 0)
+    return (str(n), "cnt-red") if n else ("✓", "cnt-green")
+
+
+def _scan_sidebar(scan_map: dict) -> str:
+    items = ['<div class="nav-grp"><div class="nav-lbl">More scans</div>',
+             '  <a class="nav-a" data-sid="scans" onclick="showSection(\'scans\',this)">'
+             '<span class="nav-ico">🎯</span>Scan Center</a>']
+    for t, icon, label, *_ in SCAN_UI:
+        txt, cls = _scan_badge_attrs(scan_map.get(t, {}))
+        items.append(
+            f'  <a class="nav-a" data-scan="{t}" onclick="scanFocus(\'{t}\')">'
+            f'<span class="nav-ico">{icon}</span>{_e(label)}'
+            f'<span class="nav-cnt {cls}" id="sbadge-{t}">{txt}</span></a>')
+    items.append('</div>')
+    return "\n".join(items)
+
+
+def _network_table(network: dict) -> str:
+    hosts = [h for h in (network.get("hosts") or []) if h.get("ports")]
+    if not hosts:
+        return ""
+    rows = []
+    for h in hosts:
+        for pt in h.get("ports", []):
+            svc = " ".join(x for x in (pt.get("service", ""), pt.get("product", ""),
+                                       pt.get("version", "")) if x) or "—"
+            rows.append(
+                f'<tr><td style="font-family:var(--mono);color:var(--text)">{_e(h.get("host",""))}</td>'
+                f'<td style="font-family:var(--mono);color:var(--accent2,#8ab4ff)">{pt.get("port","")}/{_e(pt.get("proto","tcp"))}</td>'
+                f'<td style="color:var(--text-dim)">{_e(svc)}</td></tr>')
+    return (
+        '<div style="overflow:auto;margin-top:10px"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        '<thead><tr style="text-align:left;color:var(--muted)">'
+        '<th style="padding:6px 10px">Host</th><th style="padding:6px 10px">Port</th>'
+        '<th style="padding:6px 10px">Service / Version</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>')
+
+
+def _section_openredirect(oredir: dict) -> str:
+    findings = oredir.get("findings", []) or []
+    # Older result files were written without "status". A file that lists
+    # findings or a checked count is a finished scan; only a missing file
+    # means the stage has not run.
+    ran = bool(oredir) and (
+        oredir.get("status") in ("done", "partial", "tool_error")
+        or "findings" in oredir
+        or oredir.get("checked") is not None
+    )
+    checked = int(oredir.get("checked", 0) or 0)
+    canary = oredir.get("canary", "")
+    tool = oredir.get("tool", "")
+
+    if not ran:
+        body = ('<div class="cat-desc" style="margin-bottom:10px">'
+                'Not scanned yet — run <strong>Open Redirect</strong> from the '
+                'Scan Center.</div>')
+        return (f'<div id="s-openredirect" class="section">'
+                f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+                f'<h2>↪️ Open Redirect</h2><p class="sec-sub">not scanned yet</p>'
+                f'</div></div></div>{body}</div>')
+
+    stat_row = [_stat(len(findings), "Confirmed", "red" if findings else "green", "↪️"),
+                _stat(checked, "URLs tested", "blue", "🎯")]
+    body = (f'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;'
+            f'margin-bottom:14px">{"".join(stat_row)}</div>')
+    meta_bits = []
+    if tool:
+        meta_bits.append(f"fuzzer: {_e(tool)}")
+    if canary:
+        meta_bits.append(f"canary host: {_e(canary)}")
+    if oredir.get("interrupted"):
+        meta_bits.append("interrupted — coverage may be partial")
+    if meta_bits:
+        body += (f'<div style="font-size:11px;color:var(--muted);margin:-6px 0 14px">'
+                 f'{" &middot; ".join(meta_bits)}</div>')
+    body += ('<div class="cat-desc" style="margin-bottom:14px">'
+             'Each redirect-like parameter is injected with a canary host; a finding '
+             'is confirmed only when the target returns a <code>Location</code> header '
+             'pointing off-domain to that canary — a replayable proof, not just '
+             '"a redirect happened".</div>')
+
+    if findings:
+        rows = []
+        for f in findings:
+            poc = f.get("test_url", "")
+            rows.append(
+                '<tr>'
+                f'<td style="padding:8px 10px;font-family:var(--mono);color:var(--text);word-break:break-all">{_e(f.get("url",""))}</td>'
+                f'<td style="padding:8px 10px;font-family:var(--mono);color:var(--accent2,#8ab4ff)">{_e(f.get("param",""))}</td>'
+                f'<td style="padding:8px 10px;font-family:var(--mono);color:#ff8f8f;word-break:break-all">{_e(f.get("location","")[:160])}</td>'
+                f'<td style="padding:8px 10px;font-family:var(--mono);color:var(--text-dim)">{f.get("status","")}</td>'
+                f'<td style="padding:8px 10px"><button class="btn-sm" onclick="copyOne(this)" '
+                f'data-copy="{_e(poc)}">Copy PoC</button> {_retest_btn(poc)}</td>'
+                '</tr>')
+        body += (
+            '<div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+            '<thead><tr style="text-align:left;color:var(--muted)">'
+            '<th style="padding:8px 10px">URL</th>'
+            '<th style="padding:8px 10px">Parameter</th>'
+            '<th style="padding:8px 10px">Confirmed redirect (Location)</th>'
+            '<th style="padding:8px 10px">Status</th>'
+            '<th style="padding:8px 10px">PoC</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>')
+    else:
+        body += ('<div class="alert-box" style="background:rgba(34,197,94,.08);'
+                 'border-color:rgba(34,197,94,.3);color:#6ee7a2">'
+                 '✓ No parameter followed the canary off-domain — no confirmed open redirect.</div>')
+
+    if oredir.get("tool_raw"):
+        body += (f'<div style="font-size:11px;color:var(--muted);margin-top:12px">'
+                 f'Raw {_e(tool or "fuzzer")} output: '
+                 f'<code>{_e(str(oredir.get("tool_raw","")))}</code></div>')
+
+    return (f'<div id="s-openredirect" class="section">'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>↪️ Open Redirect</h2>'
+            f'<p class="sec-sub">{len(findings):,} confirmed &middot; {checked:,} tested</p>'
+            f'</div></div></div>{body}</div>')
+
+
+def _section_scans(scan_map: dict, network: dict) -> str:
+    cards = []
+    for t, icon, label, skey, mkey, desc in SCAN_UI:
+        st = scan_map.get(t, {})
+        btxt, bcls = _scan_badge_attrs(st)
+        ran = st.get("ran")
+        if st.get("tool_error"):
+            resline = '⚠ tool error — see the console / raw output'
+        elif not ran:
+            resline = 'Not scanned yet — press Run.'
+        else:
+            n = st.get("findings", 0)
+            noun = {"network": "open port(s)"}.get(t, "finding(s)")
+            resline = (f'{n:,} {noun}' if n else 'Completed — no findings')
+            dur = _fmt_dur(st.get("duration"))
+            if dur:
+                resline += f' · {dur}'
+            if st.get("interrupted"):
+                resline += ' (interrupted — may be incomplete)'
+        detail = _network_table(network) if (t == "network" and ran) else ""
+        view = ""
+        if _SCAN_SECTION.get(t) and ran:
+            view = (f'<a class="scan-view" style="font-size:12px;color:var(--accent2,#8ab4ff);'
+                    f'cursor:pointer" onclick="showSection(\'{_SCAN_SECTION[t]}\')">View details →</a>')
+        run_label = "Re-run" if ran else "Run"
+        cards.append(
+            f'<div class="scan-card" id="scard-{t}">'
+            f'<h4>{icon} {_e(label)}<span class="nav-cnt {bcls}" id="cbadge-{t}" '
+            f'style="margin-left:auto">{btxt}</span></h4>'
+            f'<div class="scan-desc">{_e(desc)}</div>'
+            f'<div class="scan-res" id="sres-{t}">{resline}</div>'
+            f'{detail}'
+            f'<div class="scan-actions">'
+            f'<button class="btn-run" id="srun-{t}" data-srun="{t}" '
+            f'onclick="scanStart(\'{t}\')">{run_label}</button>'
+            f'<button class="btn-stop" id="sstop-{t}" onclick="scanStop()" hidden>Stop</button>'
+            f'{view}</div>'
+            f'</div>')
+
+    intro = (
+        '<div class="cat-desc" style="margin-bottom:6px">'
+        'XSS and Nuclei run with the main scan. These cards re-run them, or start the scans '
+        'that stay off that pass: open redirect, ports, CORS, subdomain takeover and cloud '
+        'buckets. Each writes back into this report; the page reloads when a scan finishes.</div>'
+        '<div style="font-size:11px;color:var(--muted);margin-bottom:4px">'
+        'Requires the report to be open through the local bridge '
+        '(<code>reconx_ai.py serve</code>, started automatically after recon). '
+        'Opened as a plain file, the Run buttons are inert.</div>')
+
+    live = (
+        '<div id="scan-live" hidden style="margin-top:16px">'
+        '<div style="display:flex;align-items:center;gap:10px">'
+        '<strong style="font-size:13px">Live output</strong>'
+        '<span id="scan-status" style="font-size:12px;color:var(--muted)"></span>'
+        '<button class="btn-stop" onclick="scanStop()" style="margin-left:auto">Stop scan</button>'
+        '</div><pre class="scan-console" id="scan-console"></pre></div>')
+
+    return (f'<div id="s-scans" class="section">'
+            f'<div class="sec-hdr"><div class="sec-hdr-inner"><div>'
+            f'<h2>🎯 Scan Center</h2>'
+            f'<p class="sec-sub">On-demand active scans &middot; one click each</p>'
+            f'</div></div></div>'
+            f'{intro}<div class="scan-grid">{"".join(cards)}</div>{live}</div>')
 
 
 def build_report(scan_dir, target: str, summary: dict = None) -> Path:
@@ -3153,7 +4505,21 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
     tech     = _parse_tech(scan_dir)
     extra    = _parse_extra(scan_dir)
     api      = _parse_api(scan_dir)            # v6.13+: CORS / Takeover / Bucket
-    vuln_map = _build_vuln_map(nuc, xss, extra)   # feeds the Threat Map's severity layer
+    network  = _parse_network(scan_dir)        # v9.4: stage14 naabu/nmap ports
+    oredir   = _parse_openredirect(scan_dir)    # v9.4: stage15 open-redirect
+    scan_map = _scan_status_map(smry_json)      # v9.4: on-demand scan status
+    try:
+        _st_stages = (json.loads((Path(scan_dir) / "checkpoints" / "state.json")
+                                 .read_text(errors="ignore")) or {}).get("stages") or {}
+    except Exception:
+        _st_stages = {}
+    _stage_num = {"stage6": "6", "stage7": "7", "stage12": "12", "stage14": "14", "stage15": "15"}
+    for _t, _icon, _label, _skey, _mkey, _desc in SCAN_UI:
+        _rec = _st_stages.get(_stage_num.get(_skey, "")) or {}
+        if _rec.get("duration_sec") and not (scan_map.get(_t) or {}).get("duration"):
+            scan_map[_t]["duration"] = _rec["duration_sec"]
+    ai       = _parse_ai(scan_dir)             # v9.1: saved AI analysis, if any
+    vuln_map = _build_vuln_map(nuc, xss, extra, oredir)   # feeds the Threat Map's severity layer
     extra_vuln_n = (sum(1 for r in extra.get("cors", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("takeover", []) if r.get("vulnerable")) +
                     sum(1 for r in extra.get("buckets", []) if r.get("public_listing")))
@@ -3190,14 +4556,19 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
   {_nav("🔗","All URLs","urls", len(urls.get("_all",[])))}
   {_nav("⚙️","Parameters","params")}
   {_nav("📂","Categorised","categorised")}
-</div>
-<div class="nav-grp"><div class="nav-lbl">Findings</div>
-  {_nav("🧨" if not nuc.get("meta",{}).get("tool_failed") else "⚠️","Nuclei","nuclei", len(nuc.get("findings",[])) if not nuc.get("meta",{}).get("tool_failed") else "ERR", "red")}
-  {_nav("💥" if not xss.get("meta",{}).get("tool_failed") else "⚠️","XSS","xss", len(xss.get("findings",[])) if not xss.get("meta",{}).get("tool_failed") else "ERR", "orange" if not xss.get("meta",{}).get("tool_failed") else "red")}
-  {_nav("🛡️","Extra Checks","extra", extra_vuln_n, "red" if extra_vuln_n else None)}
   {_nav("🔑","JS Secrets","js", len(js.get("secrets",[])), "purple")}
   {_nav("⚡","API Discovery","api", len(api.get("probes",[])) + sum(len(v) for v in api.get("found",{}).values()))}
   {_nav("⚙️","Tech Priority","tech", len(tech), "blue")}
+</div>
+{_scan_sidebar(scan_map)}
+<div class="nav-grp"><div class="nav-lbl">Scan results</div>
+  {_nav("🧨" if not nuc.get("meta",{}).get("tool_failed") else "⚠️","Nuclei","nuclei", len(nuc.get("findings",[])) if not nuc.get("meta",{}).get("tool_failed") else "ERR", "red")}
+  {_nav("💥" if not xss.get("meta",{}).get("tool_failed") else "⚠️","XSS","xss", len(xss.get("findings",[])) if not xss.get("meta",{}).get("tool_failed") else "ERR", "orange" if not xss.get("meta",{}).get("tool_failed") else "red")}
+  {_nav("↪️","Open Redirect","openredirect", len(oredir.get("findings",[])) if oredir else None, "red" if (oredir.get("findings") if oredir else None) else None)}
+  {_nav("🛡️","Extra Checks","extra", extra_vuln_n, "red" if extra_vuln_n else None)}
+</div>
+<div class="nav-grp"><div class="nav-lbl">Analysis</div>
+  {_nav("✨","AI Analysis","ai", len(ai.get("leads") or []) if ai else None, "purple")}
 </div>
 <hr class="nav-hr">
 <div class="sb-hint">
@@ -3207,7 +4578,8 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
 
     sections = "".join([
         _section_overview(target, ts, recon, subs, alive, urls, smry_json,
-                          nuc=nuc, xss=xss, js=js, tech=tech, extra=extra),
+                          nuc=nuc, xss=xss, js=js, tech=tech, extra=extra,
+                          scan_dir=scan_dir, oredir=oredir),
         _section_threatmap(target, subs, alive, vuln_map=vuln_map),
         _section_recon(recon),
         _section_subdomains(subs),
@@ -3215,12 +4587,15 @@ def build_report(scan_dir, target: str, summary: dict = None) -> Path:
         _section_urls(urls, prune=(smry_json.get("stages", {}).get("stage4") or {}).get("prune")),
         _section_params(urls),
         _section_categorised(urls),
+        _section_scans(scan_map, network),
         _section_nuclei(nuc),
         _section_xss(xss),
+        _section_openredirect(oredir),
         _section_extra(extra),
         _section_api(api),
         _section_js(js),
         _section_tech(tech),
+        _section_ai(ai, scan_dir),
     ])
 
     # ── Export Button HTML (fixed top-right) ──────────────────────────────────

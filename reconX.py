@@ -4,7 +4,7 @@ import atexit, os, sys, re, json, yaml, time, logging, argparse, html, sqlite3, 
 import subprocess, shutil, threading, signal, shlex, csv, tempfile
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # v6.9: stdout/stderr kodlamasini UTF-8'e zorla. cp1252 (Windows) veya C-locale
@@ -110,7 +110,16 @@ _SPINNER_PAUSE = threading.Event()
 def _spinner(stop_evt: threading.Event, label: str):
     frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
     i = 0
+    # A pipe (the Scan Center live console) never sees a carriage-return
+    # spinner — those frames sit in a buffer until a newline. Emit one
+    # progress line every 20s instead, so a long tool looks alive.
     if not sys.stdout.isatty():
+        last_beat = time.time()
+        while not stop_evt.is_set():
+            if time.time() - last_beat >= 20:
+                print(f"  {C.DIM}… {label} still running{C.RESET}", flush=True)
+                last_beat = time.time()
+            time.sleep(0.5)
         return
     while not stop_evt.is_set():
         if _SPINNER_PAUSE.is_set():
@@ -129,7 +138,7 @@ def stage(n, t):
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CFG_FILE = BASE_DIR / "config.yaml"
-VERSION = "8.9"
+VERSION = "9.5"
 ANSI_RE  = re.compile(r"\x1b\[[0-9;]*m")
 
 def strip_ansi(s: str) -> str:
@@ -339,25 +348,61 @@ def load_config(path=None):
             "prune_dead_urls_filter_codes": "404",
             "xss_alert_screenshots": True,
             "xss_alert_screenshots_max": 15,
+            "xss_verify_payloads_per_point": 4,
+            "xss_verify_max_checks": 60,
+            "xss_verify_budget_sec": 3600,
         },
-        "api_keys": {},
+        "api_keys": {"anthropic": ""},
         "tools": {
-            "nuclei_severity": "critical,high,medium",
+            "nuclei_severity": "critical,high,medium,low",
             "nuclei_templates": "",
             "nuclei_excluded_tags": "intrusive,dos",
             "nuclei_stats_interval": 5,
             "nuclei_tech_fastpass": True,
             "nuclei_rate_limit": 150,
             "nuclei_concurrency": 25,
-            "nuclei_retries": 2,
+            "nuclei_retries": 1,
+            "nuclei_max_targets": 0,
+            "nuclei_dedup_url_shapes": True,
+            "nuclei_max_host_error": 30,
+            "nuclei_scan_strategy": "auto",
+            "nuclei_stall_timeout_sec": 300,
             "blind_xss_callback": "",
             "dalfox_custom_payload": "",
             "dalfox_blind": False,
             "dalfox_test_path_only": False,
             "dalfox_path_only_max": 100,
             "dalfox_dedup_query_params": True,
-            "dalfox_max_targets": 40,
-            "dalfox_time_budget_sec": 2400,
+            # v9.3: skip dalfox's own parameter mining by default. ReconX already
+            # feeds dalfox a corpus of real crawled/wayback URLs with their params
+            # present, so dalfox re-guessing param names is mostly redundant — and
+            # on targets that reflect ANY param name (e.g. testasp.vulnweb.com,
+            # many search/error pages) dict+DOM mining discovers dozens of bogus
+            # "reflected" params and tests the full payload set against each,
+            # exploding per-URL time until the whole scan hits its budget and
+            # surfaces nothing — even on a URL whose real param (already in the
+            # corpus) is trivially vulnerable. Proven on testasp Search.asp?tfSearch:
+            # full mining timed out at 90s+ with 0 completed targets; "all" finished
+            # in 51s and still reported the tfSearch XSS. Values: "all" (skip
+            # dict+DOM, fastest), "dom", "dict", "" / "none" (full mining, dalfox
+            # default). Set to "" if you specifically want hidden-param discovery.
+            "dalfox_skip_mining": "all",
+            # v9.3: trim per-target cost for an XSS-focused stage. dalfox v2 scans
+            # a target file strictly ONE URL at a time, so every request saved per
+            # target compounds across the whole list. --skip-bav drops dalfox's
+            # non-XSS "basic another vulnerability" probes; --skip-headless drops
+            # its own chromedp DOM verification, which is redundant with ReconX's
+            # separate headless XSS-proof step (verified findings still surface via
+            # static+grep analysis). Set either False if you want dalfox's full
+            # behavior back.
+            "dalfox_skip_bav": True,
+            "dalfox_skip_headless": True,
+            "dalfox_max_targets": 0,
+            "dalfox_time_budget_sec": 10800,
+            # One URL must not consume the whole XSS stage. dalfox keeps
+            # fuzzing a URL after the first verified hit; 180s keeps that hit
+            # and moves on so the rest of the list is actually scanned.
+            "dalfox_per_url_sec": 420,
             "dalfox_workers": 40,
             "dalfox_delay_ms": 0,
             "dalfox_stall_timeout_sec": 0,
@@ -366,14 +411,14 @@ def load_config(path=None):
             "blind_xss_listen_after_sec": 90,
             "blind_xss_poll_interval": 5,
             "arjun_max_hosts": 10,
-            "arjun_timeout_per_host": 180,
-            "paramspider_enabled": True,
+            "arjun_timeout_per_host": 600,
             "cors_test_origin": "https://reconx-cors-probe.invalid",
+            "open_redirect_canary": "example.com",
             "cloud_bucket_timeout": 10,
             "js_secrets_max_files": 200,
             "js_secrets_concurrency": 15,
             "js_secrets_request_timeout": 12,
-            "js_secrets_budget_sec": 240,
+            "js_secrets_budget_sec": 1800,
             "js_secrets_patterns": "aws,gcp,azure,slack,stripe,github,jwt,private_key",
             "crtsh_timeout": 20,
             "chaos_enabled": False,
@@ -381,6 +426,26 @@ def load_config(path=None):
             "asn_lookup": True,
             "report_title": "ReconX Professional Report",
             "report_author": "",
+        },
+        # v9.2: per-tool wall-clock ceilings, seconds. Empty = use the built-in
+        # table (see T above); any subset can be overridden.
+        "timeouts": {},
+        # v9.1: Claude-backed analysis of the finished scan (reconx_ai.py).
+        "ai": {
+            "enabled": True,
+            # auto = Anthropic API when a key is set, falling back to the
+            # `claude` CLI (your Claude subscription) when there is no key OR
+            # the API account is out of credit. api / cli force one backend.
+            "backend": "auto",
+            "model": "claude-opus-5",
+            "cli_model": "opus",
+            "cli_timeout_sec": 1800,
+            "effort": "high",
+            "max_tokens": 16000,
+            "redact_secrets": True,
+            "auto_bridge": True,
+            "bridge_idle_timeout_sec": 0,
+            "bridge_port": 0,
         },
     }
     if not p.exists():
@@ -453,6 +518,16 @@ def _write_default_config_yaml(p: Path, cfg: dict) -> None:
     dropped from the repo."""
     s = cfg.get("settings", {})
     t = cfg.get("tools", {})
+    _ai = cfg.get("ai", {}) or {}
+    _ak = cfg.get("api_keys", {}) or {}
+    _tkeys = ", ".join(sorted(T))
+    # Write the effective table out commented, so the file documents both the
+    # current value and the knob, without silently pinning anything.
+    _to = cfg.get("timeouts", {}) or {}
+    _tdefaults = "\n".join(
+        f"  {'' if k in _to else '# '}{k}: {_to.get(k, v)}"
+        f"{'' if k in _to else '   # default'}"
+        for k, v in sorted(T.items(), key=lambda kv: (-kv[1], kv[0])))
     def _yq(v):  # YAML-safe quoted string
         s_ = str(v)
         return '"' + s_.replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -494,30 +569,99 @@ settings:
   xss_alert_screenshots_max: {s.get('xss_alert_screenshots_max', 15)}
   xss_verify_payloads_per_point: {s.get('xss_verify_payloads_per_point', 4)}
   xss_verify_max_checks: {s.get('xss_verify_max_checks', 60)}
-  xss_verify_budget_sec: {s.get('xss_verify_budget_sec', 900)}
+  xss_verify_budget_sec: {s.get('xss_verify_budget_sec', 3600)}
 
-# No API key is actively used right now — this is an empty schema reserved
-# for providers added later.
-api_keys: {{}}
+api_keys:
+  # Used by the AI analyst (reconx_ai.py). Leave empty and export
+  # ANTHROPIC_API_KEY instead if you prefer to keep keys out of files.
+  anthropic: {_yq(_ak.get('anthropic', ''))}
+
+# Claude-backed review of the finished scan. After the pipeline ends, ReconX
+# starts a localhost bridge and opens the report through it, so the report's
+# "AI Analysis" button has a backend to call. The API key stays in that
+# process and is NEVER written into report.html.
+# Per-tool wall-clock ceiling in SECONDS. Hitting one kills that tool and the
+# stage continues with whatever it produced — a ceiling set too low reads back
+# as "the target has nothing", so these are generous by default. Only the keys
+# you list here override the built-in table; delete a line to go back to the
+# default. Valid keys: {_tkeys}
+timeouts:
+{_tdefaults}
+
+ai:
+  enabled: {str(_ai.get('enabled', True)).lower()}
+  # A Claude Pro/Max subscription and the Anthropic API are billed SEPARATELY:
+  # the subscription funds claude.ai and Claude Code, the API is prepaid credit
+  # bought in the Console. A valid API key with an empty balance is common.
+  #   auto = use the API when a key is set, and fall back to the `claude` CLI
+  #          (your subscription) when there is no key or the API has no credit
+  #   api  = Anthropic API only        cli = `claude` CLI only
+  backend: {_yq(_ai.get('backend', 'auto'))}
+  model: {_yq(_ai.get('model', 'claude-opus-5'))}
+  # Model alias passed to the claude CLI (opus / sonnet / fable).
+  cli_model: {_yq(_ai.get('cli_model', 'opus'))}
+  cli_timeout_sec: {_ai.get('cli_timeout_sec', 1800)}
+  # low | medium | high | xhigh | max — how deep the model reasons before
+  # answering. Correlating a whole scan is what "high" is for.
+  effort: {_yq(_ai.get('effort', 'high'))}
+  max_tokens: {_ai.get('max_tokens', 16000)}
+  # Send discovered secrets as class + length + first/last characters instead
+  # of the real value. The evidence pack leaves this machine; keep this true
+  # unless the target is your own.
+  redact_secrets: {str(_ai.get('redact_secrets', True)).lower()}
+  # Start the bridge automatically when a scan finishes.
+  auto_bridge: {str(_ai.get('auto_bridge', True)).lower()}
+  # Shut the bridge down after this many idle seconds (0 = stay up until stopped).
+  bridge_idle_timeout_sec: {_ai.get('bridge_idle_timeout_sec', 0)}
+  # 0 = pick a free port automatically.
+  bridge_port: {_ai.get('bridge_port', 0)}
 
 tools:
-  nuclei_severity: {_yq(t.get('nuclei_severity', 'critical,high,medium'))}
+  nuclei_severity: {_yq(t.get('nuclei_severity', 'critical,high,medium,low'))}
   nuclei_templates: {_yq(t.get('nuclei_templates', ''))}
   nuclei_excluded_tags: {_yq(t.get('nuclei_excluded_tags', 'intrusive,dos'))}
   nuclei_stats_interval: {t.get('nuclei_stats_interval', 5)}
   nuclei_tech_fastpass: {str(t.get('nuclei_tech_fastpass', True)).lower()}
   nuclei_rate_limit: {t.get('nuclei_rate_limit', 150)}
   nuclei_concurrency: {t.get('nuclei_concurrency', 25)}
+  nuclei_retries: {t.get('nuclei_retries', 1)}
+  # v9.0: nuclei is fed the WHOLE live URL corpus (stage 4's pruned list +
+  # param URLs + authenticated URLs), not just the alive host roots — a
+  # path-matching template can only fire if it is given the path.
+  # Hard cap on that list. Applied by priority: host roots and parameterised
+  # URLs are kept first, only plain path URLs get trimmed. 0 = no cap.
+  nuclei_max_targets: {t.get('nuclei_max_targets', 0)}
+  # Collapse ?id=1 / ?id=2 and /post/1 / /post/2 down to one representative
+  # each — the same template surface, so testing every one costs time for zero
+  # extra coverage. Turn off only if a target routes on the literal value.
+  nuclei_dedup_url_shapes: {str(t.get('nuclei_dedup_url_shapes', True)).lower()}
+  # Drop a host from the scan after this many request errors (nuclei -mhe):
+  # a host that is down or hard-blocking should not keep absorbing templates.
+  nuclei_max_host_error: {t.get('nuclei_max_host_error', 30)}
+  # nuclei -ss: auto | host-spray | template-spray. host-spray spreads the
+  # load across hosts instead of finishing one at a time — gentler on a WAF
+  # when the list covers many subdomains.
+  nuclei_scan_strategy: {_yq(t.get('nuclei_scan_strategy', 'auto'))}
+  # Kill nuclei if it prints nothing at all for this many seconds (hung on a
+  # network block or its own update check). Must stay well above
+  # nuclei_stats_interval.
+  nuclei_stall_timeout_sec: {t.get('nuclei_stall_timeout_sec', 300)}
   nuclei_dast: {str(t.get('nuclei_dast', True)).lower()}
-  nuclei_dast_max_urls: {t.get('nuclei_dast_max_urls', 400)}
+  nuclei_dast_max_urls: {t.get('nuclei_dast_max_urls', 0)}
   blind_xss_callback: {_yq(t.get('blind_xss_callback', ''))}
   dalfox_custom_payload: {_yq(t.get('dalfox_custom_payload', ''))}
   dalfox_blind: {str(t.get('dalfox_blind', False)).lower()}
   dalfox_test_path_only: {str(t.get('dalfox_test_path_only', False)).lower()}
   dalfox_path_only_max: {t.get('dalfox_path_only_max', 100)}
   dalfox_dedup_query_params: {str(t.get('dalfox_dedup_query_params', True)).lower()}
-  dalfox_max_targets: {t.get('dalfox_max_targets', 40)}
-  dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 2400)}
+  # Skip dalfox's own param mining: "all" (fastest, skip dict+DOM) | "dom" | "dict" | "" (full mining)
+  dalfox_skip_mining: {_yq(t.get('dalfox_skip_mining', 'all'))}
+  # Per-target cost trims (XSS-focused): skip non-XSS probes / dalfox's own headless DOM check
+  dalfox_skip_bav: {str(t.get('dalfox_skip_bav', True)).lower()}
+  dalfox_skip_headless: {str(t.get('dalfox_skip_headless', True)).lower()}
+  dalfox_max_targets: {t.get('dalfox_max_targets', 0)}
+  dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 10800)}
+  dalfox_per_url_sec: {t.get('dalfox_per_url_sec', 420)}
   dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
   dalfox_workers: {t.get('dalfox_workers', 40)}
@@ -528,13 +672,14 @@ tools:
   blind_xss_listen_after_sec: {t.get('blind_xss_listen_after_sec', 90)}
   blind_xss_poll_interval: {t.get('blind_xss_poll_interval', 5)}
   arjun_max_hosts: {t.get('arjun_max_hosts', 10)}
-  arjun_timeout_per_host: {t.get('arjun_timeout_per_host', 180)}
+  arjun_timeout_per_host: {t.get('arjun_timeout_per_host', 600)}
   cors_test_origin: {_yq(t.get('cors_test_origin', 'https://reconx-cors-probe.invalid'))}
+  open_redirect_canary: {_yq(t.get('open_redirect_canary', 'example.com'))}
   cloud_bucket_timeout: {t.get('cloud_bucket_timeout', 10)}
   js_secrets_max_files: {t.get('js_secrets_max_files', 200)}
   js_secrets_concurrency: {t.get('js_secrets_concurrency', 15)}
   js_secrets_request_timeout: {t.get('js_secrets_request_timeout', 12)}
-  js_secrets_budget_sec: {t.get('js_secrets_budget_sec', 240)}
+  js_secrets_budget_sec: {t.get('js_secrets_budget_sec', 1800)}
   crtsh_timeout: {t.get('crtsh_timeout', 20)}
   dnsx_enabled: {str(t.get('dnsx_enabled', True)).lower()}
 """
@@ -604,7 +749,8 @@ def _dalfox_caps() -> dict:
     """
     if "caps" in _DALFOX_CAPS_CACHE:
         return _DALFOX_CAPS_CACHE["caps"]
-    caps = {"is_v3": False, "headers_flag": "--header", "state_file": False}
+    caps = {"is_v3": False, "headers_flag": "--header", "state_file": False,
+            "skip_mining_flags": set(), "skip_flags": set()}
     if tool_exists("dalfox"):
         txt = ""
         for args in (["dalfox", "file", "--help"], ["dalfox", "file", "-h"]):
@@ -620,6 +766,21 @@ def _dalfox_caps() -> dict:
             caps["headers_flag"] = "--headers"
         if re.search(r"(?m)^\s*(-\w,\s*)?--state-file\b", txt):
             caps["state_file"] = True
+        # v9.3: record which --skip-mining-* flags THIS binary documents, same
+        # help-declaration probe as above — so passing one can never be an
+        # "unknown flag" that kills the whole XSS stage on a version that
+        # spelled them differently.
+        for _mine in ("all", "dom", "dict"):
+            if re.search(r"(?m)^\s*(-\w,\s*)?--skip-mining-" + _mine + r"\b", txt):
+                caps["skip_mining_flags"].add(_mine)
+        # v9.3: same probe for the two per-target cost trims we default on for an
+        # XSS-focused stage — --skip-bav (dalfox's non-XSS "basic another vuln"
+        # grep) and --skip-headless (its own chromedp DOM verification, which is
+        # redundant with ReconX's separate headless XSS-proof step). Only added
+        # when documented, so an absent flag can't kill the stage.
+        for _sk in ("bav", "headless"):
+            if re.search(r"(?m)^\s*(-\w,\s*)?--skip-" + _sk + r"\b", txt):
+                caps["skip_flags"].add(_sk)
     _DALFOX_CAPS_CACHE["caps"] = caps
     return caps
 
@@ -654,6 +815,9 @@ def _pd_httpx():
 def _env_api_key(key: str) -> str:
     """Return an API key from the environment — e.g. RECONX_CENSYS_KEY."""
     env_map = {
+        # The AI analyst reads the SDK's own standard variable first, so an
+        # environment already set up for the Anthropic API just works.
+        "anthropic": "ANTHROPIC_API_KEY",
         "censys": "RECONX_CENSYS_KEY",
         "chaos": "RECONX_CHAOS_KEY",
         "github": "RECONX_GITHUB_TOKEN",
@@ -934,15 +1098,75 @@ def _resolve_proxy(cfg: dict) -> str:
 # eklemek o araci komple cokertir.
 _TOR_CLI_PROXY_FLAG = {"nuclei": "-proxy", "dalfox": "--proxy", "katana": "-proxy", "subfinder": "-proxy"}
 
+_NUCLEI_SOCKS_REWRITTEN = False
+
+def _nuclei_proxy(proxy: str) -> str:
+    """nuclei 3.11 accepts only http[s]:// and socks5://. socks5h:// (remote DNS,
+    what curl and the requests stack use) is rejected at startup:
+    'invalid proxy format' and exit 1 in well under a second, before any
+    template is loaded. The TCP connection still goes through the proxy;
+    nuclei itself resolves the name."""
+    global _NUCLEI_SOCKS_REWRITTEN
+    p = (proxy or "").strip()
+    if p.lower().startswith("socks5h://"):
+        fixed = "socks5://" + p[len("socks5h://"):]
+        if not _NUCLEI_SOCKS_REWRITTEN:
+            _NUCLEI_SOCKS_REWRITTEN = True
+            warn("Nuclei rejects socks5h:// — using socks5:// so the scan can start. "
+                 "The connection still uses the proxy; nuclei resolves DNS itself.")
+        return fixed
+    return p
+
+_NUCLEI_PROXY_SKIPPED = False
+
+def _local_proxy_open(proxy: str) -> bool:
+    """True unless this is a local proxy whose port is refusing connections.
+    A dead Tor SOCKS port makes nuclei exit 1 in under a second ('all proxies
+    are dead') and the stage then reports zero findings."""
+    try:
+        u = urlparse(proxy)
+        host = (u.hostname or "").lower()
+        port = u.port
+        if host not in ("127.0.0.1", "localhost", "::1") or not port:
+            return True
+        import socket
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except Exception:
+        return False
+
 def _tor_cli_flag(tool: str, cfg: dict) -> list:
     """Tor aktif degilse veya proxy cozulemiyorsa bos liste (davranis degismez)."""
+    global _NUCLEI_PROXY_SKIPPED
     if not _TOR_ACTIVE.is_set():
         return []
     proxy = _resolve_proxy(cfg)
     flag = _TOR_CLI_PROXY_FLAG.get(tool)
     if not (proxy and flag):
         return []
+    if tool == "nuclei":
+        proxy = _nuclei_proxy(proxy)
+        if not _local_proxy_open(proxy):
+            if not _NUCLEI_PROXY_SKIPPED:
+                _NUCLEI_PROXY_SKIPPED = True
+                warn(f"Nuclei proxy {proxy} is not accepting connections — "
+                     "scanning directly so a dead proxy does not abort the stage.")
+            return []
     return [flag, proxy]
+
+
+def _nuclei_log_cb(path: Path, fatal: dict):
+    """Append nuclei's own stdout/stderr to the run log and keep the fatal line."""
+    def cb(line: str):
+        text = strip_ansi(line or "").rstrip()
+        if text and ("[FTL]" in text or "Program exiting" in text or "[ERR]" in text):
+            fatal["line"] = text[:500]
+        try:
+            with path.open("a", encoding="utf-8") as fo:
+                fo.write(text + "\n")
+        except Exception:
+            pass
+    return cb
 
 
 class _TorManager:
@@ -1113,20 +1337,78 @@ class _TorManager:
                 pass
 
 # ── Timeouts ──────────────────────────────────────────────────────────────────
+# Per-tool WALL-CLOCK ceiling in seconds. Hitting one kills that tool and the
+# stage continues with whatever it produced — so a ceiling set too low reads
+# back as "the target has nothing", which is the worst failure mode this tool
+# has. v9.2 raised the real scanners to 2-3h (nuclei to 6h, since v9.0 feeds it
+# the whole live-URL corpus instead of a handful of host roots).
+#
+# A few entries deliberately stay short. whois, the login POST and the
+# interactsh registration are single request/response exchanges: they answer in
+# seconds or they are broken, and a 3-hour ceiling on a broken one just hangs
+# the stage for 3 hours before reaching the same conclusion. They are raised
+# enough to survive a slow or rate-limited server, not more.
+#
+# Every value here is overridable from config.yaml under `timeouts:` — see
+# apply_timeout_overrides(). Two other limits still apply on top and are NOT
+# affected by raising these:
+#   * --max-time, the global wall-clock budget for the whole scan;
+#   * the stall watchdog on nuclei/dalfox, which stops a tool that has printed
+#     nothing for N seconds regardless of how much of its ceiling is left.
 T = {
-    "whois": 120, "whatweb": 600, "wafw00f": 120, "nmap": 1800,
-    "subfinder": 1800, "assetfinder": 900, "findomain": 900,
-    "httpx": 1800,
-    "gau": 3600, "katana": 3600,
-    "nuclei": 14400,
-    "nuclei_dast": 7200,
-    "dalfox": 7200,
-    "login": 60,
-    "paramspider": 1800,
-    "arjun": 3600,
-    "extra_checks": 1800,
-    "interactsh_startup": 20,
+    # quick metadata lookups — see the note above on why these stay short
+    "whois": 300,                 # 5m
+    "wafw00f": 900,               # 15m
+    "login": 180,                 # 3m
+    "interactsh_startup": 60,     # 1m
+    # fingerprinting / enumeration
+    "whatweb": 3600,              # 1h
+    "assetfinder": 3600,          # 1h
+    "findomain": 3600,            # 1h
+    "subfinder": 7200,            # 2h — large estates with many sources
+    "extra_checks": 7200,         # 2h
+    # the heavy passes
+    "nmap": 10800,                # 3h — a full port scan genuinely takes hours
+    "httpx": 10800,               # 3h — probes every subdomain, prunes every URL
+    "gau": 10800,                 # 3h — archive pulls are slow on big domains
+    "katana": 10800,              # 3h — deep crawl
+    "arjun": 10800,               # 3h
+    "dalfox": 10800,              # 3h
+    "nuclei_dast": 14400,         # 4h
+    "nuclei": 21600,              # 6h — now scans the FULL live-URL corpus
 }
+
+
+def apply_timeout_overrides(cfg: dict) -> list:
+    """Let config.yaml's `timeouts:` block override T, in seconds.
+
+    Kept out of load_config() so T stays a plain module-level dict that any
+    caller can read without a config in hand. Returns the keys that were
+    actually changed, so the scan can say so instead of silently using a
+    different ceiling than the code shows.
+    """
+    changed = []
+    raw = (cfg or {}).get("timeouts")
+    if not isinstance(raw, dict):
+        return changed
+    for key, val in raw.items():
+        k = str(key).strip()
+        if k not in T:
+            warn(f"config timeouts.{k}: unknown tool — ignored "
+                 f"(valid: {', '.join(sorted(T))})")
+            continue
+        try:
+            sec = int(val)
+        except (TypeError, ValueError):
+            warn(f"config timeouts.{k}: '{val}' is not a number — ignored")
+            continue
+        if sec <= 0:
+            warn(f"config timeouts.{k}: must be > 0 — ignored")
+            continue
+        if sec != T[k]:
+            T[k] = sec
+            changed.append(k)
+    return changed
 
 # ── Tecknoloji risk agirlik tablosu (stage 11) ────────────────────────────────
 _TECH_RISK = [
@@ -1318,7 +1600,15 @@ def _has_reflection_param(qs: str) -> bool:
         pairs = parse_qsl(qs, keep_blank_values=True)
     except Exception:
         return False
-    return any((k or "").strip().lower() in _REFLECTION_PARAM_NAMES for k, _ in pairs)
+    for k, _ in pairs:
+        kl = (k or "").strip().lower()
+        if kl in _REFLECTION_PARAM_NAMES:
+            return True
+        # tfSearch, searchQuery — the echoed field is the suffix, not the
+        # whole name. Only the longer names, so "q"/"id" don't match everything.
+        if any(len(n) >= 5 and kl.endswith(n) for n in _REFLECTION_PARAM_NAMES):
+            return True
+    return False
 
 # v6.13: cloud storage bucket URL/hostname deseni
 _PAT_CLOUD_BUCKET = re.compile(
@@ -1395,6 +1685,50 @@ def _extract_domain_from_any(s: str) -> str:
         pass
     m = re.search(r"([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,63}", s)
     return re.sub(r"^[*]\.", "", m.group(0)) if m else ""
+
+
+def _split_host_port(s: str) -> tuple:
+    """('harbor.lab', 8088) from 'harbor.lab:8088' or a URL. Port is None when
+    the user did not name one. The bare host stays the scope key; the port is
+    what HTTP probes must actually connect to."""
+    raw = (s or "").strip()
+    if not raw:
+        return "", None
+    probe = raw if "://" in raw else "http://" + raw
+    try:
+        parsed = urlparse(probe)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return host, parsed.port
+    except Exception:
+        return _extract_domain_from_any(raw), None
+
+
+def _etc_hosts_names(domain: str) -> list:
+    """Names in /etc/hosts that are the target or a subdomain of it.
+
+    Passive enum (subfinder, crt.sh) only sees public DNS. A lab or an
+    internal name that exists solely in the hosts file is invisible to those
+    tools, so the file is read as one more source."""
+    dom = (domain or "").lower().rstrip(".")
+    if not dom:
+        return []
+    path = Path("/etc/hosts")
+    if not path.is_file():
+        return []
+    found = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        line = line.split("#", 1)[0].strip().lower()
+        if not line:
+            continue
+        for name in line.split()[1:]:
+            name = name.rstrip(".")
+            if name == dom or name.endswith("." + dom):
+                found.append(name)
+    return list(dict.fromkeys(found))
 
 # ── WAF bypass header strategies ───────────────────────────────────────────────
 _UA_POOL = [
@@ -1597,6 +1931,15 @@ def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
         return {"ok": False, "client": "curl_cffi" if is_cffi else "requests",
                 "error": str(e), "url": url, "proxy": proxy or ""}
 
+
+def _flip_scheme(url: str) -> str:
+    """http://host <-> https://host, path dropped. Empty when there is no scheme."""
+    p = urlparse(url or "")
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return ""
+    other = "http" if p.scheme == "https" else "https"
+    return urlunparse((other, p.netloc, "", "", "", ""))
+
 # ── Webhook notification (v8.1) ────────────────────────────────────────────────
 def send_webhook_notification(cfg: dict, target: str, summary: dict) -> bool:
     """Tarama bitince Slack/Discord-uyumlu bir webhook'a ozet gonderir.
@@ -1696,6 +2039,7 @@ def start_interactsh_session(work_dir: Path, poll_interval: int = 5):
         proc = subprocess.Popen(
             cmd, shell=False, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         session["process"] = proc
         # The client writes its generated domain to payload_file as soon as
@@ -1718,10 +2062,7 @@ def start_interactsh_session(work_dir: Path, poll_interval: int = 5):
             time.sleep(0.3)
         if not domain or not _INTERACTSH_DOMAIN_RE.match(domain):
             session["error"] = "timed out waiting for interactsh-client to register a domain"
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _kill_tree(proc, grace=1.0)
             return session
         session.update(available=True, domain=domain, log_file=log_file, payload_file=payload_file)
         return session
@@ -1747,14 +2088,7 @@ def stop_interactsh_session(session: dict, extra_listen_sec: int = 0):
             if proc.poll() is not None:
                 break
             time.sleep(0.5)
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    _kill_tree(proc, grace=5.0)
 
 
 def parse_interactsh_interactions(log_file: Path) -> list:
@@ -2169,7 +2503,28 @@ def write_lines(path, lines):
         # single space so one logical value always survives as one line.
         return re.sub(r"[\r\n]+", " ", s).strip()
     clean = [c for c in (_clean(l) for l in lines) if c]
-    Path(path).write_text("\n".join(clean) + ("\n" if clean else ""), encoding="utf-8")
+    body = "\n".join(clean) + ("\n" if clean else "")
+    # v9.0: atomic. These files ARE the resume contract — checkpoints/*.txt is
+    # what a --resume reads back to decide a stage is done and to feed the next
+    # one. A Ctrl+C, an OOM kill or the --max-time watchdog landing in the
+    # middle of a multi-megabyte write used to leave a half-written list behind
+    # that looked perfectly valid to the next run, silently shrinking the URL
+    # corpus with no error anywhere. Write to a temp file in the same directory
+    # (so os.replace stays on one filesystem and really is atomic) and swap.
+    dst = Path(path)
+    # pid+thread in the name so two writers can never share a temp file;
+    # the ".txt.tmpN" suffix also keeps it out of every "*.txt" glob.
+    tmp = dst.with_name(f"{dst.name}.tmp{os.getpid()}_{threading.get_ident()}")
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, dst)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        dst.write_text(body, encoding="utf-8")   # last-resort direct write
     return len(clean)
 
 def checkpoint(path, lines, label):
@@ -2332,7 +2687,31 @@ class ScanState:
             "started": datetime.now().isoformat(timespec="seconds"),
         }
         self.data["last_stage"] = n
+        # A recon-only run is marked completed. An on-demand scan that then
+        # dies must not leave that "completed" flag standing over a stage
+        # that is still "running" — the report would call a half-scan finished.
+        self.data["completed"] = False
+        self.data["finalized"] = False
+        self.data["interrupted"] = False
+        self.data["interrupt_reason"] = ""
         self.save()
+
+    def reclaim_orphan_running(self):
+        """A stage left 'running' belongs to a process that is already gone
+        (kill -9, a dead terminal). This process has not started it yet, so
+        downgrade it to partial before deciding what to re-run."""
+        changed = []
+        for k, v in (self.data.get("stages") or {}).items():
+            if isinstance(v, dict) and v.get("status") == "running":
+                v["status"] = "partial"
+                v["finished"] = datetime.now().isoformat(timespec="seconds")
+                changed.append(str(k))
+        if changed:
+            warn("A previous run left stage(s) "
+                 + ", ".join(changed)
+                 + " marked running — treating them as partial so this run can continue.")
+            self.save()
+        return changed
 
     def finish_stage(self, n, status, summary=None, duration=None):
         rec = self.data.setdefault("stages", {}).get(str(n)) or {}
@@ -2366,9 +2745,14 @@ class ScanState:
         would benefit from being re-run. A crashed stage, or one cut short by a
         skip/budget, keeps the session resumable rather than letting the scan
         quietly declare itself finished with a hole in it."""
+        # Only stages this invocation planned to run can keep the session
+        # incomplete. An on-demand nuclei left "partial" must not make the
+        # next recon-only finish look like it failed, and the reverse.
+        planned = {str(x) for x in (self.data.get("planned_stages") or [])}
         pending = sorted(
             (k for k, v in (self.data.get("stages") or {}).items()
-             if isinstance(v, dict) and v.get("status") in ("failed", "partial", "running")),
+             if isinstance(v, dict) and v.get("status") in ("failed", "partial", "running")
+             and (not planned or str(k) in planned)),
             key=lambda k: int(k) if str(k).isdigit() else 99)
         self.data["interrupted"] = False
         self.data["finalized"]   = True
@@ -2681,8 +3065,71 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
     return counts
 
 # ── run_cmd ───────────────────────────────────────────────────────────────────
+def _kill_tree(proc, grace: float = 3.0):
+    """Stop a tool AND everything it spawned.
+
+    v9.0: every external tool is now started with start_new_session=True, which
+    makes it the leader of its own process group. That matters because
+    proc.kill() only ever signals that ONE pid — and a good share of the
+    commands here do not run the scanner as that pid:
+
+      * _stream_tool() passes plain strings, so Popen(shell=True) makes /bin/sh
+        the child and nuclei/dalfox a grandchild;
+      * katana and dalfox fork workers of their own.
+
+    So a timeout, a stall watchdog firing or a Ctrl+C used to kill the wrapper
+    and leave the actual scanner running: still hammering the target, still
+    holding sockets and CPU, and completely invisible to a pipeline that
+    believed it had stopped it. Signalling the whole group is what actually
+    ends the work.
+
+    SIGTERM first, so a tool gets the chance to flush its own -o output file
+    (nuclei writes findings incrementally, but dalfox/httpx buffer), then
+    SIGKILL for whatever ignored it.
+    """
+    if proc is None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+    # If start_new_session somehow did not take effect, pgid is OUR group —
+    # signalling it would kill ReconX itself. Fall back to the single pid.
+    try:
+        if pgid is not None and pgid == os.getpgrp():
+            pgid = None
+    except Exception:
+        pgid = None
+    def _signal(sig):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                proc.send_signal(sig)
+        except Exception:
+            pass          # already gone (ESRCH) — nothing to do
+
+    # SIGTERM the whole group, then wait for the process we actually hold a
+    # handle on. Note the SIGKILL below is NOT conditional on that wait timing
+    # out: the leader here is often just the /bin/sh wrapper, and it dies
+    # instantly while the scanner it forked keeps running. Returning as soon as
+    # the leader exits is exactly how an orphan survives, so the group always
+    # gets the follow-up SIGKILL — on an already-empty group that is a no-op.
+    _signal(signal.SIGTERM)
+    try:
+        proc.wait(grace)
+    except Exception:
+        pass
+    _signal(signal.SIGKILL)
+    try:
+        proc.wait(2.0)
+    except Exception:
+        pass
+
+
 def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
-            silent=False, stream=False, retries=2, retry_delay=5, stdin_file=None):
+            silent=False, stream=False, retries=2, retry_delay=5, stdin_file=None,
+            cwd=None):
     # v8.8: stage_skip() zaten hard()'i de kapsar — "stage'i atla" secildiginde
     # bu stage'in KALAN cagrilari hic baslatilmadan atlanir (once baslatilip
     # hemen ardindan oldurulmesini beklemek yerine).
@@ -2692,7 +3139,7 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
     while True:
         _ok, _txt = _run_once(cmd, out_file=out_file, timeout=timeout,
                               log=log, label=label, silent=silent, stream=stream,
-                              attempt=_attempt, stdin_file=stdin_file)
+                              attempt=_attempt, stdin_file=stdin_file, cwd=cwd)
         if _INT.hard() or _INT.interrupted():
             return _ok, _txt
         file_lines = _count_lines(out_file) if (out_file and Path(out_file).exists() and Path(out_file).stat().st_size > 0) else 0
@@ -2730,7 +3177,7 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
             except: pass
 
 def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
-              silent=False, stream=False, attempt=0, stdin_file=None):
+              silent=False, stream=False, attempt=0, stdin_file=None, cwd=None):
     if _INT.stage_skip():
         return False, ""
     if label:
@@ -2760,7 +3207,8 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
                 if stdin_file:
                     stdin_handle = open(stdin_file, "rb")
                 p = subprocess.Popen(argv, shell=False, stdin=stdin_handle,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     start_new_session=True, cwd=cwd)
                 proc_ref[0] = p
                 out, err_out = p.communicate()
             finally:
@@ -2783,17 +3231,13 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
             break
         if _INT.interrupted() or _INT.hard():
             ctrl_killed[0] = True
-            if proc_ref[0]:
-                try: proc_ref[0].kill(); proc_ref[0].wait(2)
-                except: pass
+            _kill_tree(proc_ref[0], grace=2.0)
             worker.join(2)
             break
     else:
         if worker.is_alive():
             timed_out[0] = True
-            if proc_ref[0]:
-                try: proc_ref[0].kill(); proc_ref[0].wait(3)
-                except: pass
+            _kill_tree(proc_ref[0])
             worker.join(3)
     stop_spin.set()
     if not silent:
@@ -2833,7 +3277,7 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
 # ── Streaming tool runner ─────────────────────────────────────────────────────
 def _stream_tool(cmd, timeout: int, log=None, label: str = "",
                  line_cb=None, stall_timeout: int = 0, ok_exit_codes=(0, None),
-                 status: dict = None) -> tuple:
+                 status: dict = None, stop_check=None) -> tuple:
     """stall_timeout: eger > 0 ve o kadar saniye boyunca TEK BIR YENI SATIR bile
     gelmezse (arac askida kalmis / network'e sessizce takilmis olabilir), sureci
     zorla durdurur. v6.17: nuclei gibi araclarin bazen kendi ic guncelleme/
@@ -2870,6 +3314,18 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
         frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
         i = 0
         if not sys.stdout.isatty():
+            last_beat = time.time()
+            while not stop_spin.is_set():
+                if time.time() - last_beat >= 20:
+                    elapsed = int(time.time() - start)
+                    live = ""
+                    if status:
+                        live = str(status.get("text") or "")
+                    extra = f" {live}" if live else ""
+                    print(f"  {C.DIM}… {spin_label}{extra} — "
+                          f"{total_lines[0]:,} lines, {elapsed}s{C.RESET}", flush=True)
+                    last_beat = time.time()
+                time.sleep(0.5)
             return
         while not stop_spin.is_set():
             if _SPINNER_PAUSE.is_set():
@@ -2906,7 +3362,7 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
             p = subprocess.Popen(
                 cmd, shell=_shell,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=0,
+                bufsize=0, start_new_session=True,
                 env={**os.environ, "PYTHONUNBUFFERED": "1", "TERM": "dumb"}
             )
             proc_ref[0] = p
@@ -2944,12 +3400,7 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
         reader_thread.join(0.3)
         if _INT.interrupted() or _INT.hard():
             killed[0] = True
-            if proc_ref[0]:
-                try:
-                    proc_ref[0].kill()
-                    proc_ref[0].wait(3)
-                except Exception:
-                    pass
+            _kill_tree(proc_ref[0])
             break
         now = time.time()
         if total_lines[0] != last_count:
@@ -2961,22 +3412,22 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
                  f"(network block, its own update check, ...), stopping it")
             stalled[0] = True
             killed[0] = True
-            if proc_ref[0]:
-                try:
-                    proc_ref[0].kill()
-                    proc_ref[0].wait(3)
-                except Exception:
-                    pass
+            _kill_tree(proc_ref[0])
             break
+        if stop_check is not None:
+            try:
+                _stop_now = bool(stop_check())
+            except Exception:
+                _stop_now = False
+            if _stop_now:
+                warn(f"{spin_label}: finding already saved — moving on")
+                killed[0] = True
+                _kill_tree(proc_ref[0])
+                break
         if now > deadline:
             warn(f"{spin_label} timeout ({timeout}s) — stopping")
             killed[0] = True
-            if proc_ref[0]:
-                try:
-                    proc_ref[0].kill()
-                    proc_ref[0].wait(3)
-                except Exception:
-                    pass
+            _kill_tree(proc_ref[0])
             break
     stop_spin.set()
     spin_thread.join(1.0)
@@ -3479,6 +3930,74 @@ def _crtsh_enum(domain: str, timeout: int = 20) -> list:
     except Exception:
         return []
 
+def evaluate_prune(before, after, elapsed, threads, req_timeout, max_pct,
+                   survivor_positions=None):
+    """Decide whether a high-removal httpx prune is a dead corpus or a throttle.
+
+    A blunt "removed more than 70%" rule treats a real Wayback corpus — where
+    most archived URLs are long gone — as a rate-limit, and then every later
+    stage scans the dead list. The throttle signature observed in the field is
+    different: survivors clustered in the first part of the input, nothing past
+    that point. A probe that finishes far faster than a timeout storm is the
+    other half of the evidence.
+
+    Returns (trust, reason). trust=True means keep the pruned file.
+    """
+    if before <= 0:
+        return False, "empty input"
+    removed_pct = (before - after) / before * 100.0
+    if before < 50 or removed_pct <= float(max_pct):
+        return True, "within the removal limit"
+
+    positions = list(survivor_positions or [])
+    if after > 0 and positions and len(positions) >= after * 0.5:
+        npos = len(positions)
+        in_first = sum(1 for p in positions if p < before * 0.25)
+        in_last_half = sum(1 for p in positions if p >= before * 0.5)
+        last = max(positions)
+        if (in_first / npos >= 0.90 and in_last_half / npos < 0.02
+                and last < before * 0.40):
+            return False, (
+                f"removed {removed_pct:.1f}% and the live URLs all sit in the "
+                f"first part of the list — the probe was rate-limited, not a dead corpus")
+        if in_last_half / npos >= 0.10:
+            return True, (
+                f"removed {removed_pct:.1f}%, and live URLs are spread through the "
+                f"list — dead archive URLs, not a prefix-only probe")
+
+    floor = (before / max(int(threads) or 1, 1)) * max(float(req_timeout), 1.0)
+    if elapsed > 0 and elapsed < floor * 0.35:
+        return True, (
+            f"probe finished in {elapsed:.0f}s; a timeout storm of {before:,} URLs "
+            f"on {int(threads)} threads would take at least {floor:.0f}s, so the "
+            f"dropped URLs answered with a filtered status")
+    return False, (
+        f"removed {removed_pct:.1f}% (over the {float(max_pct):.0f}% limit) and the "
+        f"probe was slow enough that throttling cannot be ruled out")
+
+
+def _survivor_positions(raw_path: Path, live_path: Path) -> list:
+    """Indexes in the raw URL file of lines that also appear in the live file."""
+    live = set()
+    try:
+        for line in live_path.read_text(errors="ignore").splitlines():
+            s = line.strip()
+            if s:
+                live.add(s)
+                live.add(s.rstrip("/"))
+    except Exception:
+        return []
+    positions = []
+    try:
+        for i, line in enumerate(raw_path.read_text(errors="ignore").splitlines()):
+            s = line.strip()
+            if s and (s in live or s.rstrip("/") in live):
+                positions.append(i)
+    except Exception:
+        return []
+    return positions
+
+
 class ReconPipeline:
     def __init__(self, target, cfg, resume=False, auto_mode=False,
                  url_targets=None, login_url=None, login_user=None, login_pass=None,
@@ -3488,10 +4007,22 @@ class ReconPipeline:
                  login_csrf_field="", raw_cookie=None, request_file=None,
                  nuclei_templates_override=None, nuclei_severity_override=None,
                  blind_cb=None, config_path=None, session_dir=None,
-                 max_time_min=0, scan_diff=True, xss_payloads=None):
+                 max_time_min=0, scan_diff=True, xss_payloads=None,
+                 ai_bridge_disabled=False, only_checks=None,
+                 service_port=None):
         self.target      = target.strip()
+        try:
+            self.service_port = int(service_port) if service_port else None
+        except (TypeError, ValueError):
+            self.service_port = None
+        if self.service_port is not None and not (1 <= self.service_port <= 65535):
+            self.service_port = None
         self.cfg         = cfg
         self._config_path = Path(config_path) if config_path else CFG_FILE
+        self.ai_bridge_disabled = bool(ai_bridge_disabled)
+        # stage12 passive-check sub-selection (report exposes these as separate
+        # buttons); None / empty means run all three checks.
+        self.only_checks = set(only_checks) if only_checks else None
         self.ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
         _out_root = (os.environ.get("RECONX_OUTPUT_DIR") or "").strip()
         self._out_root = Path(_out_root) if _out_root else BASE_DIR / "output"
@@ -3555,6 +4086,8 @@ class ReconPipeline:
         self.js_results      = None
         self.tech_summary    = []
         self.extra_results   = None  # v6.13: CORS/takeover/bucket sonuclari
+        self.network_results = None  # v9.4: stage14 naabu/nmap port scan
+        self.open_redirect_results = None  # v9.4: stage15 nuclei open-redirect
 
         self._nuclei_tpl_path = None
         self._nuclei_tpl_override = nuclei_templates_override or ""
@@ -3999,6 +4532,21 @@ class ReconPipeline:
             self.summary["stage8"] = {"status": "done", "count": 0, "note": "no_urls_found"}
             warn("Authenticated crawl produced no URLs — check login success / seed hosts")
 
+    def _host_url(self, host: str) -> str:
+        """URL for one hostname. An explicit -d host:port is kept; otherwise
+        the historical default is https on 443."""
+        host = (host or "").strip()
+        if host.startswith(("http://", "https://")):
+            return host
+        port = self.service_port
+        if port in (443, 8443):
+            return f"https://{host}" if port == 443 else f"https://{host}:{port}"
+        if port == 80:
+            return f"http://{host}"
+        if port:
+            return f"http://{host}:{port}"
+        return f"https://{host}"
+
     # ── Stage 1 ───────────────────────────────────────────────────────────────
     def stage1_recon(self):
         stage(1, "Initial Reconnaissance")
@@ -4020,6 +4568,9 @@ class ReconPipeline:
         # is completely unaffected since _probe_base then falls back to the
         # exact old "https://{tgt}" default.
         _seed_parsed = urlparse(self.url_targets[0]) if self.url_targets else None
+        if self.service_port and not self.url_targets:
+            _probe_base = self._host_url(tgt)
+            _seed_parsed = urlparse(_probe_base)
         _probe_netloc = (_seed_parsed.netloc if (_seed_parsed and _seed_parsed.netloc) else tgt)
         _probe_scheme = (_seed_parsed.scheme if (_seed_parsed and _seed_parsed.scheme) else "https")
         _probe_base = f"{_probe_scheme}://{_probe_netloc}"
@@ -4028,8 +4579,25 @@ class ReconPipeline:
             ok(f"IP resolved: {tgt} → {target_ip}")
         else:
             warn("IP resolution failed — continuing with domain")
+        probe = {}
         try:
             probe = http_probe(_probe_base, self.cfg, timeout=12)
+            # A scheme that never connects (HTTPS on an HTTP-only test app, or
+            # the reverse) used to be recorded as a failed probe and then every
+            # later stage kept using it — httpx returned 0 hosts, whatweb 0
+            # lines, the crawl hit a dead port. Try the other scheme once
+            # before giving up.
+            if not probe.get("ok"):
+                alt = _flip_scheme(_probe_base)
+                if alt:
+                    sub(f"HTTP probe failed on {_probe_base} — trying {alt}")
+                    alt_probe = http_probe(alt, self.cfg, timeout=8)
+                    if alt_probe.get("ok"):
+                        probe = alt_probe
+                        _probe_base = alt
+                        self._retarget_scheme(urlparse(alt).scheme, urlparse(alt).hostname or "")
+                        ok(f"Scheme fallback: continuing on {_probe_base} "
+                           f"(the other scheme did not connect)")
             (d / "http_probe.json").write_text(json.dumps(probe, ensure_ascii=False, indent=2), encoding="utf-8")
             if probe.get("ok"):
                 ok(f"HTTP probe: {probe.get('status')} ({probe.get('client')}) "
@@ -4050,12 +4618,32 @@ class ReconPipeline:
         # sadece bosluklara gore boluyor, yani "||" ve "true" kelimeleri whois'e
         # DOGRUDAN GECERSIZ ARGUMAN olarak gidiyordu ve whois her seferinde
         # cakiliyordu (exit 1). Duzeltme: fallback mantigi Python tarafinda.
-        ok_w, whois_out = run_cmd(["whois", tgt], timeout=T["whois"], log=self.log,
-                                   label="whois", retries=1, retry_delay=3)
-        if not ok_w or not whois_out.strip():
-            ok_w, whois_out = run_cmd(["whois", "-H", tgt], timeout=T["whois"],
-                                       log=self.log, label="whois-H", retries=1, retry_delay=3)
-        if whois_out.strip():
+        # whois exits 1 even when it printed a record, so a non-empty body is
+        # the result. A hostname with no registration of its own
+        # ("No match for testasp.vulnweb.com") is looked up one label higher.
+        def _whois_miss(text: str) -> bool:
+            head = (text or "").lower()[:500]
+            if not head.strip():
+                return True
+            return any(s in head for s in ("no match for", "not found", "no data found", "no entries found"))
+
+        _, whois_out = run_cmd(["whois", tgt], timeout=T["whois"], log=self.log,
+                               label="whois", retries=0)
+        if _whois_miss(whois_out):
+            labels = [p for p in tgt.split(".") if p]
+            parent = ".".join(labels[-2:]) if len(labels) > 2 else ""
+            if parent and parent != tgt:
+                sub(f"whois has no record for {tgt} — trying {parent}")
+                _, parent_out = run_cmd(["whois", parent], timeout=T["whois"], log=self.log,
+                                        label=f"whois {parent}", retries=0)
+                if not _whois_miss(parent_out):
+                    whois_out = parent_out
+            if _whois_miss(whois_out):
+                _, alt = run_cmd(["whois", "-H", parent or tgt], timeout=T["whois"],
+                                 log=self.log, label="whois-H", retries=0)
+                if not _whois_miss(alt):
+                    whois_out = alt
+        if whois_out.strip() and not _whois_miss(whois_out):
             (d / "whois.txt").write_text(whois_out, encoding="utf-8", errors="replace")
         if tool_exists("whatweb"):
             # v8.3-fix: was bare "{tgt}" (no scheme/port -> whatweb assumes
@@ -4174,6 +4762,15 @@ class ReconPipeline:
                 if self.log:
                     self.log.debug(f"crt.sh fallback failed: {e}")
 
+        local_names = _etc_hosts_names(tgt)
+        if local_names:
+            existing = set(l.strip().lower() for l in raw_f.read_text(errors="ignore").splitlines() if l.strip()) if raw_f.exists() else set()
+            added = [n for n in local_names if n not in existing]
+            if added:
+                with raw_f.open("a", encoding="utf-8") as fo:
+                    for n in added:
+                        fo.write(n + "\n")
+                info(f"/etc/hosts: {len(added):,} name(s) under {tgt}")
         lines = [l.strip() for l in raw_f.read_text(errors="ignore").splitlines() if l.strip()]
         if tgt not in lines:
             lines.insert(0, tgt)
@@ -4235,7 +4832,13 @@ class ReconPipeline:
             shot_dir.mkdir(parents=True, exist_ok=True)
             shot_flag = f"-screenshot -srd {shot_dir} "
             info("Screenshot mode active (settings.enable_screenshots=true) — this stage may be slower")
-        ports_flag = "-ports 80,443,8080,8443,8000,8888,9090,3000,5000 " if probe_ports else ""
+        if probe_ports:
+            ports = ["80", "443", "8080", "8443", "8000", "8888", "9090", "3000", "5000"]
+            if self.service_port and str(self.service_port) not in ports:
+                ports.append(str(self.service_port))
+            ports_flag = "-ports " + ",".join(ports) + " "
+        else:
+            ports_flag = ""
         tor_flag = f"-http-proxy {_resolve_proxy(self.cfg)} " if _TOR_ACTIVE.is_set() else ""
         httpx_cmd = (
             f"{httpx_bin} -l {target_file} {noc_flag} "
@@ -4249,9 +4852,11 @@ class ReconPipeline:
             + f" {json_flag} -o {json_out}"
         )
         run_cmd(httpx_cmd, timeout=T["httpx"], log=self.log, label=label, retries=1, retry_delay=5)
-        alive_urls = []
-        status_cnt = {}
-        if json_out.exists() and json_out.stat().st_size > 0:
+
+        def _read_httpx_json():
+            found, counts = [], {}
+            if not json_out.exists() or json_out.stat().st_size == 0:
+                return found, counts
             with json_out.open("r", errors="replace") as fh:
                 for line in fh:
                     line = line.strip()
@@ -4264,9 +4869,27 @@ class ReconPipeline:
                     url = rec.get("url") or rec.get("input") or ""
                     if not url.startswith("http"):
                         continue
-                    alive_urls.append(url)
+                    found.append(url)
                     status = int(rec.get("status-code") or rec.get("status_code") or 0)
-                    status_cnt[status] = status_cnt.get(status, 0) + 1
+                    counts[status] = counts.get(status, 0) + 1
+            return found, counts
+
+        alive_urls, status_cnt = _read_httpx_json()
+        # A rich probe (favicon, tech, extra headers) can exit 0 with an empty
+        # file even when the host answers a normal GET — seen on the HTTP-only
+        # vulnweb test app, where curl and a plain httpx both returned 200 and
+        # this command returned nothing. One plain retry, no extra headers.
+        if not alive_urls and _count_lines(target_file) > 0:
+            warn(f"{label} returned no hosts — retrying with a plain request")
+            plain = (
+                f"{httpx_bin} -l {target_file} -silent {noc_flag} "
+                f"-timeout 15 -retries 1 {fr_flag} "
+                f"-status-code -title -tech-detect -ip -server -content-length "
+                f"-response-time {json_flag} -o {json_out}"
+            )
+            run_cmd(plain, timeout=T["httpx"], log=self.log,
+                    label=f"{label} plain", retries=0)
+            alive_urls, status_cnt = _read_httpx_json()
         return alive_urls, status_cnt
 
     def stage3_alive(self):
@@ -4281,7 +4904,7 @@ class ReconPipeline:
         if not sub_file.exists() or sub_file.stat().st_size == 0:
             warn("No subdomain file — using domain directly")
             n = checkpoint(self._cp("stage3_alive"),
-                           [f"https://{self.target}", f"http://{self.target}"],
+                           [self._host_url(self.target)],
                            "alive-fallback")
             self.summary["stage3"] = {"status": "done", "count": n, "note": "fallback"}
             return
@@ -4290,7 +4913,7 @@ class ReconPipeline:
             warn("httpx (ProjectDiscovery) not found — treating every subdomain "
                  "as alive")
             subs = [l.strip() for l in sub_file.read_text(errors="ignore").splitlines() if l.strip()]
-            urls = sorted({f"https://{s}" if not s.startswith("http") else s for s in subs})
+            urls = sorted({s if s.startswith("http") else self._host_url(s) for s in subs})
             n = checkpoint(self._cp("stage3_alive"), urls, "alive-nohttpx")
             self.summary["stage3"] = {"status": "done", "count": n, "note": "no-httpx"}
             return
@@ -4306,7 +4929,7 @@ class ReconPipeline:
             warn("httpx no response — using subdomains as fallback")
             subs = [l.strip() for l in sub_file.read_text(errors="ignore").splitlines() if l.strip()]
             for s in subs:
-                alive_urls.append(f"https://{s}" if not s.startswith("http") else s)
+                alive_urls.append(s if s.startswith("http") else self._host_url(s))
         # v8.0: dnsx doğrulaması (opsiyonel) — brute-force değil, sadece passive DNS check
         if bool(_cfg_get(self.cfg, "tools", "dnsx_enabled", default=True)) and tool_exists("dnsx"):
             try:
@@ -4370,9 +4993,10 @@ class ReconPipeline:
         hh = _help_text(httpx_bin)
         noc_flag = "-no-color" if "-no-color" in hh else ""
         fc_flag = f"-fc {codes}" if codes else ""
+        prune_http_timeout = 15
         cmd = (
             f"{httpx_bin} -l {raw_all} {noc_flag} -silent "
-            f"-threads {threads} -timeout 15 -retries 1 {fc_flag} "
+            f"-threads {threads} -timeout {prune_http_timeout} -retries 1 {fc_flag} "
             + _hdr_args_httpx(headers)
             + f" -o {pruned_file}"
         )
@@ -4388,8 +5012,10 @@ class ReconPipeline:
         # from what httpx itself already wrote to disk (e.g. if -no-color isn't
         # supported by the installed version and ANSI codes leak into stdout).
         # We read pruned_file directly below regardless, as the source of truth.
+        t_prune = time.time()
         run_cmd(cmd, timeout=T["httpx"], log=self.log, label="httpx-url-prune",
                 retries=1, retry_delay=5)
+        stats["elapsed_sec"] = round(time.time() - t_prune, 1)
         if not pruned_file.exists() or pruned_file.stat().st_size == 0:
             warn("URL pruning produced no output (httpx error or every URL was unreachable) — "
                  "keeping the raw (unfiltered) URL list instead of risking an empty result")
@@ -4401,34 +5027,39 @@ class ReconPipeline:
         stats["removed_pct"] = round(removed_pct, 1)
 
         # A liveness probe only proves death if the target was actually
-        # answering. Confirmed on a real scan: 15,553 collected URLs came back
-        # as 348 "live" (97.8% "dead") — but only 3 of the 15,553 were
-        # malformed, every survivor sat in the first quarter of the input order
-        # with nothing at all surviving past that point, and the host whose
-        # 14,729 URLs were ALL dropped resolved to the same Cloudflare IP as the
-        # host that did answer. That is a WAF throttling the probe, not a dead
-        # corpus — and the pruned list then silently became "all URLs" for every
-        # later stage and for the report.
+        # answering. One real scan dropped 97.8% of a corpus, but every
+        # survivor sat in the first quarter of the input and nothing past that
+        # point answered — a WAF throttling the probe. A later scan dropped
+        # 98.8% of a Wayback-heavy corpus that httpx walked in ~30 minutes
+        # (tens of URLs/sec, not 15s timeouts) with hits spread across the
+        # file — those URLs really were dead, and keeping all 100k of them
+        # flooded every stage after this one.
         #
-        # So past a threshold, refuse to trust the prune and keep the raw list:
-        # the same rule the rest of the tool follows — "no answer" is not
-        # "clean", and a silent 98% data loss is the worst possible default.
+        # Past the removal threshold, tell those two apart. Only a clustered
+        # or too-slow probe is discarded; a fast or well-spread one is kept.
         max_pct = float(_cfg_get(self.cfg, "settings",
                                  "prune_dead_urls_max_removal_pct", default=70) or 70)
-        if removed_pct > max_pct and stats["before"] >= 50:
+        positions = _survivor_positions(raw_all, pruned_file) if removed_pct > max_pct else None
+        trust, why = evaluate_prune(
+            stats["before"], stats["after"], stats.get("elapsed_sec") or 0,
+            threads, prune_http_timeout, max_pct, positions)
+        stats["trust_reason"] = why
+        if not trust:
             stats["rejected"] = True
-            stats["reject_reason"] = (f"removed {removed_pct:.1f}% (> {max_pct:.0f}% limit) — "
-                                      f"treated as throttling, not as dead URLs")
+            stats["reject_reason"] = why
             warn(f"Dead-URL pruning claimed {stats['removed']:,} of {stats['before']:,} URLs "
-                 f"({removed_pct:.1f}%) are dead — far more than a real corpus loses, so the "
-                 f"target most likely rate-limited the probe.")
+                 f"({removed_pct:.1f}%) are dead — not trusting that.")
+            sub(why)
             sub(f"Keeping the full {stats['before']:,}-URL list. Lower settings.threads, or set "
                 f"settings.prune_dead_urls: false, if this repeats.")
             return raw_all, stats
 
         stats["rejected"] = False
+        stats["trusted_high_removal"] = bool(removed_pct > max_pct)
         ok(f"Dead-URL pruning: {stats['before']:,} → {stats['after']:,} live URLs "
            f"({stats['removed']:,} removed as {codes or 'dead'})")
+        if stats["trusted_high_removal"]:
+            sub(why)
         return pruned_file, stats
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────
@@ -4592,7 +5223,7 @@ class ReconPipeline:
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 6 — XSS (Dalfox) taramasi
     # ══════════════════════════════════════════════════════════════════════════
-    def _run_dalfox_once(self, xss_file: Path, d: Path, run_tag: str) -> dict:
+    def _run_dalfox_once(self, xss_file: Path, d: Path, run_tag: str, timeout_sec: int = 0) -> dict:
         res = {
             "workers": 0, "delay_ms": 0, "blocked_hits": 0, "total_lines": 0,
             "block_ratio": 0.0, "findings": 0, "poc_live": 0, "count": 0,
@@ -4652,6 +5283,28 @@ class ReconPipeline:
         cmd += ["--worker", str(_dfx_worker_n)]
         if _dfx_delay > 0:
             cmd += ["--delay", str(_dfx_delay)]
+        # v9.3: skip parameter mining (see dalfox_skip_mining default for the full
+        # rationale — ReconX already supplies the param corpus, and mining explodes
+        # per-URL time on any target that reflects arbitrary param names). The flag
+        # is only added when THIS binary's own --help documents it (via _dalfox_caps),
+        # so an off-name spelling can never become an "unknown flag" that kills the
+        # stage; if unavailable we silently fall back to full mining.
+        _dfx_skip = str(_cfg_get(self.cfg, "tools", "dalfox_skip_mining", default="all") or "").strip().lower()
+        if _dfx_skip in ("all", "dom", "dict"):
+            if _dfx_skip in _dalfox_caps().get("skip_mining_flags", set()):
+                cmd += ["--skip-mining-" + _dfx_skip]
+            else:
+                warn(f"dalfox has no --skip-mining-{_dfx_skip} flag — using full mining "
+                     f"(scan may be slow on param-reflecting targets)")
+        elif _dfx_skip not in ("", "none", "off", "false"):
+            warn(f"Unknown tools.dalfox_skip_mining={_dfx_skip!r} — using full mining "
+                 f"(valid: all | dom | dict | '')")
+        # v9.3: per-target cost trims, each caps-gated the same way.
+        _skip_avail = _dalfox_caps().get("skip_flags", set())
+        if bool(_cfg_get(self.cfg, "tools", "dalfox_skip_bav", default=True)) and "bav" in _skip_avail:
+            cmd += ["--skip-bav"]
+        if bool(_cfg_get(self.cfg, "tools", "dalfox_skip_headless", default=True)) and "headless" in _skip_avail:
+            cmd += ["--skip-headless"]
         cmd += _tor_cli_flag("dalfox", self.cfg)
 
         # v8.4-fix: dalfox v3.x (Rust rewrite) adds --state-file — it records
@@ -4798,9 +5451,10 @@ class ReconPipeline:
         # positive number in config.yaml if you want the old quiet-period
         # auto-kill back (e.g. for much smaller/faster scans).
         _dalfox_stall_sec = int(_cfg_get(self.cfg, "tools", "dalfox_stall_timeout_sec", default=0) or 0)
+        _cap_note = (f" (per-URL cap {int(timeout_sec)}s)" if timeout_sec
+                     else ("" if _dalfox_stall_sec else " (no stall limit — only the stage time ceiling applies)"))
         info(f"Dalfox is running against {_count_lines(xss_file):,} targets "
-             f"— progress streams below, runtime scales with the target count"
-             + ("" if _dalfox_stall_sec else " (no stall limit — only the global 2h ceiling applies)"))
+             f"— progress streams below, runtime scales with the target count{_cap_note}")
 
         # v8.3: live XSS-hit display. On dalfox v2.x (Go), DalLog("PRINT", ...)
         # writes each finding's raw JSON both to its -o output file AND to
@@ -4837,7 +5491,8 @@ class ReconPipeline:
         # is NOT given, and we always give it — so seed the count from the value
         # we set rather than waiting for a line that never arrives.
         dfx_status = {"text": f"target 0/{_dfx_total} (0%) · {_dfx_worker_n}w"}
-        prog = {"done": 0, "workers": _dfx_worker_n, "hits": 0}
+        prog = {"done": 0, "workers": _dfx_worker_n, "hits": 0, "cur": "", "hit_at": 0.0}
+        live_findings = []
 
         def _dfx_status_text():
             pct = prog["done"] * 100.0 / _dfx_total
@@ -4846,6 +5501,13 @@ class ReconPipeline:
                 bits.append(f"{prog['workers']}w")
             if prog["hits"]:
                 bits.append(f"{prog['hits']} hit{'s' if prog['hits'] > 1 else ''}")
+            # v9.3: show the target dalfox is CURRENTLY grinding on. dalfox v2 emits
+            # nothing between a target's start and its "Finish Scan!" (~1min each on
+            # a slow host), so without this the counter sits at the same "N/total"
+            # for a full minute and reads as frozen — showing the live URL makes it
+            # obvious the scan is alive and working, just sequential.
+            if prog["cur"]:
+                bits.append(f"scanning {prog['cur']}")
             return " · ".join(bits)
 
         def _dalfox_line_cb(line: str):
@@ -4872,7 +5534,16 @@ class ReconPipeline:
                                 prog["done"] = max(prog["done"], int(m.group(1)))
                         except ValueError:
                             pass
-                        dfx_status["text"] = _dfx_status_text()
+                    # capture the URL dalfox is starting on (case-preserved from the
+                    # raw line), shortened to path+query so the status stays one line
+                    um = re.search(r"URL:\s*(\S+)", s)
+                    if um:
+                        try:
+                            _p = urlparse(um.group(1))
+                            prog["cur"] = ((_p.path or "/") + ("?" + _p.query if _p.query else ""))[:60]
+                        except Exception:
+                            prog["cur"] = um.group(1)[:60]
+                    dfx_status["text"] = _dfx_status_text()
                 return
             try:
                 rec = json.loads(s)
@@ -4880,8 +5551,18 @@ class ReconPipeline:
                 return
             if isinstance(rec, dict) and ("payload" in rec or "data" in rec) and "type" in rec:
                 prog["hits"] += 1
+                if not prog["hit_at"]:
+                    prog["hit_at"] = time.time()
+                live_findings.append(rec)
                 dfx_status["text"] = _dfx_status_text()
                 xss_live_hit(rec)
+
+        def _stop_after_hit():
+            # A verified hit is already on stdout. Give dalfox a few seconds to
+            # flush sibling payloads for this parameter, then move on. Without
+            # this, one URL keeps fuzzing for many minutes after the first hit
+            # and the rest of the list is never scanned.
+            return bool(prog["hits"] and prog["hit_at"] and (time.time() - prog["hit_at"]) >= 20)
 
         # v8.4-fix: only dalfox v3.x uses exit 1 == "vulnerabilities found";
         # v2.x's exit-code convention on a normal findings run is 0, so this
@@ -4901,21 +5582,31 @@ class ReconPipeline:
         # incrementally, so a run cut off at the budget still keeps everything
         # found so far — far better than a 2h open-ended run that the user
         # ends up Ctrl+C-ing anyway.
-        _dfx_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=2400) or 2400)
+        _dfx_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=10800) or 10800)
         _dfx_budget = min(_dfx_budget, T["dalfox"]) if _dfx_budget > 0 else T["dalfox"]
+        if timeout_sec and int(timeout_sec) > 0:
+            _dfx_budget = min(_dfx_budget, int(timeout_sec))
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
             cmd, timeout=_dfx_budget, log=self.log, label=f"dalfox-{run_tag}",
             line_cb=_dalfox_line_cb, stall_timeout=_dalfox_stall_sec, status=dfx_status,
-            ok_exit_codes=_dalfox_ok_codes
+            ok_exit_codes=_dalfox_ok_codes, stop_check=_stop_after_hit
         )
         res["duration_sec"] = round(time.time() - _t0, 1)
         # distinguish "we stopped dalfox at its time budget" (expected, findings
         # so far are kept) from a real user Ctrl+C — the report wording differs.
-        _budget_hit = bool(killed) and not _INT.interrupted() and \
-            res["duration_sec"] >= max(1, _dfx_budget - 10)
+        # --max-time raises the same hard-stop flag as Ctrl+C, so a duration
+        # check alone used to label a budget stop as a user interrupt.
+        _time_budget = bool(getattr(self, "_budget_fired", False))
+        _per_url_cap = bool(killed) and not _INT.interrupted() and not _time_budget and \
+            res["duration_sec"] >= max(1, _dfx_budget - 15)
+        _stopped_after_hit = bool(
+            killed and prog["hits"] and not _time_budget and not _per_url_cap and not _INT.interrupted())
+        _budget_hit = bool(killed) and (_time_budget or _per_url_cap)
         res["budget_hit"] = _budget_hit
-        res["interrupted"] = bool(killed) and not _budget_hit
+        res["per_url_capped"] = _per_url_cap
+        res["stopped_after_hit"] = _stopped_after_hit
+        res["interrupted"] = bool(killed) and not _budget_hit and not _stopped_after_hit
         res["stalled"] = bool(stalled)
         res["total_lines"] = lines
         res["exit_code"] = rc
@@ -4939,6 +5630,15 @@ class ReconPipeline:
         blocked = 0
         _dalfox_meta = None
         _dalfox_hard_error = ""
+        # Stopping dalfox right after a hit can land before -o is flushed.
+        # The same JSON lines already arrived on stdout; keep those.
+        if live_findings and not (json_f.exists() and json_f.stat().st_size > 0):
+            try:
+                with json_f.open("w", encoding="utf-8") as fh:
+                    for rec in live_findings:
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
         if json_f.exists() and json_f.stat().st_size > 0:
             with json_f.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -4996,9 +5696,19 @@ class ReconPipeline:
                                   f"block etc.), or a single slow/WAF-protected target just needs more "
                                   f"time. Set tools.dalfox_stall_timeout_sec: 0 to disable this auto-kill "
                                   f"entirely and rely only on the overall 2h ceiling (this is the default).")
+        elif killed and _stopped_after_hit:
+            pass
+        elif killed and getattr(self, "_budget_fired", False):
+            res["tool_error"] = (
+                "Scan stopped because --max-time was reached. Findings saved so far are kept; "
+                "targets that did not finish are not clean.")
+        elif killed and res.get("per_url_capped"):
+            res["tool_error"] = (
+                f"This URL hit the per-URL cap ({_dfx_budget}s). Findings saved so far are kept.")
         elif killed:
-            res["tool_error"] = ("Tarama kullanici tarafindan erken durduruldu (Ctrl+C) — "
-                                  "bulgular EKSIK olabilir, tum hedefler taranmamis olabilir")
+            res["tool_error"] = (
+                "Scan stopped early (Ctrl+C). Findings may be incomplete; "
+                "targets that did not finish are not clean.")
         elif _dalfox_hard_error:
             res["tool_failed"] = True
             res["tool_error"] = f"dalfox reported an error: {_dalfox_hard_error}"
@@ -5048,6 +5758,111 @@ class ReconPipeline:
         res["file_json"] = str(json_f)
         return res
 
+    def _run_dalfox_per_url(self, xss_file: Path, d: Path, run_tag: str) -> dict:
+        """Scan each URL in its own dalfox process with a wall-clock cap.
+
+        dalfox file mode walks the list one URL at a time and keeps fuzzing a
+        URL long after the first verified hit. A single slow URL then eats the
+        stage budget and every later URL is never scanned — while the report
+        used to mark those later URLs clean. A per-URL cap keeps findings
+        already written and moves on."""
+        try:
+            urls = [l.strip() for l in xss_file.read_text(errors="ignore").splitlines() if l.strip()]
+        except Exception:
+            urls = []
+        if len(urls) <= 1:
+            return self._run_dalfox_once(xss_file, d, run_tag)
+
+        per = int(_cfg_get(self.cfg, "tools", "dalfox_per_url_sec", default=420) or 420)
+        stage_budget = int(_cfg_get(self.cfg, "tools", "dalfox_time_budget_sec", default=10800) or 10800)
+        stage_budget = min(stage_budget, T["dalfox"]) if stage_budget > 0 else T["dalfox"]
+        one_dir = d / "dalfox_per_url"
+        one_dir.mkdir(parents=True, exist_ok=True)
+        info(f"Dalfox: {len(urls)} URLs, one process each, {per}s cap per URL "
+             f"(stage ceiling {stage_budget}s)")
+
+        finished, incomplete = [], []
+        results = []
+        t0 = time.time()
+        for i, u in enumerate(urls):
+            if _INT.hard() or _INT.interrupted() or getattr(self, "_budget_fired", False):
+                break
+            remaining = stage_budget - (time.time() - t0)
+            if remaining < 20:
+                break
+            cap = max(20, min(per, int(remaining)))
+            cf = one_dir / f"u{i}.txt"
+            write_lines(cf, [u])
+            info(f"Dalfox URL {i + 1}/{len(urls)} — cap {cap}s — {u[:120]}")
+            r = self._run_dalfox_once(cf, one_dir, f"u{i}", timeout_sec=cap)
+            results.append((u, r))
+            if r.get("stopped_after_hit"):
+                finished.append(u)
+                continue
+            if getattr(self, "_budget_fired", False) or r.get("interrupted"):
+                incomplete.append(u)
+                break
+            if r.get("per_url_capped") or r.get("budget_hit") or r.get("tool_failed"):
+                incomplete.append(u)
+                continue
+            finished.append(u)
+
+        write_lines(d / "xss_targets_finished.txt", finished)
+        write_lines(d / "xss_targets_incomplete.txt", incomplete)
+
+        merged = {
+            "workers": 0, "delay_ms": 0, "blocked_hits": 0, "total_lines": 0,
+            "block_ratio": 0.0, "findings": 0, "poc_live": 0, "count": 0,
+            "tool_failed": False, "exit_code": 0, "tool_error": "",
+            "interrupted": False, "stalled": False, "budget_hit": False,
+            "duration_sec": round(time.time() - t0, 1),
+            "targets_count": len(urls),
+            "targets_finished": len(finished),
+            "targets_incomplete": len(incomplete),
+            "findings_list": [], "dalfox_meta": None, "suspicious_empty": False,
+        }
+        json_f = d / f"dalfox_{run_tag}.json"
+        txt_f = d / f"dalfox_{run_tag}.txt"
+        with json_f.open("w", encoding="utf-8") as jout, txt_f.open("w", encoding="utf-8") as tout:
+            for _u, r in results:
+                if not r:
+                    continue
+                merged["findings"] += r.get("findings", 0)
+                merged["count"] += r.get("count", 0)
+                merged["total_lines"] += r.get("total_lines", 0)
+                merged["findings_list"].extend(r.get("findings_list", []) or [])
+                merged["stalled"] = merged["stalled"] or bool(r.get("stalled"))
+                if r.get("tool_failed") and not r.get("per_url_capped"):
+                    merged["tool_failed"] = True
+                    merged["tool_error"] = merged["tool_error"] or r.get("tool_error", "")
+                pj = r.get("file_json", "")
+                if pj and Path(pj).exists():
+                    for ln in Path(pj).read_text(errors="ignore").splitlines():
+                        if ln.strip():
+                            jout.write(ln.rstrip("\n") + "\n")
+                pt = r.get("file_txt", "")
+                if pt and Path(pt).exists():
+                    tout.write(Path(pt).read_text(errors="ignore"))
+        not_started = len(urls) - len(finished) - len(incomplete)
+        if getattr(self, "_budget_fired", False):
+            merged["budget_hit"] = True
+            merged["tool_error"] = (
+                "Scan stopped because --max-time was reached. Findings saved so far are kept; "
+                "targets that did not finish are not clean.")
+        elif _INT.interrupted():
+            merged["interrupted"] = True
+            merged["tool_error"] = (
+                "Scan stopped early (Ctrl+C). Findings may be incomplete; "
+                "targets that did not finish are not clean.")
+        elif incomplete or not_started:
+            merged["budget_hit"] = True
+            merged["tool_error"] = (
+                f"{len(incomplete)} URL(s) hit the per-URL cap and {not_started} were not started. "
+                f"Those are not clean — raise tools.dalfox_per_url_sec for a deeper pass.")
+        merged["file_json"] = str(json_f)
+        merged["file_txt"] = str(txt_f)
+        return merged
+
     def _run_dalfox(self, xss_file: Path, d: Path, run_tag: str) -> dict:
         """v8.6: dispatcher. dalfox v2 scans a target file strictly one URL at
         a time. ReconX can split the list into N chunks and run N dalfox
@@ -5061,7 +5876,10 @@ class ReconPipeline:
         n = _count_lines(xss_file)
         jobs = int(_cfg_get(self.cfg, "tools", "dalfox_parallel_jobs", default=1) or 1)
         min_targets = int(_cfg_get(self.cfg, "tools", "dalfox_parallel_min", default=8) or 8)
+        per_url = int(_cfg_get(self.cfg, "tools", "dalfox_per_url_sec", default=420) or 0)
         if jobs <= 1 or n < min_targets or _dalfox_caps().get("is_v3") or not tool_exists("dalfox"):
+            if per_url > 0 and n > 1:
+                return self._run_dalfox_per_url(xss_file, d, run_tag)
             return self._run_dalfox_once(xss_file, d, run_tag)
 
         try:
@@ -5077,6 +5895,8 @@ class ReconPipeline:
         if len(by_host) < 2:
             info("Dalfox: single host — parallel execution skipped (parallel requests to one "
                  "host trip its rate-limit/WAF and corrupt the result), scanning sequentially")
+            if per_url > 0 and n > 1:
+                return self._run_dalfox_per_url(xss_file, d, run_tag)
             return self._run_dalfox_once(xss_file, d, run_tag)
 
         host_groups = sorted(by_host.values(), key=len, reverse=True)
@@ -5183,13 +6003,16 @@ class ReconPipeline:
         # doesn't finish. Drop malformed URLs (literal \n, control chars,
         # crawler junk), dedup by (host, path, sorted-param-names), rank
         # param'd URLs above path-only, and keep the top N.
-        _dfx_max = int(_cfg_get(self.cfg, "tools", "dalfox_max_targets", default=40) or 40)
+        try:
+            _dfx_max = int(_cfg_get(self.cfg, "tools", "dalfox_max_targets", default=0))
+        except (TypeError, ValueError):
+            _dfx_max = 0
         _dfx_path_only = bool(_cfg_get(self.cfg, "tools", "dalfox_test_path_only", default=False))
         try:
             raw = [l.strip() for l in xss_file.read_text(errors="ignore").splitlines() if l.strip()]
         except Exception:
             raw = []
-        clean, seen_shape = [], set()
+        clean, seen_shape = [], {}
         for u in raw:
             if not u.startswith(("http://", "https://")):
                 continue
@@ -5199,14 +6022,42 @@ class ReconPipeline:
                 pr = urlparse(u)
                 if not pr.hostname or not self._is_in_scope_url(u):
                     continue
-                params = tuple(sorted(k for k, _ in parse_qsl(pr.query)))
+                # Wayback concatenates unrelated URLs onto a static file
+                # (t/fit.txt?.com/search, %00.jpg). Dalfox then spends its
+                # whole budget on target 0 and never reaches a real parameter.
+                qs_l = (pr.query or "").lower()
+                if "%00" in u.lower() or qs_l.startswith(".") or qs_l.startswith("%2e"):
+                    continue
+                # Archive rows that already ARE someone else's payload, not a
+                # parameter. Testing those burns the budget and never returns.
+                decoded_q = pr.query or ""
+                for _ in range(4):
+                    nxt = unquote(decoded_q)
+                    if nxt == decoded_q:
+                        break
+                    decoded_q = nxt
+                decoded_q = decoded_q.lower()
+                if any(tok in decoded_q for tok in (
+                        "<script", "onerror=", "javascript:", "alert(",
+                        "createelement(", "union select", "xp_cmdshell",
+                        "/etc/passwd")):
+                    continue
+                if re.search(r"\.(txt|xml|jpg|jpeg|png|gif|css|ico|svg|map|pdf|zip)$",
+                             pr.path or "", re.I):
+                    continue
+                params = tuple(sorted(k.lower() for k, _ in parse_qsl(pr.query) if k))
                 reflect = _has_reflection_param(pr.query)
             except Exception:
                 continue
-            shape = (pr.hostname, pr.path.rstrip("/"), params)
+            shape = ((pr.hostname or "").lower(), pr.path.rstrip("/"), params)
             if shape in seen_shape:
+                # Same injection point. Keep the shorter example so a clean
+                # ?tfsearch=a wins over an archive value like ?tfSearch=%253.
+                i = seen_shape[shape]
+                if len(u) < len(clean[i][0]):
+                    clean[i] = (u, len(params), reflect)
                 continue
-            seen_shape.add(shape)
+            seen_shape[shape] = len(clean)
             clean.append((u, len(params), reflect))
         # Ranking, best first:
         #   1. a parameter whose NAME is one people actually echo back into the
@@ -5220,21 +6071,24 @@ class ReconPipeline:
         clean.sort(key=lambda t: (0 if (t[1] and t[2]) else (1 if t[1] else 2), len(t[0])))
         _param_urls = [u for u, n, _r in clean if n]
         _reflect_urls = [u for u, n, r in clean if n and r]
+        def _take(seq):
+            seq = list(seq)
+            return seq if _dfx_max <= 0 else seq[:_dfx_max]
         if _dfx_path_only or len(_param_urls) < 5:
             # keep path-only URLs too (config opted in, or too few real
             # injection points to fill a useful run)
-            final = [u for u, _n, _r in clean[:_dfx_max]]
+            final = _take(u for u, _n, _r in clean)
         else:
             # every URL dalfox tests without a query param costs ~30s of DOM
             # mining for near-zero XSS yield — drop them
-            final = _param_urls[:_dfx_max]
+            final = _take(_param_urls)
         if not final:
             # v8.7-fix: this fallback used to skip the scope check applied in
             # the `clean` loop above — re-apply it here too, otherwise an
             # empty `clean`/`final` (e.g. every URL failing urlparse or the
             # scope check) fed a raw, unfiltered slice straight to dalfox.
-            final = [u for u in raw
-                     if u.startswith(("http://", "https://")) and self._is_in_scope_url(u)][:_dfx_max]
+            final = _take(u for u in raw
+                          if u.startswith(("http://", "https://")) and self._is_in_scope_url(u))
         _n_reflect = sum(1 for u in final if u in set(_reflect_urls))
         if _reflect_urls:
             sub(f"XSS target ranking: {_n_reflect} of the {len(final)} selected carry a "
@@ -5243,8 +6097,10 @@ class ReconPipeline:
         write_lines(tested_f, final)
         xss_file = tested_f
         if len(raw) > len(final):
-            sub(f"Dalfox targets {len(raw)} → {len(final)} (cleanup + unique injection "
-                f"points + tools.dalfox_max_targets={_dfx_max} cap)")
+            why = "cleanup + unique injection points"
+            if _dfx_max > 0:
+                why += f" + tools.dalfox_max_targets={_dfx_max} cap"
+            sub(f"Dalfox targets {len(raw)} → {len(final)} ({why})")
 
         # v8.2: auto-provision a blind XSS OOB callback (interactsh) if the user
         # hasn't manually configured one. A manually-set config.blind_xss_callback
@@ -5273,7 +6129,7 @@ class ReconPipeline:
             xss_screenshots = capture_xss_alert_screenshots(
                 run.get("findings_list") or [], d, max_shots=max_shots,
                 nav_timeout_sec=int(_cfg_get(self.cfg, "settings", "timeout", default=15) or 15),
-                budget_sec=int(_cfg_get(self.cfg, "settings", "xss_verify_budget_sec", default=900) or 900),
+                budget_sec=int(_cfg_get(self.cfg, "settings", "xss_verify_budget_sec", default=3600) or 3600),
                 payloads_per_point=int(_cfg_get(self.cfg, "settings", "xss_verify_payloads_per_point", default=4) or 4),
                 max_checks=int(_cfg_get(self.cfg, "settings", "xss_verify_max_checks", default=60) or 60))
             # v8.5-fix: the "R"→"RV" promotion (a Reflected finding ReconX
@@ -5309,8 +6165,10 @@ class ReconPipeline:
         run["blind_callback_used"] = (interactsh_session or {}).get("domain", "") or manual_blind
         run["screenshots"] = xss_screenshots
         self.xss_results = run
+        _stage6_status = "tool_error" if run.get("tool_failed") else (
+            "partial" if (run.get("interrupted") or run.get("budget_hit")) else "done")
         self.summary["stage6"] = {
-            "status": "done" if not run.get("tool_failed") else "tool_error",
+            "status": _stage6_status,
             "findings": run["findings"],
             "count": run["findings"],
             "file_txt": run["file_txt"],
@@ -5322,6 +6180,8 @@ class ReconPipeline:
             "stalled": run.get("stalled", False),
             "duration_sec": run.get("duration_sec", 0.0),
             "targets_count": run.get("targets_count", 0),
+            "targets_finished": run.get("targets_finished", 0),
+            "targets_incomplete": run.get("targets_incomplete", 0),
             "blind_callback_used": run["blind_callback_used"],
             "blind_interactions": blind_interactions,
             "screenshots": xss_screenshots,
@@ -5343,7 +6203,7 @@ class ReconPipeline:
             ok("Dalfox completed — no findings")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Stage 7 — Nuclei Vulnerability Scan (alive hosts)
+    # Stage 7 — Nuclei Vulnerability Scan (full live URL corpus)
     # ══════════════════════════════════════════════════════════════════════════
     def _get_nuclei_template_path(self) -> str:
         # v8.7-fix: memoization was lost in a refactor — discover_nuclei_
@@ -5415,6 +6275,137 @@ class ReconPipeline:
                     break
         return ",".join(sorted(tags))
 
+    def _build_nuclei_targets(self, tgt_file: Path) -> dict:
+        """v9.0: nuclei's target list is the FULL live URL corpus, not just the
+        alive host roots.
+
+        Feeding it only "https://host/" (the pre-9.0 behaviour) meant every
+        template that matches on a PATH — an exposed /.git/config, a
+        /actuator/env, a /wp-json/ endpoint, a parameterised injection point —
+        could only ever fire if that path happened to be the site root. Every
+        URL the crawl stages actually proved to be live was thrown away before
+        the scan. Now stage 4's pruned live-URL list, the categorised param
+        URLs and any authenticated URLs all go into one -l file.
+
+        Two guards keep "everything" from turning into a scan that never ends:
+
+          * shape dedup — ?id=1 / ?id=2 / ?id=3 and /post/1 /post/2 /post/3 are
+            the same template surface, so ONE representative per
+            (scheme, host, path-shape, param-names) is kept. On a real corpus
+            this is where most of the reduction comes from, and it costs no
+            coverage.
+          * a hard cap (tools.nuclei_max_targets) applied BY PRIORITY, so the
+            alive host roots and the parameterised URLs always survive it and
+            only plain path URLs get trimmed.
+
+        Returns a stats dict; the file itself is written to tgt_file.
+        """
+        dedup = bool(_cfg_get(self.cfg, "tools", "nuclei_dedup_url_shapes", default=True))
+        buckets = {0: [], 1: [], 2: []}     # 0 = host roots, 1 = param/auth URLs, 2 = path URLs
+        seen_url = {}                        # url -> tier already assigned
+        seen_shape = set()
+        counters = {"raw": 0, "out_of_scope": 0, "shape_dropped": 0}
+
+        def _add(raw: str, tier: int):
+            u = strip_ansi((raw or "").strip())
+            if not u or u.startswith("#"):
+                return
+            counters["raw"] += 1
+            if not u.startswith(("http://", "https://")):
+                u = f"https://{u}"
+            if len(u) > 2000:
+                return
+            if not self._is_in_scope_url(u):
+                counters["out_of_scope"] += 1
+                return
+            try:
+                pr = urlparse(u)
+            except Exception:
+                return
+            if not pr.hostname:
+                return
+            if u in seen_url:
+                return
+            # Host roots are never shape-deduped against each other: one root
+            # per alive host is exactly what we want and they are the highest
+            # value targets in the list.
+            if dedup and tier > 0:
+                shape = (pr.scheme, pr.hostname, pr.port,
+                         _path_shape(pr.path or "/"),
+                         _query_param_shape(pr.query) if pr.query else "")
+                if shape in seen_shape:
+                    counters["shape_dropped"] += 1
+                    return
+                seen_shape.add(shape)
+            seen_url[u] = tier
+            buckets[tier].append(u)
+
+        def _lines(path: Path):
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    return path.read_text(errors="replace").splitlines()
+            except Exception:
+                pass
+            return []
+
+        # ── tier 0: every alive host root ────────────────────────────────────
+        for ln in _lines(self._cp("stage3_alive")):
+            _add(ln, 0)
+
+        # ── tier 1: authenticated URLs (behind a login = the interesting half)
+        for ln in _lines(self._cp("stage8_authenticated_urls")):
+            _add(ln, 1)
+
+        # ── tiers 1/2: the live URL corpus. Anything carrying a query string
+        # is a candidate injection point, so it outranks a plain path URL.
+        url_sources = [
+            self._cp("stage4_urls"),
+            self.out / "04_urls" / "all_urls_live.txt",
+            self.out / "05_categorized" / "params.txt",
+            self.out / "05_categorized" / "xss_targets.txt",
+            self._cp("stage5_params"),
+            self._cp("stage9_params"),
+            self._cp("stage13_api"),
+        ]
+        for src in url_sources:
+            for ln in _lines(src):
+                s = ln.strip()
+                if not s:
+                    continue
+                _add(s, 1 if "?" in s else 2)
+
+        ordered = buckets[0] + buckets[1] + buckets[2]
+        total_unique = len(ordered)
+        try:
+            cap = int(_cfg_get(self.cfg, "tools", "nuclei_max_targets", default=0) or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        capped = 0
+        if cap > 0 and total_unique > cap:
+            keep = []
+            for tier in (0, 1, 2):
+                room = cap - len(keep)
+                if room <= 0:
+                    break
+                keep.extend(buckets[tier][:room])
+            capped = total_unique - len(keep)
+            ordered = keep
+
+        write_lines(tgt_file, ordered)
+        stats = {
+            "total": len(ordered),
+            "hosts": sum(1 for u in ordered if seen_url.get(u) == 0),
+            "param_urls": sum(1 for u in ordered if seen_url.get(u) == 1),
+            "path_urls": sum(1 for u in ordered if seen_url.get(u) == 2),
+            "raw_seen": counters["raw"],
+            "shape_deduped": counters["shape_dropped"],
+            "out_of_scope": counters["out_of_scope"],
+            "capped": capped,
+            "cap": cap,
+            "shape_dedup": dedup,
+        }
+        return stats
+
     def _run_nuclei_once(self, targets: Path, d: Path, run_tag: str, extra_tags: str = "") -> dict:
         res = {
             "threads": 0, "rate": 0, "blocked_hits": 0, "total_lines": 0,
@@ -5459,6 +6450,13 @@ class ReconPipeline:
         res["severity_filter"] = severity or "none"
         ex_tags = (_cfg_get(self.cfg, "tools", "nuclei_excluded_tags", default="") or "").strip()
         stats_interval = str(int(_cfg_get(self.cfg, "tools", "nuclei_stats_interval", default=5) or 5))
+        # "No output for N seconds" is only evidence of a hang if nuclei would
+        # normally have printed something by then — and what it prints on a
+        # quiet scan is its -stats line. Derive the watchdog from that interval
+        # instead of hardcoding 300s, so raising nuclei_stats_interval can no
+        # longer make a healthy scan look stalled.
+        stall_sec = int(_cfg_get(self.cfg, "tools", "nuclei_stall_timeout_sec",
+                                 default=max(300, int(stats_interval) * 12)) or 300)
 
         hdr_set = pick_header_strategy(self.target, self.cfg)
         if self.has_auth():
@@ -5474,21 +6472,61 @@ class ReconPipeline:
         # bulut altyapisina baglanmayi dener; kisitli/duvarli aglarda bu kontrol
         # hicbir cikti uretmeden askida kalabiliyor (tespit edildi). -duc bu riski
         # buyuk olcude azaltir; ek guvence olarak stall_timeout watchdog'u da devrede.
-        cmd = ["nuclei", "-l", str(targets), "-nc", "-duc",
-               "-jsonl", "-o", str(json_f),
-               "-stats", "-stats-interval", stats_interval]
-        cmd += ["-c", str(threads), "-rl", str(rate),
-                "-timeout", str(int(_cfg_get(self.cfg, "settings", "timeout", default=20)))]
-        if tpl:
-            cmd += ["-t", tpl]
-        if severity:
-            cmd += ["-severity", severity]
-        if ex_tags:
-            cmd += ["-exclude-tags", ex_tags]
-        if extra_tags:
-            cmd += ["-tags", extra_tags]
-        cmd += hdr_args
-        cmd += _tor_cli_flag("nuclei", self.cfg)
+        # v9.0: the main pass and the adaptive re-run used to build their argv
+        # separately, so a flag added to one silently never reached the other.
+        # One builder now owns both.
+        nh = _help_text("nuclei")
+        retries = int(_cfg_get(self.cfg, "tools", "nuclei_retries", default=1) or 1)
+        max_host_err = int(_cfg_get(self.cfg, "tools", "nuclei_max_host_error", default=30) or 30)
+        strategy = (_cfg_get(self.cfg, "tools", "nuclei_scan_strategy", default="auto") or "auto").strip()
+        req_timeout = int(_cfg_get(self.cfg, "settings", "timeout", default=20))
+
+        def _build(out_path: Path, conc: int, rl: int) -> list:
+            c = ["nuclei", "-l", str(targets), "-nc", "-duc",
+                 "-jsonl", "-o", str(out_path),
+                 "-stats", "-stats-interval", stats_interval,
+                 "-c", str(conc), "-rl", str(rl), "-timeout", str(req_timeout)]
+            # Every entry in the list is a full scheme://host/path URL, so
+            # nuclei's own httpx pre-probe round has nothing left to resolve —
+            # skipping it saves one request per target on a list this size.
+            if "-no-httpx" in nh:
+                c += ["-nh"]
+            if "-retries" in nh:
+                c += ["-retries", str(max(0, retries))]
+            # A host that has already errored out N times is down or blocking;
+            # continuing to aim thousands of templates at it only slows the run.
+            if "-max-host-error" in nh:
+                c += ["-mhe", str(max(1, max_host_err))]
+            if strategy and strategy != "auto" and "-scan-strategy" in nh:
+                c += ["-ss", strategy]
+            # The JSONL is parsed for template-id / severity / matched-at only —
+            # nothing downstream reads the raw request/response pair or the
+            # base64 template body, and on a multi-thousand-URL corpus those two
+            # fields are what turn the output into a multi-GB file.
+            if "-omit-raw" in nh:
+                c += ["-or"]
+            if "-omit-template" in nh:
+                c += ["-ot"]
+            if tpl:
+                c += ["-t", tpl]
+            if severity:
+                c += ["-severity", severity]
+            if ex_tags:
+                c += ["-exclude-tags", ex_tags]
+            if extra_tags:
+                c += ["-tags", extra_tags]
+            c += hdr_args
+            c += _tor_cli_flag("nuclei", self.cfg)
+            return c
+
+        cmd = _build(json_f, threads, rate)
+        fatal = {"line": ""}
+        try:
+            dbg.write_text(
+                f"# {time.strftime('%Y-%m-%d %H:%M:%S')} {shlex.join(cmd)}\n",
+                encoding="utf-8")
+        except Exception:
+            pass
 
         info(f"Nuclei is running against {_count_lines(targets):,} targets "
              f"(templates={res['template_path']}"
@@ -5496,8 +6534,9 @@ class ReconPipeline:
              f"every {stats_interval}s below")
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
-            cmd, timeout=T["nuclei"], log=self.log, label="nuclei", line_cb=None,
-            stall_timeout=300
+            cmd, timeout=T["nuclei"], log=self.log, label="nuclei",
+            line_cb=_nuclei_log_cb(dbg, fatal),
+            stall_timeout=stall_sec
         )
         res["duration_sec"] = round(time.time() - _t0, 1)
         res["interrupted"] = bool(killed)
@@ -5506,7 +6545,9 @@ class ReconPipeline:
         res["exit_code"] = rc
         if not killed and rc not in (0, None):
             res["tool_failed"] = True
-            res["tool_error"] = f"nuclei exited with code {rc} — sonuclar eksik/gecersiz olabilir (log: {dbg})"
+            detail = f" — {fatal['line']}" if fatal.get("line") else ""
+            res["tool_error"] = (
+                f"nuclei exited with code {rc}{detail} — results may be incomplete (log: {dbg})")
         elif stalled:
             res["tool_failed"] = True
             res["tool_error"] = ("Nuclei 300s boyunca hicbir ilerleme kaydetmedi ve otomatik "
@@ -5572,24 +6613,10 @@ class ReconPipeline:
                     break
                 rerun_rate = self._tuned_rate(max(1, int(rate * (backoff ** idx))), 30)
                 rerun_f = d / f"nuclei_{run_tag}_rerun_{idx}.json"
-                rerun_cmd = ["nuclei", "-l", str(targets), "-nc", "-duc",
-                             "-jsonl", "-o", str(rerun_f),
-                             "-stats", "-stats-interval", stats_interval,
-                             "-c", str(max(1, threads // 2)), "-rl", str(rerun_rate),
-                             "-timeout", str(int(_cfg_get(self.cfg, "settings", "timeout", default=20)))]
-                if tpl:
-                    rerun_cmd += ["-t", tpl]
-                if severity:
-                    rerun_cmd += ["-severity", severity]
-                if ex_tags:
-                    rerun_cmd += ["-exclude-tags", ex_tags]
-                if extra_tags:
-                    rerun_cmd += ["-tags", extra_tags]
-                rerun_cmd += hdr_args
-                rerun_cmd += _tor_cli_flag("nuclei", self.cfg)
+                rerun_cmd = _build(rerun_f, max(1, threads // 2), rerun_rate)
                 _rc2, _lines2, killed2, _stalled2 = _stream_tool(
                     rerun_cmd, timeout=T["nuclei"], log=self.log, label=f"nuclei-rerun-{idx}",
-                    line_cb=None, stall_timeout=300
+                    line_cb=None, stall_timeout=stall_sec
                 )
                 res["reruns"] = idx
                 res["rate"] = rerun_rate
@@ -5664,12 +6691,6 @@ class ReconPipeline:
 
         res["file_txt"] = str(txt_f)
         res["file_json"] = str(json_f)
-        if dbg.exists():
-            try:
-                with dbg.open("w") as fo:
-                    fo.write("")
-            except Exception:
-                pass
         return res
 
     def _collect_param_urls(self, limit=1500):
@@ -5704,7 +6725,7 @@ class ReconPipeline:
                     continue
                 seen_shape.add(shape)
                 out.append(u)
-                if len(out) >= limit:
+                if limit and len(out) >= limit:
                     return out
         return out
 
@@ -5718,7 +6739,10 @@ class ReconPipeline:
                "targets_count": 0, "tool_failed": False, "tool_error": "", "duration_sec": 0.0}
         if not bool(_cfg_get(self.cfg, "tools", "nuclei_dast", default=True)):
             return res
-        dast_max = int(_cfg_get(self.cfg, "tools", "nuclei_dast_max_urls", default=400) or 400)
+        try:
+            dast_max = int(_cfg_get(self.cfg, "tools", "nuclei_dast_max_urls", default=0) or 0)
+        except (TypeError, ValueError):
+            dast_max = 0
         param_urls = self._collect_param_urls(limit=dast_max)
         if not param_urls:
             sub("Nuclei DAST skipped — no parameterised URLs")
@@ -5745,31 +6769,38 @@ class ReconPipeline:
         cmd += _hdr_args_nuclei(hdr_set)
         cmd += dns_resolver_args("nuclei")
         cmd += _tor_cli_flag("nuclei", self.cfg)
+        dast_log = d / "nuclei_dast.log"
+        fatal = {"line": ""}
+        try:
+            dast_log.write_text(
+                f"# {time.strftime('%Y-%m-%d %H:%M:%S')} {shlex.join(cmd)}\n",
+                encoding="utf-8")
+        except Exception:
+            pass
         info(f"Nuclei DAST (fuzzing) on {len(param_urls):,} parameterised URLs — "
              f"XSS/SQLi/SSTI/LFI/cmdi/redirect fuzzing")
         _t0 = time.time()
         rc = lines = killed = stalled = None
-        # v8.6-fix: the DAST pass runs right after dalfox has hammered the same
-        # host for minutes — the target's edge (CDN/WAF/ALB) sometimes throttles
-        # it just long enough that nuclei loads templates, gets blocked on the
-        # first requests and exits in <10s with 0 findings, even though the same
-        # command works fine a minute later. Detect that (fast exit + empty
-        # output file) and retry once after a short cooldown.
+        # A fast empty pass right after dalfox is often a brief throttle, so
+        # retry once. A non-zero exit is a startup failure (bad flag, dead
+        # proxy, missing templates) — waiting 15s does not fix it.
         for _try in (1, 2):
             rc, lines, killed, stalled = _stream_tool(
-                cmd, timeout=T.get("nuclei_dast", 7200), log=self.log, label=f"nuclei-dast{'' if _try == 1 else '-retry'}",
-                line_cb=None, stall_timeout=600)
+                cmd, timeout=T.get("nuclei_dast", 7200), log=self.log,
+                label=f"nuclei-dast{'' if _try == 1 else '-retry'}",
+                line_cb=_nuclei_log_cb(dast_log, fatal), stall_timeout=600)
             _elapsed = time.time() - _t0
             _empty = not (json_f.exists() and json_f.stat().st_size > 0)
-            if killed or not _empty or _elapsed > 25 or _try == 2:
+            if killed or rc not in (0, None) or not _empty or _elapsed > 25 or _try == 2:
                 break
-            warn(f"Nuclei DAST finished suspiciously fast ({_elapsed:.0f}s) and empty — the target "
-                 f"probably rate-limited briefly (right after dalfox). Waiting 15s and retrying once.")
+            warn(f"Nuclei DAST finished in {_elapsed:.0f}s with no findings — "
+                 f"the target may have throttled the first requests. Waiting 15s and retrying once.")
             time.sleep(15)
         res["duration_sec"] = round(time.time() - _t0, 1)
         if not killed and rc not in (0, None):
             res["tool_failed"] = True
-            res["tool_error"] = f"nuclei -dast exited {rc}"
+            detail = f" — {fatal['line']}" if fatal.get("line") else ""
+            res["tool_error"] = f"nuclei -dast exited {rc}{detail} (log: {dast_log})"
         findings, sev_counts = [], {}
         if json_f.exists() and json_f.stat().st_size > 0:
             for line in json_f.read_text(errors="replace").splitlines():
@@ -5804,36 +6835,38 @@ class ReconPipeline:
         if findings:
             ok(f"Nuclei DAST: {len(findings):,} findings — "
                f"{', '.join(f'{k}={v}' for k, v in sev_counts.items() if v)}")
+        elif res["tool_failed"]:
+            warn(f"Nuclei DAST failed — {res['tool_error']}")
         else:
             ok("Nuclei DAST complete — no findings")
         return res
 
     def stage7_nuclei(self):
-        stage(7, "Nuclei Vulnerability Scan (alive hosts)")
+        stage(7, "Nuclei Vulnerability Scan (full live URL corpus)")
         d = self.out / "07_nuclei"
         d.mkdir(parents=True, exist_ok=True)
         tgt_file = d / "nuclei_targets.txt"
-        # v6.12: hedef kumesi SADECE "alive" hostlar + authenticated URL'ler.
-        sources = [self._cp("stage3_alive"), self._cp("stage8_authenticated_urls")]
-        targets = []
-        seen = set()
-        for src in sources:
-            if not src.exists():
-                continue
-            for line in src.read_text(errors="replace").splitlines():
-                u = strip_ansi(line.strip())
-                if not u or not u.startswith(("http://", "https://")) or not self._is_in_scope_url(u):
-                    continue
-                if u not in seen:
-                    seen.add(u); targets.append(u)
-        write_lines(tgt_file, targets)
+        # v9.0: the target list is every live URL we proved exists, not just
+        # the alive host roots — see _build_nuclei_targets() for why.
+        tstats = self._build_nuclei_targets(tgt_file)
         if not tgt_file.exists() or tgt_file.stat().st_size == 0:
-            warn("No alive hosts — skipping nuclei")
-            self.summary["stage7"] = {"status": "skipped", "reason": "no_alive"}
+            warn("No live URLs or alive hosts — skipping nuclei")
+            self.summary["stage7"] = {"status": "skipped", "reason": "no_alive",
+                                      "targets": tstats}
             return
+        ok(f"Nuclei target list: {tstats['total']:,} URLs "
+           f"({tstats['hosts']:,} host roots, {tstats['param_urls']:,} parameterised, "
+           f"{tstats['path_urls']:,} path-only)")
+        if tstats["shape_deduped"]:
+            sub(f"{tstats['shape_deduped']:,} URLs collapsed as duplicate shapes "
+                f"(?id=1 / ?id=2, /post/1 / /post/2 test the same surface)")
+        if tstats["capped"]:
+            warn(f"{tstats['capped']:,} path-only URLs dropped by the "
+                 f"tools.nuclei_max_targets={tstats['cap']:,} cap — raise it for deeper coverage")
         if not tool_exists("nuclei"):
             warn("nuclei not installed — skipping scan")
-            self.summary["stage7"] = {"status": "skipped", "reason": "not_installed"}
+            self.summary["stage7"] = {"status": "skipped", "reason": "not_installed",
+                                      "targets": tstats}
             return
 
         # v6.13: teknoloji-bazli hizli on-tarama. Tespit edilen teknolojilere
@@ -5940,6 +6973,7 @@ class ReconPipeline:
             "dast_file_txt": dast.get("file_txt", ""),
             "dast_targets_count": dast.get("targets_count", 0),
             "tech_fastpass_tags": tech_tags,
+            "targets": tstats,
             "tool_failed": tool_failed,
             "tool_error": tool_error,
             "interrupted": interrupted,
@@ -5966,69 +7000,13 @@ class ReconPipeline:
             ok("Nuclei completed — no findings")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Stage 9 — Param/Endpoint Discovery (paramspider + arjun)
+    # Stage 9 — Param/Endpoint Discovery (arjun)
     # ══════════════════════════════════════════════════════════════════════════
     def stage9_params(self):
-        stage(9, "Param Discovery (paramspider + arjun)")
+        stage(9, "Param Discovery (arjun)")
         d = self.out / "09_params"
         all_params = []
         seen = set()
-
-        subs_file = self._cp("stage2_subdomains")
-        if tool_exists("paramspider"):
-            pid = d / "paramspider_tmp"
-            pid.mkdir(parents=True, exist_ok=True)
-            paramspider_all = d / "paramspider.txt"
-            domains = []
-            if subs_file.exists() and subs_file.stat().st_size > 0:
-                domains = [l.strip() for l in subs_file.read_text(errors="ignore").splitlines()
-                           if l.strip()]
-            if not domains:
-                domains = [self.target]
-            info(f"paramspider: {len(domains)} domain isleniyor")
-            ph = _help_text("paramspider")
-            ps_has_output = ("--output" in ph) or bool(re.search(r"\s-o\s", ph))
-            ps_has_level  = bool(re.search(r"-l\s+LEVEL|-l\s+\d", ph))
-            for dom in domains:
-                if _INT.stage_skip():
-                    break
-                dom_dir = pid / dom
-                dom_dir.mkdir(parents=True, exist_ok=True)
-                txt_lines = []
-                if ps_has_level:
-                    ps_cmd = f"paramspider -d {dom} -l 3"
-                else:
-                    ps_cmd = f"paramspider -d {dom}"
-                if ps_has_output:
-                    ps_cmd += f" --output {dom_dir}"
-                _, out_txt = run_cmd(ps_cmd, timeout=T["paramspider"], log=self.log,
-                                     label=f"paramspider-{dom}", retries=1, retry_delay=5)
-                if out_txt.strip():
-                    for ln in out_txt.splitlines():
-                        ln = strip_ansi(ln.strip())
-                        if ln and ln.startswith("http") and self._is_in_scope_url(ln) and ln not in seen:
-                            seen.add(ln)
-                            txt_lines.append(ln)
-                found = sorted([p for p in dom_dir.rglob("*.txt")
-                                if p.stat().st_size > 0])
-                if not found:
-                    res_dom = BASE_DIR / "results" / f"{dom}.txt"
-                    if res_dom.exists() and res_dom.stat().st_size > 0:
-                        found = [res_dom]
-                for p in found:
-                    for ln in p.read_text(errors="replace").splitlines():
-                        ln = strip_ansi(ln.strip())
-                        if ln and ln.startswith("http") and self._is_in_scope_url(ln) and ln not in seen:
-                            seen.add(ln)
-                            txt_lines.append(ln)
-                all_params.extend(txt_lines)
-            if all_params:
-                write_lines(paramspider_all, all_params)
-                ok(f"paramspider: {len(all_params):,} parameterised URLs")
-            else:
-                warn("paramspider produced no results")
-        else:
-            sub("paramspider not found — skipping")
 
         if tool_exists("arjun"):
             alive_file = self._cp("stage3_alive")
@@ -6071,7 +7049,7 @@ class ReconPipeline:
                         pass
             if arjun_res:
                 write_lines(d / "arjun.txt", arjun_res)
-                ok(f"arjun: {len(arjun_res):,} parametreli URL buldu")
+                ok(f"arjun: {len(arjun_res):,} parameterised URLs")
                 for u in arjun_res:
                     if self._is_in_scope_url(u) and u not in seen:
                         seen.add(u)
@@ -6333,7 +7311,7 @@ class ReconPipeline:
                     budget_hit[0] = True
                     break
                 if now - last_print >= 2:
-                    sub(f"JS taraniyor: {completed[0]:,}/{len(js_urls_scan):,} "
+                    sub(f"JS scan: {completed[0]:,}/{len(js_urls_scan):,} "
                         f"({int(now - start_t)}s)")
                     last_print = now
         finally:
@@ -6485,6 +7463,10 @@ class ReconPipeline:
                 if not m:
                     continue
                 url = m.group(1).rstrip(",")
+                # whatweb's plugin blurbs contain their own homepages
+                # ("Website: https://www.asp.net/"). Those are not the target.
+                if not self._is_in_scope_url(url):
+                    continue
                 found = re.findall(r"\[([^\[\]]+)\]", ln)
                 host_techs.setdefault(url, {"status": 0, "techs": set()})
                 for f in found:
@@ -6549,15 +7531,22 @@ class ReconPipeline:
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 12 — v6.13: Ekstra Guvenlik Kontrolleri (CORS / Takeover / Bucket)
     # ══════════════════════════════════════════════════════════════════════════
+    def _check_on(self, name: str) -> bool:
+        """stage12 passive-check gate: True when the report/CLI asked for this
+        check (or asked for none, meaning run them all)."""
+        return (not self.only_checks) or (name in self.only_checks)
+
     def stage12_extra_checks(self):
-        stage(12, "Extra Security Checks (CORS / Takeover / Cloud Bucket)")
+        _sel = ("/".join(sorted(self.only_checks)) if self.only_checks
+                else "CORS / Takeover / Cloud Bucket")
+        stage(12, f"Extra Security Checks ({_sel})")
         d = self.out / "12_extra"
         results = {"cors": [], "takeover": [], "buckets": []}
 
         # ── CORS misconfig — alive hostlarin ana sayfalarinda test ─────────────
         alive_file = self._cp("stage3_alive")
         alive_urls = []
-        if alive_file.exists() and alive_file.stat().st_size > 0:
+        if self._check_on("cors") and alive_file.exists() and alive_file.stat().st_size > 0:
             alive_urls = [l.strip() for l in alive_file.read_text(errors="ignore").splitlines() if l.strip()]
         if alive_urls:
             info(f"CORS testi: {len(alive_urls):,} alive host")
@@ -6581,7 +7570,7 @@ class ReconPipeline:
         # ── Subdomain takeover — subdomain listesi uzerinde CNAME kontrolu ─────
         subs_file = self._cp("stage2_subdomains")
         subs = []
-        if subs_file.exists() and subs_file.stat().st_size > 0:
+        if self._check_on("takeover") and subs_file.exists() and subs_file.stat().st_size > 0:
             subs = [l.strip() for l in subs_file.read_text(errors="ignore").splitlines() if l.strip()]
         if subs and tool_exists("dig"):
             info(f"Subdomain takeover check: {len(subs):,} subdomains (CNAME based)")
@@ -6608,7 +7597,7 @@ class ReconPipeline:
             self.out / "04_urls" / "all_urls_raw.txt",
             self._cp("stage9_params"), self.out / "09_params" / "all.txt",
         ]
-        candidates = find_cloud_bucket_candidates(candidate_files)
+        candidates = find_cloud_bucket_candidates(candidate_files) if self._check_on("bucket") else []
         if candidates:
             info(f"Cloud bucket check: {len(candidates):,} candidates")
             jitter3 = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
@@ -6626,6 +7615,22 @@ class ReconPipeline:
                 ok("Cloud bucket: no publicly listable bucket found")
         else:
             sub("No cloud bucket candidates — skipped")
+
+        # v9.4: when the report runs a single passive check on demand (--check),
+        # keep the other categories' prior results instead of clobbering them —
+        # the three checks are separate report buttons that build up one file.
+        if self.only_checks:
+            prior = {}
+            pf = d / "extra_results.json"
+            if pf.exists():
+                try:
+                    prior = json.loads(pf.read_text(encoding="utf-8", errors="replace")) or {}
+                except Exception:
+                    prior = {}
+            for cat in ("cors", "takeover", "buckets"):
+                ran = {"cors": "cors", "takeover": "takeover", "buckets": "bucket"}[cat]
+                if not self._check_on(ran) and prior.get(cat):
+                    results[cat] = prior[cat]
 
         (d / "extra_results.json").write_text(
             json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -6649,6 +7654,367 @@ class ReconPipeline:
                  f"Takeover={n_tko_vuln}, Bucket={n_bucket_vuln})")
         else:
             ok("Extra checks complete — no findings")
+
+    # ── Stage 14 — Network / Port Scan (naabu → nmap -sV) ──────────────────────
+    @staticmethod
+    def _bare_host(line: str) -> str:
+        """A URL or host line → bare hostname/IP (no scheme, no port, no path)."""
+        s = (line or "").strip()
+        if not s:
+            return ""
+        if "://" not in s:
+            s = "//" + s
+        h = (urlparse(s).hostname or "").strip().rstrip(".")
+        return h.lower()
+
+    def _parse_nmap_xml(self, xmlf: Path, host: str, ports: list) -> dict:
+        """nmap -oX output → {host, ports:[{port, proto, state, service,
+        product, version}]}. Falls back to the naabu port list on any parse
+        error so a host is never dropped just because nmap XML was malformed."""
+        entry = {"host": host, "ports": [{"port": p, "proto": "tcp", "state": "open",
+                                          "service": "", "product": "", "version": ""}
+                                         for p in ports]}
+        try:
+            import xml.etree.ElementTree as ET
+            if not xmlf.exists() or xmlf.stat().st_size == 0:
+                return entry
+            root = ET.parse(str(xmlf)).getroot()
+            found = []
+            for h in root.findall("host"):
+                for port in h.findall("./ports/port"):
+                    svc = port.find("service")
+                    state = port.find("state")
+                    found.append({
+                        "port": int(port.get("portid", 0) or 0),
+                        "proto": port.get("protocol", "tcp"),
+                        "state": (state.get("state") if state is not None else "open"),
+                        "service": (svc.get("name") if svc is not None else "") or "",
+                        "product": (svc.get("product") if svc is not None else "") or "",
+                        "version": (svc.get("version") if svc is not None else "") or "",
+                    })
+            if found:
+                entry["ports"] = sorted(found, key=lambda x: x["port"])
+        except Exception as e:  # noqa: BLE001
+            self.log.warning(f"nmap XML parse failed for {host}: {e}")
+        return entry
+
+    def stage14_network(self):
+        stage(14, "Network / Port Scan (naabu → nmap -sV)")
+        d = self.out / "14_network"
+        d.mkdir(parents=True, exist_ok=True)
+
+        alive_file = self._cp("stage3_alive")
+        hosts, seen = [], set()
+        if alive_file.exists() and alive_file.stat().st_size > 0:
+            for line in alive_file.read_text(errors="ignore").splitlines():
+                h = self._bare_host(line)
+                if h and h not in seen:
+                    seen.add(h)
+                    hosts.append(h)
+        if not hosts:
+            warn("No alive hosts — skipping network scan")
+            self.summary["stage14"] = {"status": "skipped", "reason": "no_alive"}
+            return
+        max_hosts = int(_cfg_get(self.cfg, "tools", "nmap_max_hosts", default=50) or 50)
+        if len(hosts) > max_hosts:
+            warn(f"{len(hosts):,} hosts — capping the port scan at {max_hosts} "
+                 f"(tools.nmap_max_hosts). Raise it for wider coverage.")
+            hosts = hosts[:max_hosts]
+
+        if not tool_exists("naabu"):
+            warn("naabu not installed — skipping network scan")
+            self.summary["stage14"] = {"status": "skipped", "reason": "naabu_not_installed"}
+            return
+
+        hosts_file = d / "hosts.txt"
+        hosts_file.write_text("\n".join(hosts) + "\n", encoding="utf-8")
+        top  = int(_cfg_get(self.cfg, "tools", "naabu_top_ports", default=100) or 100)
+        rate = int(_cfg_get(self.cfg, "tools", "naabu_rate", default=1000) or 1000)
+        naabu_timeout = int(_cfg_get(self.cfg, "tools", "naabu_timeout_sec", default=1800) or 1800)
+        naabu_json = d / "naabu.json"
+        if naabu_json.exists():
+            try: naabu_json.unlink()
+            except Exception: pass
+        info(f"naabu: {len(hosts):,} host(s), top-{top} ports @ {rate}/s")
+        run_cmd(f"naabu -list {hosts_file} -top-ports {top} -rate {rate} -silent "
+                f"-json -o {naabu_json}",
+                timeout=naabu_timeout, log=self.log, label="naabu", stream=True)
+
+        open_map = {}
+        if naabu_json.exists():
+            for line in naabu_json.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                h = rec.get("host") or rec.get("ip")
+                p = rec.get("port")
+                if h and p:
+                    open_map.setdefault(h, set()).add(int(p))
+        open_map = {h: sorted(ps) for h, ps in open_map.items()}
+        total_open = sum(len(v) for v in open_map.values())
+
+        if not open_map:
+            ok("naabu completed — no open ports found")
+            self.network_results = {"hosts": []}
+            self.summary["stage14"] = {"status": "done", "hosts_scanned": len(hosts),
+                                       "hosts_with_open": 0, "open_ports_total": 0}
+            return
+        ok(f"naabu: {total_open:,} open port(s) across {len(open_map):,} host(s)")
+
+        have_nmap = tool_exists("nmap")
+        if not have_nmap:
+            warn("nmap not installed — reporting open ports without service detection")
+        nmap_timeout = int(_cfg_get(self.cfg, "tools", "nmap_timeout_sec", default=1800) or 1800)
+        services = []
+        for h, ports in open_map.items():
+            if _INT.stage_skip():
+                break
+            if have_nmap:
+                xmlf = d / f"nmap_{re.sub(r'[^A-Za-z0-9_.-]+', '_', h)}.xml"
+                pcsv = ",".join(str(p) for p in ports)
+                info(f"nmap -sV {h} ({len(ports)} port(s))")
+                run_cmd(f"nmap -sV -Pn -T4 -p {pcsv} -oX {xmlf} {h}",
+                        timeout=nmap_timeout, log=self.log, label=f"nmap:{h}", stream=True)
+                services.append(self._parse_nmap_xml(xmlf, h, ports))
+            else:
+                services.append({"host": h, "ports": [{"port": p, "proto": "tcp",
+                                 "state": "open", "service": "", "product": "",
+                                 "version": ""} for p in ports]})
+
+        (d / "network_results.json").write_text(
+            json.dumps({"hosts": services}, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.network_results = {"hosts": services}
+        self.summary["stage14"] = {
+            "status": "done",
+            "hosts_scanned": len(hosts),
+            "hosts_with_open": len(open_map),
+            "open_ports_total": total_open,
+            "services": services,
+        }
+        ok(f"Network scan complete — {total_open:,} open port(s) on {len(open_map):,} host(s)")
+
+    # ── Stage 15 — Open Redirect (OpenRedireX fuzz + canary verification) ───────
+    # Parameter names that commonly carry a redirect target.
+    _REDIR_PARAMS = {
+        "url", "next", "redirect", "redirect_uri", "redirect_url", "redir",
+        "redirecturl", "return", "returnurl", "return_url", "returnto",
+        "return_to", "dest", "destination", "continue", "continueto", "goto",
+        "target", "out", "view", "to", "image_url", "callback", "forward",
+        "r", "u", "link", "go", "rurl", "checkout_url", "success_url", "back",
+        "backurl", "origin", "path", "file", "page", "domain",
+        "returl", "returnuri", "return_uri", "redirect_to", "next_url",
+        "continue_url", "redir_url", "location",
+    }
+    # Host injected during verification. The scanner reads Location and does not
+    # follow it. example.com answers, so opening the PoC lands somewhere real.
+    # Override with tools.open_redirect_canary in the local config (gitignored).
+    _OREDIR_CANARY = "example.com"
+
+    def _canary_host(self) -> str:
+        raw = str(_cfg_get(self.cfg, "tools", "open_redirect_canary", default="") or "").strip().lower()
+        raw = re.sub(r"^https?://", "", raw).split("/")[0].split(":")[0].strip(".")
+        return raw or self._OREDIR_CANARY
+
+    def _oredir_payloads(self, target_host: str) -> list:
+        """Canary payloads across the common open-redirect bypass shapes. A hit
+        is unambiguous: the target must return a Location whose HOST is our
+        canary — a value that only appears because we injected it."""
+        c = self._canary_host()
+        pays = [
+            f"https://{c}", f"https://{c}/", f"http://{c}",
+            f"//{c}", f"//{c}/", f"/\\{c}", f"\\/{c}", f"/%2f{c}",
+            f"https:/{c}", f"https:\\{c}", f"////{c}",
+            f"/%2f%2f{c}", f"/%09/{c}", f"/.{c}", f"https://{c}/%2e%2e",
+        ]
+        if target_host:
+            # @-trick + confusion payloads that keep the real host in front.
+            pays += [f"https://{target_host}@{c}", f"//{target_host}@{c}",
+                     f"https://{target_host}.{c}"]
+        return pays
+
+    def _verify_open_redirect(self, url: str, timeout: int = 12) -> dict:
+        """Inject canary payloads into each redirect-like param of `url` and read
+        the Location header WITHOUT following it. Returns the first confirmed
+        redirect off-domain to the canary host, or {} if none — this is the
+        replayable proof a triager needs, not just 'a redirect happened'."""
+        client, is_cffi = _get_http_client(self.cfg)
+        if client is None:
+            return {}
+        try:
+            pr = urlparse(url)
+            params = parse_qsl(pr.query, keep_blank_values=True)
+        except Exception:
+            return {}
+        redir_idxs = [i for i, (k, _) in enumerate(params)
+                      if k.lower() in self._REDIR_PARAMS]
+        if not redir_idxs:
+            return {}
+        target_host = (pr.hostname or "").lower()
+        settings = (self.cfg or {}).get("settings", {}) if isinstance(self.cfg, dict) else {}
+        impersonate = settings.get("curl_cffi_impersonate", "chrome120")
+        proxy = _resolve_proxy(self.cfg)
+        jitter = float(settings.get("jitter_max", 0.0) or 0.0)
+        headers = pick_header_strategy(target_host, self.cfg)
+        payloads = self._oredir_payloads(target_host)
+
+        for idx in redir_idxs:
+            pname = params[idx][0]
+            for payload in payloads:
+                if _INT.stage_skip():
+                    return {}
+                new_params = list(params)
+                new_params[idx] = (pname, payload)
+                test_url = urlunparse(pr._replace(query=urlencode(new_params, safe="/:@\\%")))
+                if jitter > 0:
+                    time.sleep(random.random() * jitter)
+                try:
+                    kw = dict(timeout=timeout, allow_redirects=False,
+                              headers=headers, verify=False)
+                    if proxy:
+                        kw["proxies"] = {"http": proxy, "https": proxy}
+                    if is_cffi:
+                        kw["impersonate"] = impersonate
+                    r = client.get(test_url, **kw)
+                except Exception:
+                    continue
+                status = int(getattr(r, "status_code", 0) or 0)
+                loc = ""
+                try:
+                    loc = (dict(getattr(r, "headers", {}) or {}).get("location")
+                           or dict(getattr(r, "headers", {}) or {}).get("Location") or "")
+                except Exception:
+                    loc = ""
+                if not loc:
+                    continue
+                # Resolve the Location against the request URL, then compare host.
+                try:
+                    loc_host = (urlparse(loc if "//" in loc else "//" + loc.lstrip("/\\")).hostname or "").lower()
+                except Exception:
+                    loc_host = ""
+                canary = self._canary_host()
+                off_canary = loc_host == canary or loc_host.endswith("." + canary)
+                if loc_host and off_canary and loc_host != target_host:
+                    return {"url": url, "param": pname, "payload": payload,
+                            "test_url": test_url, "status": status, "location": loc}
+        return {}
+
+    def stage15_open_redirect(self):
+        stage(15, "Open Redirect Scan (OpenRedireX fuzz + canary verification)")
+        d = self.out / "15_open_redirect"
+        d.mkdir(parents=True, exist_ok=True)
+
+        # Target URLs: those whose params look like a redirect sink.
+        redir_re = re.compile(
+            r"[?&](?:url|next|redirect|redirect_uri|redirect_url|redirect_to|return|"
+            r"returl|returnurl|returnuri|return_uri|return_url|returnto|return_to|"
+            r"dest|destination|continue|continue_url|goto|target|redir|redir_url|"
+            r"out|view|to|image_url|callback|forward|rurl|go|back|backurl|"
+            r"origin|success_url|checkout_url|location|next_url)=", re.I)
+        try:
+            cap = int(_cfg_get(self.cfg, "tools", "open_redirect_max_targets", default=0) or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        seen, redir_targets = set(), []
+        for key in ("stage4_urls", "stage9_params"):
+            uf = self._cp(key)
+            if uf.exists() and uf.stat().st_size > 0:
+                for line in uf.read_text(errors="ignore").splitlines():
+                    u = line.strip()
+                    if u and redir_re.search(u) and u not in seen:
+                        seen.add(u)
+                        redir_targets.append(u)
+
+        if not redir_targets:
+            ok("No URLs with redirect-like parameters — nothing to test")
+            empty = {"status": "done", "findings": [], "targets_count": 0,
+                     "checked": 0, "tool": "", "tool_raw": "",
+                     "canary": self._canary_host(), "reason": "no_redirect_params"}
+            (d / "open_redirect_results.json").write_text(
+                json.dumps(empty, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.open_redirect_results = empty
+            self.summary["stage15"] = {"status": "done", "findings": 0,
+                                       "targets_count": 0, "reason": "no_redirect_params"}
+            return
+
+        if cap > 0:
+            redir_targets = redir_targets[:cap]
+        tgt_file = d / "openredirect_targets.txt"
+        tgt_file.write_text("\n".join(redir_targets) + "\n", encoding="utf-8")
+        ok(f"Open-redirect targets: {len(redir_targets):,} URL(s) with redirect-like params")
+
+        # ── 1) OpenRedireX — the dedicated fuzzer (broad bypass payloads) ───────
+        raw_file = d / "openredirex_raw.txt"
+        tool_used = ""
+        if tool_exists("openredirex"):
+            tool_used = "openredirex"
+            # OpenRedireX has a built-in payload list, so -p is optional; use a
+            # bundled payloads.txt if we can find one, otherwise fall back to it.
+            pfile = next((p for p in (
+                Path(_cfg_get(self.cfg, "tools", "openredirex_payloads", default="") or "x"),
+                Path.home() / "Desktop" / "openredirex" / "payloads.txt",
+                BASE_DIR / "openredirex" / "payloads.txt",
+            ) if p.exists()), None)
+            conc = int(_cfg_get(self.cfg, "tools", "openredirex_concurrency", default=50) or 50)
+            ptimeout = int(_cfg_get(self.cfg, "tools", "openredirex_timeout_sec", default=1800) or 1800)
+            popt = f"-p {pfile} " if pfile else ""
+            info(f"OpenRedireX: fuzzing {len(redir_targets):,} URL(s) (concurrency {conc})")
+            # OpenRedireX reads the URL list on stdin.
+            run_cmd(f"openredirex {popt}-c {conc}", out_file=str(raw_file),
+                    timeout=ptimeout, log=self.log, label="openredirex",
+                    stream=True, stdin_file=str(tgt_file))
+        else:
+            warn("openredirex not installed — running verification pass only "
+                 "(install: go/pip OpenRedireX). See install.sh")
+
+        # ── 2) Canary verification — the part that PROVES a real open redirect ──
+        # OpenRedireX flags any redirect; a triager needs a redirect that lands
+        # on an attacker-chosen host. We confirm that here.
+        budget = int(_cfg_get(self.cfg, "tools", "open_redirect_budget_sec", default=1200) or 1200)
+        t0 = time.time()
+        info(f"Verifying redirects against canary host {self._canary_host()} …")
+        findings, checked = [], 0
+        for u in redir_targets:
+            if _INT.stage_skip():
+                break
+            if budget and (time.time() - t0) > budget:
+                warn(f"Open-redirect verification budget ({budget}s) reached — "
+                     f"checked {checked:,}/{len(redir_targets):,}")
+                break
+            checked += 1
+            hit = self._verify_open_redirect(u)
+            if hit:
+                findings.append(hit)
+                ok(f"CONFIRMED open redirect: {hit['param']} → {hit['location'][:80]}")
+
+        interrupted = _INT.stage_skip() or (budget and (time.time() - t0) > budget)
+        self.open_redirect_results = {
+            "status": "done",
+            "findings": findings, "targets_count": len(redir_targets),
+            "checked": checked, "tool": tool_used,
+            "tool_raw": str(raw_file) if raw_file.exists() else "",
+            "canary": self._canary_host(), "interrupted": bool(interrupted),
+        }
+        (d / "open_redirect_results.json").write_text(
+            json.dumps(self.open_redirect_results, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        self.summary["stage15"] = {
+            "status": "done",
+            "findings": len(findings),
+            "targets_count": len(redir_targets),
+            "checked": checked,
+            "tool": tool_used,
+            "duration_sec": round(time.time() - t0, 1),
+            "interrupted": bool(interrupted),
+        }
+        if findings:
+            ok(f"Open-redirect: {len(findings):,} CONFIRMED finding(s)")
+        else:
+            ok(f"Open-redirect scan complete — no confirmed redirect "
+               f"(checked {checked:,} URL(s))")
 
     # ── HTML Report ───────────────────────────────────────────────────────────
     def _read_text_safe(self, p: Path, limit_bytes: int = 50_000_000) -> str:
@@ -7149,6 +8515,107 @@ class ReconPipeline:
         rp.write_text(html_doc, encoding="utf-8", errors="replace")
         return rp
 
+    def _open_report_with_ai_bridge(self, report_path) -> bool:
+        """Open the report THROUGH the local AI bridge instead of over file://.
+
+        The report's "AI Analysis" button needs a backend, and the one thing it
+        must never contain is the Anthropic API key — a report gets shared, and
+        a key baked into the HTML travels with it. So reconx_ai.py serves the
+        report from 127.0.0.1 and holds the key in its own process; the page
+        and the API then share an origin, which also removes the CORS problem
+        a file:// page would have had.
+
+        The bridge runs detached with an idle timeout, so the scan still exits
+        and returns the terminal. Returns True if the bridge took over opening
+        the report; False means the caller should fall back to file://, which
+        is a fully working report minus the button.
+        """
+        if not bool(_cfg_get(self.cfg, "ai", "enabled", default=True)):
+            return False
+        if not bool(_cfg_get(self.cfg, "ai", "auto_bridge", default=True)):
+            return False
+        if self.ai_bridge_disabled:
+            return False
+
+        script = BASE_DIR / "reconx_ai.py"
+        if not script.exists():
+            return False
+
+        # Two independent backends can answer the button, so the gate has to
+        # mirror reconx_ai.run_analysis(): the Anthropic API (SDK + key, and
+        # credit we cannot check from here), or the `claude` CLI, which runs on
+        # a Claude subscription and needs neither. Requiring an API key here —
+        # as this did before the CLI backend existed — would hand a
+        # subscription-only user a report with a permanently dead button.
+        backend = str(_cfg_get(self.cfg, "ai", "backend", default="auto") or "auto").lower()
+        try:
+            import anthropic  # noqa: F401
+            has_sdk = True
+        except ImportError:
+            has_sdk = False
+        api_ok = has_sdk and bool(get_api_key(self.cfg, "anthropic"))
+        cli_path = shutil.which("claude") or ""
+        if not cli_path:
+            _guess = Path.home() / ".local" / "bin" / "claude"
+            cli_path = str(_guess) if _guess.is_file() else ""
+        cli_ok = bool(cli_path)
+
+        if backend == "api" and not api_ok:
+            warn("AI Analysis unavailable — ai.backend is 'api' but "
+                 + ("no API key is set (export ANTHROPIC_API_KEY, or set "
+                    "api_keys.anthropic in config.yaml)" if has_sdk
+                    else "the 'anthropic' package is missing (pip install anthropic)"))
+            sub("The report still opens normally; everything except the AI panel works.")
+            return False
+        if backend == "cli" and not cli_ok:
+            warn("AI Analysis unavailable — ai.backend is 'cli' but the "
+                 "`claude` CLI was not found (install Claude Code).")
+            sub("The report still opens normally; everything except the AI panel works.")
+            return False
+        if not api_ok and not cli_ok:
+            warn("AI Analysis unavailable — no usable backend. Either add an "
+                 "Anthropic API key, or install Claude Code to run it on a "
+                 "Claude subscription.")
+            sub("The report still opens normally; everything except the AI panel works.")
+            return False
+
+        idle = int(_cfg_get(self.cfg, "ai", "bridge_idle_timeout_sec", default=0) or 0)
+        port = int(_cfg_get(self.cfg, "ai", "bridge_port", default=0) or 0)
+        cmd = [sys.executable, str(script), "serve", str(Path(report_path).parent),
+               "--config", str(self._config_path), "--idle-timeout", str(idle),
+               "--port", str(port)]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:  # noqa: BLE001
+            warn(f"Could not start the AI bridge: {e}")
+            return False
+
+        # The bridge writes .ai_bridge.json once it is actually listening, and
+        # it opens the browser itself. Waiting for that file is what tells us
+        # it bound a port rather than died on startup.
+        handshake = Path(report_path).parent / ".ai_bridge.json"
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            if handshake.exists():
+                try:
+                    url = json.loads(handshake.read_text(errors="replace")).get("url", "")
+                except Exception:
+                    url = ""
+                if url:
+                    ok(f"AI Analysis ready: {url}")
+                    if idle:
+                        sub(f"The report opened through the local bridge — click "
+                            f"'Run AI Analysis'. Idle timeout {idle}s.")
+                    else:
+                        sub("The report opened through the local bridge — click "
+                            "'Run AI Analysis'. The bridge stays up until you stop it.")
+                    return True
+                break
+            time.sleep(0.25)
+        warn("AI bridge did not come up in time — opening the report directly")
+        return False
+
     # ── Report ────────────────────────────────────────────────────────────────
     def generate_report(self):
         stage("✦", "Generating Report")
@@ -7228,14 +8695,14 @@ class ReconPipeline:
             except Exception as e:
                 warn(f"FULL report error: {e}")
 
-        try:
-            import webbrowser
-            target_rp = report_path or full_report
-            if target_rp:
+        target_rp = report_path or full_report
+        if target_rp and not self._open_report_with_ai_bridge(target_rp):
+            try:
+                import webbrowser
                 # Windows'ta dogru file URI: file:///C:/... (file://C:\... okunmaz)
                 webbrowser.open(Path(target_rp).as_uri())
-        except:
-            pass
+            except Exception:
+                pass
 
         try:
             send_webhook_notification(self.cfg, self.target, self.summary)
@@ -7262,6 +8729,26 @@ class ReconPipeline:
         print()
 
     # ── Stage 0 — URL seed ────────────────────────────────────────────────────
+    def _retarget_scheme(self, scheme: str, hostname: str):
+        """Point seed URLs for this host at the scheme that actually answered."""
+        if not scheme or not hostname or not self.url_targets:
+            return
+        host = hostname.lower()
+        rewritten = []
+        changed = False
+        for u in self.url_targets:
+            p = urlparse(u)
+            if (p.hostname or "").lower() == host and p.scheme and p.scheme != scheme:
+                rewritten.append(urlunparse((
+                    scheme, p.netloc, p.path or "/", p.params, p.query, p.fragment)))
+                changed = True
+            else:
+                rewritten.append(u)
+        if changed:
+            self.url_targets = rewritten
+            for u in rewritten[:5]:
+                sub(f"seed now {u}")
+
     def stage0_seed_urls(self):
         stage(0, "URL Seed Mode (-u/--single)")
         urls = []
@@ -7676,6 +9163,7 @@ class ReconPipeline:
             9: self.stage9_params,     10: self.stage10_js,
             11: self.stage11_tech_priority, 12: self.stage12_extra_checks,
             13: self.stage13_api_discovery,
+            14: self.stage14_network,  15: self.stage15_open_redirect,
         }
 
         wants_login = bool(self.login_url or self.raw_cookie or self.request_file)
@@ -7711,9 +9199,11 @@ class ReconPipeline:
                             self.summary.get("stage1"), time.time() - _t1)
                     _INT.reset()
             self.stage0_seed_urls()
-            run_stages = stages or [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            # XSS (6) and Nuclei (7) run in the default pass. Port scan, open
+            # redirect, CORS, takeover and cloud buckets stay on the Scan Center.
+            run_stages = stages or [4, 5, 6, 7, 8, 9, 10, 11, 13]
         else:
-            run_stages = stages or [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            run_stages = stages or [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
 
         # -s ile acikca stage secildiyse kullanicinin secimi aynen kullanilir
         # (stage 8 istemeden zorla eklenmez); yalniz login/cookie verilip de
@@ -7739,6 +9229,7 @@ class ReconPipeline:
 
         # Record the plan so a later resume knows what the run was aiming at.
         self.state.planned(run_stages)
+        self.state.reclaim_orphan_running()
         self._start_budget_watchdog()
 
         stopped_early = False
@@ -7765,14 +9256,19 @@ class ReconPipeline:
                 # so restore + display them instead of burning the time again.
                 # "partial"/"failed" stages are deliberately NOT skipped: their
                 # output is incomplete by definition, so they run from scratch.
-                if self.resume and self.state.is_done(n):
+                # v9.4: EXPLICIT selection (-s / --stageN) is an intent to run —
+                # so an on-demand scan button (`--stageN --resume`) re-runs the
+                # scan every click instead of restoring the previous result.
+                explicitly_requested = stages is not None and n in stages
+                if (self.resume and self.state.is_done(n)
+                        and not explicitly_requested):
                     self._restore_stage(n)
                     continue
 
                 if n == 6:
                     if interactive:
                         self.xss_asked = True
-                        if not ask_yes_no("Run an XSS (Dalfox) scan against the high-value URLs?", default="n"):
+                        if not ask_yes_no("Run an XSS (Dalfox) scan against the high-value URLs?", default="y"):
                             self.state.finish_stage(n, "skipped", {"status": "skipped",
                                                                    "reason": "declined"})
                             _INT.reset()
@@ -7781,7 +9277,7 @@ class ReconPipeline:
                 if n == 7:
                     if interactive:
                         self.nuclei_asked = True
-                        if not ask_yes_no("Run a Nuclei vulnerability scan against the alive hosts?", default="n"):
+                        if not ask_yes_no("Run a Nuclei vulnerability scan against every live URL?", default="y"):
                             self.state.finish_stage(n, "skipped", {"status": "skipped",
                                                                    "reason": "declined"})
                             _INT.reset()
@@ -7903,11 +9399,12 @@ _TOOL_CHECKS = [
     ("dig",               "recommended", "Stage 12 — CNAME / subdomain-takeover checks"),
     ("dalfox",            "critical",    "Stage 6 — XSS scanning"),
     ("nuclei",            "critical",    "Stage 7 — vulnerability scan + DAST fuzzing"),
-    ("paramspider",       "recommended", "Stage 9 — parameter discovery"),
     ("arjun",             "recommended", "Stage 9 — hidden parameter brute force"),
     ("whatweb",           "recommended", "Stage 1/11 — technology fingerprinting"),
     ("wafw00f",           "optional",    "Stage 1 — WAF fingerprinting"),
-    ("nmap",              "optional",    "Stage 1 — port/service scan"),
+    ("naabu",             "recommended", "Stage 14 — on-demand network/port discovery"),
+    ("nmap",              "recommended", "Stage 1 + Stage 14 — port/service + version detection"),
+    ("openredirex",       "recommended", "Stage 15 — open-redirect fuzzing"),
     ("trufflehog",        "optional",    "Stage 10 — deeper JS secret detection"),
     ("interactsh-client", "optional",    "Stage 6 — blind-XSS OOB callback"),
     ("tor",               "optional",    "Automatic IP rotation when blocked"),
@@ -7918,8 +9415,8 @@ _PY_CHECKS = [
     ("requests",  "critical",    "HTTP fallback client"),
     ("curl_cffi", "recommended", "Primary HTTP client (Cloudflare-friendly TLS)"),
     ("stem",      "optional",    "Tor control port — automatic IP rotation"),
-    ("flask",     "optional",    "Web control panel (reconx_web.py)"),
     ("selenium",  "optional",    "Stage 6 — headless XSS proof screenshots (needs chromedriver too)"),
+    ("anthropic", "optional",    "AI Analysis panel in the report (reconx_ai.py)"),
 ]
 
 _SEV_STYLE = {
@@ -7993,17 +9490,90 @@ def run_doctor(cfg, config_path=None) -> int:
     _doctor_row(bool(tpl), "nuclei templates", "recommended",
                 "no populated template directory found — nuclei falls back to built-ins")
 
+    # The AI panel needs BOTH the SDK and a key; having one without the other
+    # is the case worth naming, because the button then only ever errors.
+    try:
+        import anthropic  # noqa: F401
+        _ai_sdk = True
+    except ImportError:
+        _ai_sdk = False
+    _ai_key = bool(get_api_key(cfg, "anthropic"))
+    _ai_on = bool(_cfg_get(cfg, "ai", "enabled", default=True))
+    if _ai_on:
+        # Two independent backends. The claude CLI runs on a Claude
+        # subscription and needs no API key at all, so "no key" is only a
+        # problem when the CLI is missing too.
+        _ai_backend = str(_cfg_get(cfg, "ai", "backend", default="auto") or "auto").lower()
+        _cli = shutil.which("claude") or ""
+        if not _cli:
+            _guess = Path.home() / ".local" / "bin" / "claude"
+            _cli = str(_guess) if _guess.is_file() else ""
+        _api_ok = _ai_sdk and _ai_key
+        _cli_ok = bool(_cli)
+        _usable = (_api_ok if _ai_backend == "api" else
+                   _cli_ok if _ai_backend == "cli" else (_api_ok or _cli_ok))
+        _doctor_row(_usable, "AI analysis", "optional",
+                    "no usable backend — either add an Anthropic API key, or "
+                    "install Claude Code to run it on a Claude subscription")
+        sub(f"backend: {_ai_backend} · "
+            f"API {'ready' if _api_ok else ('no key' if _ai_sdk else 'no sdk')} · "
+            f"claude CLI {'ready' if _cli_ok else 'not found'}")
+        if _usable:
+            sub(f"model: {_cfg_get(cfg, 'ai', 'model', default='claude-opus-5')}"
+                f"{' / cli ' + str(_cfg_get(cfg, 'ai', 'cli_model', default='opus')) if _cli_ok else ''} · "
+                f"secrets redacted: "
+                f"{str(bool(_cfg_get(cfg, 'ai', 'redact_secrets', default=True))).lower()}")
+
+    # v9.0-fix: this used to test the SYSTEM resolver only (socket.gethostbyname),
+    # and report CRITICAL + exit 1 whenever UDP/53 was blocked — even though
+    # main() had already started the bundled DoH proxy and every ProjectDiscovery
+    # tool in the pipeline was about to be handed "-r 127.0.0.1:<port>". On a
+    # UDP/53-blocked box (labs, VPNs, cloud sandboxes) that made --doctor fail
+    # a perfectly scannable environment and, used as a CI gate, block the run.
+    # Check the path ReconX will ACTUALLY resolve through instead.
     try:
         import socket
         socket.setdefaulttimeout(5)
         socket.gethostbyname("example.com")
-        dns_ok = True
+        system_dns_ok = True
     except Exception:
-        dns_ok = False
+        system_dns_ok = False
+    resolver = (os.environ.get("RECONX_RESOLVER") or "").strip()
+    doh_ok = False
+    if resolver:
+        try:
+            _h, _, _p = resolver.partition(":")
+            doh_ok = bool(_udp_dns_answers(_h or "127.0.0.1", int(_p or 53)))
+        except Exception:
+            doh_ok = False
+    dns_ok = system_dns_ok or doh_ok
     _doctor_row(dns_ok, "DNS resolution", "critical",
                 "cannot resolve names — see reconx_dns.py (DoH proxy) if UDP/53 is blocked")
+    if dns_ok and not system_dns_ok:
+        sub(f"System DNS is down; resolving through the bundled DoH proxy at {resolver}. "
+            f"httpx/nuclei/subfinder/dnsx get it via -r — katana/dalfox/gau still use "
+            f"system DNS, so run the proxy on port 53 as root for full coverage.")
     if not dns_ok:
         missing_critical.append("DNS")
+
+    # ── effective tool timeouts ──────────────────────────────────────────────
+    # Printed because a ceiling that is too low doesn't look like an error: the
+    # tool is killed, the stage continues, and the report reads "0 findings".
+    # Seeing the real numbers is the only way to tell a quiet target from a
+    # truncated scan.
+    print(f"\n{C.BOLD}Tool timeouts{C.RESET} {C.DIM}(config.yaml → timeouts:){C.RESET}")
+    _over = set(k for k in (cfg.get("timeouts") or {}) if k in T)
+    def _hms(s):
+        h, m = divmod(int(s) // 60, 60)
+        return (f"{h}h{m:02d}m" if h else f"{m}m") if s >= 60 else f"{s}s"
+    _row = []
+    for k, v in sorted(T.items(), key=lambda kv: (-kv[1], kv[0])):
+        mark = f"{C.YELLOW}*{C.RESET}" if k in _over else " "
+        _row.append(f"{mark}{k} {C.DIM}{_hms(v)}{C.RESET}")
+    for i in range(0, len(_row), 4):
+        print("  " + "".join(f"{c:<34}" for c in _row[i:i + 4]))
+    if _over:
+        print(f"  {C.DIM}{C.YELLOW}*{C.RESET}{C.DIM} = overridden in config.yaml{C.RESET}")
 
     print(f"\n{C.DIM}{'─'*60}{C.RESET}")
     if missing_critical:
@@ -8040,10 +9610,10 @@ def main():
         _lines = [
             f"ReconX  ·  Sequential Bug-Bounty Scanner  ·  v{VERSION}",
             "",
-            "Recon → Subs → Alive → URLs → Params → XSS/Dalfox",
-            "Nuclei + DAST fuzzing → JS-Secrets",
-            "Tech-Priority → API Discovery   ·   13 stages",
-            "Checkpoint/resume · scan diff · --doctor · --max-time",
+            "Recon → subs, URLs, params, XSS, Nuclei",
+            "Port, redirect and CORS stay on demand",
+            "from the report, against this same corpus",
+            "AI Analysis: Claude ranks what to test, in the report",
             "",
             "linkedin.com/in/2u1fuk4r",
         ]
@@ -8065,8 +9635,14 @@ def main():
     p.add_argument("-U", "--url-file",  dest="url_file", metavar="FILE")
     p.add_argument("--single",          dest="single", metavar="TARGET")
     p.add_argument("-s", "--stages",    nargs="+", type=int)
-    for i in range(1, 14):
+    for i in range(1, 16):
         p.add_argument(f"--stage{i}", action="store_true", help=f"Run only stage {i}")
+    # On-demand scan sub-selector: restrict stage 12 (passive checks) to one
+    # check so the report can expose CORS / Takeover / Bucket as separate buttons.
+    p.add_argument("--check", nargs="+", dest="checks", metavar="NAME",
+                   choices=["cors", "takeover", "bucket"],
+                   help="With --stage12: run only these passive checks "
+                        "(cors, takeover, bucket). Default: all three.")
     # --resume and --fresh are opposite answers to the same question, so let
     # argparse reject the contradiction instead of silently picking one.
     res_grp = p.add_mutually_exclusive_group()
@@ -8090,14 +9666,23 @@ def main():
                         "(Nuclei) 'run this?' confirmations and the resume prompt — the complete "
                         "pipeline runs with zero interactive input. Use this for scheduled tasks, "
                         "CI, or any run where nobody is at the keyboard.")
-    # Deprecated: the startup legal prompt was removed, this flag is accepted
-    # and ignored so existing wrappers (reconx_web.py, cron jobs) keep working.
+    # Deprecated no-op: the startup legal prompt was removed. Still accepted
+    # (and ignored) so existing cron jobs / wrapper scripts keep working.
     p.add_argument("--no-legal",        action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--config",          default=str(CFG_FILE))
+    p.add_argument("--session-dir",     dest="session_dir", default=None, metavar="DIR",
+                   help="Run against this exact existing session directory (implies "
+                        "--resume). Used by the report's on-demand Scan buttons to "
+                        "attach a scan stage to the recon session it belongs to.")
+    p.add_argument("--no-ai",           dest="no_ai", action="store_true",
+                   help="Do not start the local AI bridge when the scan ends — open the "
+                        "report as a plain file instead. The report is identical minus a "
+                        "working 'AI Analysis' button; run it later with "
+                        "'python3 reconx_ai.py serve <session-dir>'.")
     p.add_argument("--nuclei-templates", dest="nuclei_templates", default=None,
                    help="Override nuclei template path (e.g. /root/nuclei-templates)")
     p.add_argument("--severity",        dest="severity", default=None,
-                   help="Nuclei severity filter (e.g. critical,high,medium)")
+                   help="Nuclei severity filter (e.g. critical,high,medium,low)")
     p.add_argument("--blind",           dest="blind_cb", default=None,
                    help="Blind XSS callback URL for Dalfox")
     p.add_argument("--xss-payloads",    dest="xss_payloads", nargs="?", const="xss-payloads.txt",
@@ -8145,6 +9730,12 @@ def main():
 
     cfg = load_config(Path(args.config))
 
+    # Per-tool ceilings from config.yaml, applied before anything can run.
+    _t_changed = apply_timeout_overrides(cfg)
+    if _t_changed:
+        info("Tool timeouts overridden from config: "
+             + ", ".join(f"{k}={T[k]}s" for k in sorted(_t_changed)))
+
     # --doctor is a standalone environment report: no target needed, exits here.
     if args.doctor:
         sys.exit(run_doctor(cfg, config_path=args.config))
@@ -8170,7 +9761,7 @@ def main():
     url_targets = list(dict.fromkeys(url_targets))
 
     stage_flags = [i for i in range(1, 6) if getattr(args, f"stage{i}")]
-    for sf in (6, 7, 8, 9, 10, 11, 12, 13):
+    for sf in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
         if getattr(args, f"stage{sf}", False):
             stage_flags.append(sf)
     if stage_flags and args.stages:
@@ -8181,12 +9772,19 @@ def main():
         stages = args.stages
 
     domain = args.domain
+    service_port = None
     if domain:
-        # accept "*.example.com", "https://sub.example.com/path", "host:8080" —
-        # normalise to the bare registrable host used for scope + output dir.
-        _norm = _extract_domain_from_any(domain)
+        # accept "*.example.com", "https://sub.example.com/path", "host:8080".
+        # The bare host is the scope key. A port in -d is NOT optional noise:
+        # dropping it makes every probe hit :443 while the service listens
+        # somewhere else (harbor.lab:8088).
+        _host, service_port = _split_host_port(domain)
+        _norm = _host or _extract_domain_from_any(domain)
         if _norm and _norm != domain:
-            info(f"Domain normalised: {domain} → {_norm}")
+            shown = f"{_norm}:{service_port}" if service_port else _norm
+            info(f"Domain normalised: {domain} → {shown}")
+            domain = _norm
+        elif _norm:
             domain = _norm
     if not domain:
         if url_targets:
@@ -8211,6 +9809,14 @@ def main():
                     err("Domain could not be detected from request file — use -d"); sys.exit(1)
             except Exception as e:
                 err(f"--request parse failed: {e}"); sys.exit(1)
+        elif args.session_dir:
+            # An on-demand scan can omit -d: the target lives in the session.
+            _st = read_state_file(args.session_dir)
+            domain = _extract_domain_from_any(_st.get("target") or "") or (_st.get("target") or "")
+            if domain:
+                info(f"Domain from session: {domain}")
+            else:
+                err("--session-dir: could not read target from the session — pass -d"); sys.exit(1)
         else:
             err("-d / --domain required (or -u/--single with a URL)"); sys.exit(1)
 
@@ -8222,10 +9828,21 @@ def main():
     # Looks for the most recent unfinished session of this target, shows what it
     # already completed and decides (flag or prompt) whether to continue it.
     _out_root = Path((os.environ.get("RECONX_OUTPUT_DIR") or "").strip() or (BASE_DIR / "output"))
-    do_resume, resume_dir = resolve_resume(_out_root, domain,
-                                           force_resume=args.resume,
-                                           fresh=args.fresh,
-                                           auto=args.auto)
+    if args.session_dir:
+        # v9.4: an on-demand scan launched from the report's Scan panel points
+        # straight at the recon session it belongs to. This is unambiguous and,
+        # unlike resolve_resume(), also adopts a session already marked
+        # "completed" — which a recon-only run always is.
+        sd = Path(args.session_dir).expanduser().resolve()
+        if not (sd / "checkpoints").is_dir():
+            err(f"--session-dir: not a ReconX session directory: {sd}")
+            sys.exit(2)
+        do_resume, resume_dir = True, sd
+    else:
+        do_resume, resume_dir = resolve_resume(_out_root, domain,
+                                               force_resume=args.resume,
+                                               fresh=args.fresh,
+                                               auto=args.auto)
 
     extra_fields = {}
     for kv in (args.login_extra_fields or []):
@@ -8258,6 +9875,9 @@ def main():
         blind_cb=args.blind_cb,
         xss_payloads=args.xss_payloads,
         config_path=str(Path(args.config)),
+        ai_bridge_disabled=args.no_ai,
+        only_checks=args.checks,
+        service_port=service_port,
     ).run(stages=stages)
 
 if __name__ == "__main__":
