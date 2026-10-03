@@ -1,0 +1,3 @@
+LAB-CANARY-TRAVERSAL
+This file sits outside the public download folder. A path that climbs out of /files can read it.
+The server still refuses anything outside the Vuln-Site directory.
