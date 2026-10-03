@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ReconX — UI preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f3f5f8;
+  --bg-2:#ffffff;
+  --surface:#ffffff;
+  --surface-2:#f7f8fa;
+  --line:#e2e6ee;
+  --line-strong:#cfd5e0;
+  --text:#1c2430;
+  --dim:#3d4858;
+  --muted:#5c6778;
+  --accent:#1e3a5f;
+  --accent-ink:#ffffff;
+  --red:#b42318;
+  --orange:#b54708;
+  --yellow:#946200;
+  --green:#067647;
+  --blue:#1849a9;
+  --purple:#5925dc;
+  --sans:"IBM Plex Sans",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+  --sw:248px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:14.5px;
+  line-height:1.55;
+  display:flex;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+button,input{font-family:inherit;color:inherit}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#c5ccd6;border-radius:99px;border:2px solid var(--bg)}
+
+.sidebar{
+  width:var(--sw);min-width:var(--sw);
+  background:var(--bg-2);
+  border-right:1px solid var(--line);
+  position:fixed;inset:0 auto 0 0;
+  display:flex;flex-direction:column;
+  overflow-y:auto;z-index:20;
+}
+.sb-brand{
+  padding:20px 16px 14px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--bg-2);z-index:2;
+}
+.sb-logo{display:flex;align-items:center;gap:10px}
+.mark{
+  width:22px;height:22px;border-radius:6px;
+  background:var(--accent);color:var(--accent-ink);
+  display:grid;place-items:center;font-weight:600;font-size:13px;
+}
+.sb-brand h1{font-size:15px;font-weight:600;letter-spacing:-.03em;color:var(--text)}
+.sb-brand h1 span{color:var(--muted);font-weight:500}
+.sb-meta{margin-top:12px;display:flex;flex-direction:column;gap:3px}
+.sb-target{font-family:var(--mono);font-size:12.5px;color:var(--text)}
+.sb-ts{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.nav-grp{padding:14px 10px 2px}
+.nav-lbl{
+  padding:0 8px 8px;
+  font-size:11px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--muted);
+}
+.nav-a{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 8px;margin-bottom:2px;
+  border-radius:8px;color:var(--dim);
+  text-decoration:none;font-size:14px;cursor:pointer;
+}
+.nav-a:hover{background:#f3f5f8;color:var(--text)}
+.nav-a.active{background:#e8eef6;color:var(--accent)}
+.nav-a.active .nav-ico{background:var(--accent)}
+.nav-ico{width:7px;height:7px;border-radius:99px;background:#9aa3b2;flex:none}
+.nav-cnt{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--dim)}
+.nav-cnt.hot{color:var(--red)}
+.sb-foot{
+  margin-top:8px;padding:14px 16px 18px;
+  border-top:1px solid var(--line);
+  font-size:12px;color:var(--muted);font-family:var(--mono);
+}
+
+.main{margin-left:var(--sw);flex:1;min-width:0}
+.topbar{
+  position:sticky;top:0;z-index:10;
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:12px 28px;
+  background:rgba(255,255,255,.94);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+.crumb{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--dim)}
+.crumb b{color:var(--text);font-weight:600}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;
+  border:1px solid var(--line-strong);border-radius:999px;
+  padding:3px 8px;font-family:var(--mono);font-size:12px;color:var(--dim);
+}
+.pill i{width:7px;height:7px;border-radius:99px;background:var(--green);display:block}
+.actions{display:flex;gap:8px;position:relative}
+.btn{
+  background:var(--surface);border:1px solid var(--line-strong);
+  border-radius:8px;padding:7px 12px;font-size:13.5px;cursor:pointer;color:var(--text);
+}
+.btn:hover{background:var(--surface-2)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+.btn.primary:hover{background:#16304f}
+.menu{
+  display:none;position:absolute;right:0;top:40px;min-width:220px;
+  background:var(--surface-2);border:1px solid var(--line-strong);
+  border-radius:10px;padding:6px;z-index:30;
+}
+.menu.open{display:block}
+.menu button{
+  display:block;width:100%;text-align:left;background:none;border:0;
+  color:var(--text);padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13.5px;
+}
+.menu button span{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.menu button:hover{background:#f3f5f8}
+
+.section{display:none;padding:28px;max-width:1180px}
+.section.active{display:block}
+.preview-note{
+  margin-bottom:18px;padding:10px 12px;border-radius:10px;
+  border:1px solid var(--line-strong);color:var(--dim);font-size:13.5px;
+  background:var(--surface);
+}
+.preview-note strong{color:var(--text);font-weight:600}
+
+.sec-title{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:18px}
+.sec-title h2{font-size:24px;font-weight:600;letter-spacing:-.03em;color:var(--text)}
+.sec-title p{color:var(--dim);font-size:14px;margin-top:4px}
+
+.stats{display:grid;grid-template-columns:repeat(6,1fr);border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--surface)}
+.stat{padding:16px 16px 14px;border-right:1px solid var(--line);cursor:pointer}
+.stat:last-child{border-right:0}
+.stat:hover{background:var(--surface-2)}
+.stat .k{font-size:13px;color:var(--dim)}
+.stat .v{margin-top:8px;font-size:28px;letter-spacing:-.04em;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+.stat .s{margin-top:6px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+.stat .s.bad{color:var(--red)}
+.stat .s.ok{color:var(--green)}
+.stat .s.warn{color:var(--orange)}
+
+.grid{display:grid;grid-template-columns:1.4fr .8fr;gap:14px;margin-top:14px}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
+.panel h3{font-size:14px;font-weight:600;color:var(--text);margin-bottom:10px}
+table{width:100%;border-collapse:collapse}
+th{
+  text-align:left;font-size:12px;font-weight:600;color:var(--dim);
+  letter-spacing:.04em;text-transform:uppercase;padding:8px;border-bottom:1px solid var(--line);
+}
+td{padding:11px 8px;border-bottom:1px solid var(--line);font-size:14px;color:var(--text);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tr.click:hover td{background:#f7f8fa;cursor:pointer}
+.mono{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+.sev{display:inline-block;min-width:72px;text-align:center;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:600}
+.sev.critical{background:#fde8ea;color:#9f1239}
+.sev.high{background:#ffeedd;color:#9a3412}
+.sev.medium{background:#fef6d8;color:#854d0e}
+.sev.low{background:#e7f1fb;color:#1e4d73}
+.sev.real{background:#fde8ea;color:#9f1239}
+.sev.public{background:#e7f6ee;color:#067647}
+.sev.unknown{background:#fef6d8;color:#854d0e}
+.linkish{color:var(--accent);cursor:pointer;background:none;border:0;padding:0;font-size:13px;font-weight:600}
+.linkish:hover{color:var(--accent)}
+
+.rail{display:flex;gap:8px;margin-top:4px}
+.step{flex:1;min-width:0}
+.step .bar{height:4px;background:#e2e6ee;border-radius:99px;margin-bottom:8px}
+.step.done .bar{background:var(--accent)}
+.step .name{font-size:12px;color:var(--dim)}
+.step .dur{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:2px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+.row span{color:var(--dim)}
+.row b{font-weight:500;font-family:var(--mono);font-size:13px;color:var(--text)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line-strong);border-radius:999px;padding:4px 10px;font-size:13px;color:var(--text);background:var(--surface-2)}
+
+.banner{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  margin-top:14px;padding:14px;border-radius:12px;
+  background:#f4f7fb;border:1px solid #d5e0ee;
+}
+.banner strong{font-weight:600;color:var(--text)}
+.banner p{color:var(--dim);font-size:14px;margin-top:2px}
+
+.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.vs-search{
+  flex:1;min-width:180px;max-width:360px;
+  background:var(--bg);border:1px solid var(--line-strong);border-radius:8px;
+  padding:8px 12px;color:var(--text);font-size:14px;outline:none;background:#fff;
+}
+.vs-search::placeholder{color:var(--muted)}
+.vs-search:focus{border-color:var(--accent)}
+.counter{font-family:var(--mono);font-size:12px;color:var(--dim)}
+
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tab{
+  background:transparent;border:1px solid var(--line);color:var(--dim);
+  border-radius:999px;padding:6px 12px;cursor:pointer;font-size:13px;
+}
+.tab.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+.pane{display:none}
+.pane.active{display:block}
+
+.list-row{
+  display:flex;justify-content:space-between;gap:12px;align-items:center;
+  padding:10px 4px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:13px;color:var(--text);
+}
+.map{
+  height:420px;border-radius:14px;border:1px solid var(--line);
+  background:
+    radial-gradient(circle at 50% 48%, rgba(30,58,95,.06), transparent 42%),
+    linear-gradient(rgba(30,58,95,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30,58,95,.06) 1px, transparent 1px),
+    var(--surface);
+  background-size:auto, 48px 48px, 48px 48px, auto;
+  position:relative;overflow:hidden;
+}
+.node{
+  position:absolute;transform:translate(-50%,-50%);
+  background:var(--surface-2);border:1px solid var(--line-strong);
+  border-radius:10px;padding:8px 10px;font-size:12.5px;color:var(--text);cursor:pointer;
+  max-width:180px;
+}
+.node small{display:block;color:var(--dim);font-family:var(--mono);font-size:11px;margin-top:2px}
+.node.bad{border-color:#f3b4bc;background:#fff7f8}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.scan-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:8px}
+.scan-card h4{font-size:15px;font-weight:600;color:var(--text)}
+.scan-card p{color:var(--dim);font-size:13.5px;flex:1}
+.scan-card .st{font-family:var(--mono);font-size:12px;color:var(--green)}
+.poc{border:1px solid #f3b4bc;border-radius:12px;padding:14px;background:#fff7f8;margin-bottom:12px}
+.poc h4{color:#9f1239;margin-bottom:6px}
+.poc code{display:block;font-family:var(--mono);font-size:12.5px;color:var(--text);margin-top:8px;word-break:break-all}
+.toast{
+  position:fixed;bottom:18px;right:18px;background:var(--accent);color:#fff;
+  padding:10px 14px;border-radius:10px;font-size:13.5px;font-weight:600;
+  opacity:0;pointer-events:none;transition:opacity .2s;z-index:50;
+}
+.toast.show{opacity:1}
+@media (max-width:1100px){
+  .stats{grid-template-columns:repeat(3,1fr)}
+  .stat:nth-child(3){border-right:0}
+  .stat:nth-child(-n+3){border-bottom:1px solid var(--line)}
+  .grid{grid-template-columns:1fr}
+}
+@media (max-width:800px){
+  .sidebar{display:none}
+  .main{margin-left:0}
+  .stats{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+</head>
+<body>
+<nav class="sidebar">
+  <div class="sb-brand">
+    <div class="sb-logo"><div class="mark">R</div><h1>Recon<span>X</span></h1></div>
+    <div class="sb-meta">
+      <div class="sb-target">asus.com</div>
+      <div class="sb-ts">2026-09-28 16:47</div>
+    </div>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">Overview</div>
+    <a class="nav-a active" data-sid="overview"><span class="nav-ico"></span>Dashboard</a>
+    <a class="nav-a" data-sid="threatmap"><span class="nav-ico"></span>Threat Map<span class="nav-cnt">1,284</span></a>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">Reconnaissance</div>
+    <a class="nav-a" data-sid="recon"><span class="nav-ico"></span>Recon</a>
+    <a class="nav-a" data-sid="subdomains"><span class="nav-ico"></span>Subdomains<span class="nav-cnt">1,284</span></a>
+    <a class="nav-a" data-sid="alive"><span class="nav-ico"></span>Alive Hosts<span class="nav-cnt">216</span></a>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">Discovery</div>
+    <a class="nav-a" data-sid="urls"><span class="nav-ico"></span>All URLs<span class="nav-cnt">48k</span></a>
+    <a class="nav-a" data-sid="params"><span class="nav-ico"></span>Parameters</a>
+    <a class="nav-a" data-sid="categorised"><span class="nav-ico"></span>Categorised</a>
+    <a class="nav-a" data-sid="js"><span class="nav-ico"></span>JS Secrets<span class="nav-cnt hot">2</span></a>
+    <a class="nav-a" data-sid="api"><span class="nav-ico"></span>API Discovery<span class="nav-cnt">6</span></a>
+    <a class="nav-a" data-sid="tech"><span class="nav-ico"></span>Tech Priority<span class="nav-cnt">8</span></a>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">More scans</div>
+    <a class="nav-a" data-sid="scans"><span class="nav-ico"></span>Scan Center</a>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">Scan results</div>
+    <a class="nav-a" data-sid="nuclei"><span class="nav-ico"></span>Nuclei<span class="nav-cnt hot">9</span></a>
+    <a class="nav-a" data-sid="xss"><span class="nav-ico"></span>XSS<span class="nav-cnt hot">3</span></a>
+    <a class="nav-a" data-sid="openredirect"><span class="nav-ico"></span>Open Redirect<span class="nav-cnt">1</span></a>
+    <a class="nav-a" data-sid="extra"><span class="nav-ico"></span>Extra Checks<span class="nav-cnt hot">2</span></a>
+  </div>
+  <div class="nav-grp">
+    <div class="nav-lbl">Analysis</div>
+    <a class="nav-a" data-sid="ai"><span class="nav-ico"></span>AI Analysis<span class="nav-cnt">4</span></a>
+  </div>
+  <div class="sb-foot">preview · sample data</div>
+</nav>
+
+<main class="main">
+  <header class="topbar">
+    <div class="crumb"><span class="pill"><i></i> authorized</span><b>asus.com</b><span id="crumb-sec">/ dashboard</span></div>
+    <div class="actions">
+      <button class="btn" type="button" id="copy-path">Copy path</button>
+      <button class="btn primary" type="button" id="export-btn">Export</button>
+      <div class="menu" id="export-menu">
+        <button type="button" data-toast="HTML export is a preview action">Save as HTML<span>Full interactive report, offline</span></button>
+        <button type="button" data-toast="Print dialog is a preview action">Print / Save as PDF<span>Browser print dialog</span></button>
+        <button type="button" id="copy-path-2">Copy file path<span>Share the local file location</span></button>
+      </div>
+    </div>
+  </header>
+
+  <section class="section active" id="overview">
+    <div class="preview-note"><strong>Açık tema önizlemesi.</strong> Beyaz zemin, lacivert vurgu. Menüler aynı şekilde açılır. Canlı rapor değişmedi.</div>
+    <div class="sec-title"><div><h2>Dashboard</h2><p>Önce bakılacaklar, sonra yüzeyin geri kalanı.</p></div></div>
+    <div class="stats">
+      <div class="stat" data-goto="subdomains"><div class="k">Subdomains</div><div class="v">1,284</div><div class="s ok">+36 new</div></div>
+      <div class="stat" data-goto="alive"><div class="k">Alive</div><div class="v">216</div><div class="s">httpx</div></div>
+      <div class="stat" data-goto="urls"><div class="k">URLs</div><div class="v">48,902</div><div class="s">katana</div></div>
+      <div class="stat" data-goto="nuclei"><div class="k">Nuclei</div><div class="v">9</div><div class="s bad">2 critical</div></div>
+      <div class="stat" data-goto="xss"><div class="k">XSS</div><div class="v">3</div><div class="s warn">1 verified</div></div>
+      <div class="stat" data-goto="js"><div class="k">Secrets</div><div class="v">2</div><div class="s bad">1 real</div></div>
+    </div>
+    <div class="banner">
+      <div><strong>2 critical · 1 verified XSS · 1 real secret</strong><p>Aynı sorun birçok hostta tek satır.</p></div>
+      <button class="btn" type="button" data-goto="nuclei">Open findings</button>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <h3>Look here first</h3>
+        <table>
+          <thead><tr><th>Severity</th><th>Finding</th><th>Where</th><th></th></tr></thead>
+          <tbody>
+            <tr class="click" data-goto="nuclei"><td><span class="sev critical">critical</span></td><td>Exposed Spring actuator</td><td class="mono">api.asus.com</td><td><button class="linkish" type="button">view</button></td></tr>
+            <tr class="click" data-goto="xss"><td><span class="sev high">high</span></td><td>Reflected XSS · q</td><td class="mono">/search</td><td><button class="linkish" type="button">view</button></td></tr>
+            <tr class="click" data-goto="js"><td><span class="sev high">high</span></td><td>AWS access key</td><td class="mono">main.8f3a.js</td><td><button class="linkish" type="button">view</button></td></tr>
+            <tr class="click" data-goto="openredirect"><td><span class="sev medium">medium</span></td><td>Open redirect · next</td><td class="mono">login.asus.com</td><td><button class="linkish" type="button">view</button></td></tr>
+            <tr class="click" data-goto="extra"><td><span class="sev low">low</span></td><td>CORS reflects origin</td><td class="mono">www.asus.com</td><td><button class="linkish" type="button">view</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <div class="panel">
+          <h3>Pipeline</h3>
+          <div class="rail">
+            <div class="step done"><div class="bar"></div><div class="name">Recon</div><div class="dur">4m</div></div>
+            <div class="step done"><div class="bar"></div><div class="name">URLs</div><div class="dur">11m</div></div>
+            <div class="step done"><div class="bar"></div><div class="name">Nuclei</div><div class="dur">22m</div></div>
+            <div class="step done"><div class="bar"></div><div class="name">XSS</div><div class="dur">18m</div></div>
+            <div class="step done"><div class="bar"></div><div class="name">Report</div><div class="dur">1m</div></div>
+          </div>
+          <div style="margin-top:12px">
+            <div class="row"><span>WAF</span><b>Cloudflare</b></div>
+            <div class="row"><span>Tech</span><b>nginx · next</b></div>
+            <div class="row"><span>JS scanned</span><b>500 / 1,902</b></div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:14px">
+          <h3>Stack</h3>
+          <div class="chips">
+            <button class="chip" type="button" data-goto="tech">Next.js</button>
+            <button class="chip" type="button" data-goto="tech">nginx</button>
+            <button class="chip" type="button" data-goto="tech">Cloudflare</button>
+            <button class="chip" type="button" data-goto="tech">GraphQL</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="threatmap">
+    <div class="sec-title"><div><h2>Threat Map</h2><p>Hostlara tıklayınca ilgili bulgu sayfası açılır.</p></div></div>
+    <div class="map">
+      <button class="node" style="left:50%;top:46%" type="button" data-goto="alive">asus.com<small>root · alive</small></button>
+      <button class="node bad" style="left:28%;top:30%" type="button" data-goto="nuclei">api.asus.com<small>critical</small></button>
+      <button class="node bad" style="left:72%;top:28%" type="button" data-goto="xss">www.asus.com<small>verified XSS</small></button>
+      <button class="node" style="left:22%;top:68%" type="button" data-goto="openredirect">login.asus.com<small>redirect</small></button>
+      <button class="node" style="left:74%;top:70%" type="button" data-goto="js">cdn.asus.com<small>secret</small></button>
+      <button class="node" style="left:48%;top:78%" type="button" data-goto="subdomains">dev.asus.com<small>alive</small></button>
+    </div>
+  </section>
+
+  <section class="section" id="recon">
+    <div class="sec-title"><div><h2>Recon</h2><p>Hedefin pasif yüzeyi.</p></div></div>
+    <div class="grid">
+      <div class="panel">
+        <h3>Identity</h3>
+        <div class="row"><span>Domain</span><b>asus.com</b></div>
+        <div class="row"><span>Registrar</span><b>MarkMonitor</b></div>
+        <div class="row"><span>ASN</span><b>AS15133</b></div>
+        <div class="row"><span>Org</span><b>ASUSTeK</b></div>
+        <div class="row"><span>Created</span><b>1995-04-12</b></div>
+      </div>
+      <div class="panel">
+        <h3>Resolves</h3>
+        <div class="list-row"><span>asus.com</span><span>104.18.22.10</span></div>
+        <div class="list-row"><span>www.asus.com</span><span>104.18.22.10</span></div>
+        <div class="list-row"><span>api.asus.com</span><span>13.224.10.4</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="subdomains">
+    <div class="sec-title"><div><h2>Subdomains</h2><p>Filtre kutusu listeyi süzer.</p></div></div>
+    <div class="panel">
+      <div class="toolbar">
+        <input class="vs-search" data-filter="sub-list" placeholder="Filter subdomains...">
+        <span class="counter" id="sub-list-cnt">6</span>
+        <button class="btn" type="button" data-copy="sub-list">Copy visible</button>
+      </div>
+      <div id="sub-list">
+        <div class="list-row"><span>api.asus.com</span><button class="linkish" type="button" data-goto="alive">alive</button></div>
+        <div class="list-row"><span>www.asus.com</span><button class="linkish" type="button" data-goto="alive">alive</button></div>
+        <div class="list-row"><span>login.asus.com</span><button class="linkish" type="button" data-goto="alive">alive</button></div>
+        <div class="list-row"><span>dev.asus.com</span><button class="linkish" type="button" data-goto="alive">alive</button></div>
+        <div class="list-row"><span>cdn.asus.com</span><button class="linkish" type="button" data-goto="alive">alive</button></div>
+        <div class="list-row"><span>old-shop.asus.com</span><span class="mono">dangling</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="alive">
+    <div class="sec-title"><div><h2>Alive Hosts</h2><p>httpx ile cevap veren hostlar.</p></div></div>
+    <div class="panel">
+      <div class="toolbar"><input class="vs-search" data-filter="alive-tbl" placeholder="Filter hosts..."></div>
+      <table id="alive-tbl">
+        <thead><tr><th>Host</th><th>Status</th><th>Title</th><th>Tech</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">https://www.asus.com</td><td>200</td><td>ASUS</td><td>Cloudflare, Next.js</td></tr>
+          <tr><td class="mono">https://api.asus.com</td><td>401</td><td>API</td><td>nginx</td></tr>
+          <tr><td class="mono">https://login.asus.com</td><td>200</td><td>Sign in</td><td>nginx</td></tr>
+          <tr><td class="mono">https://dev.asus.com</td><td>200</td><td>Dev</td><td>Apache</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="urls">
+    <div class="sec-title"><div><h2>All URLs</h2><p>Toplanan adresler. Filtre ve kopyala çalışır.</p></div></div>
+    <div class="panel">
+      <div class="toolbar">
+        <input class="vs-search" data-filter="url-list" placeholder="Filter URLs...">
+        <button class="btn" type="button" data-copy="url-list">Copy visible</button>
+      </div>
+      <div id="url-list">
+        <div class="list-row">https://www.asus.com/search?q=laptop</div>
+        <div class="list-row">https://www.asus.com/static/js/main.8f3a1c9b.js</div>
+        <div class="list-row">https://login.asus.com/auth?next=/account</div>
+        <div class="list-row">https://api.asus.com/v1/graphql</div>
+        <div class="list-row">https://api.asus.com/swagger.json</div>
+        <div class="list-row">https://dev.asus.com/.git/config</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="params">
+    <div class="sec-title"><div><h2>Parameters</h2><p>Sorguda görülen parametreler.</p></div></div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Param</th><th>Host</th><th>Example</th><th></th></tr></thead>
+        <tbody>
+          <tr class="click" data-goto="xss"><td class="mono">q</td><td>www.asus.com</td><td class="mono">/search?q=</td><td><button class="linkish" type="button">XSS</button></td></tr>
+          <tr class="click" data-goto="openredirect"><td class="mono">next</td><td>login.asus.com</td><td class="mono">/auth?next=</td><td><button class="linkish" type="button">redirect</button></td></tr>
+          <tr><td class="mono">id</td><td>api.asus.com</td><td class="mono">/v1/user?id=</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="categorised">
+    <div class="sec-title"><div><h2>Categorised</h2><p>Sekmeler gerçekten değişir.</p></div></div>
+    <div class="tabs" data-tabs="cat">
+      <button class="tab active" type="button" data-pane="cat-js">JavaScript</button>
+      <button class="tab" type="button" data-pane="cat-api">API</button>
+      <button class="tab" type="button" data-pane="cat-admin">Admin</button>
+      <button class="tab" type="button" data-pane="cat-files">Sensitive files</button>
+    </div>
+    <div class="panel">
+      <div class="pane active" id="cat-js">
+        <div class="list-row">/static/js/main.8f3a1c9b.js <button class="linkish" type="button" data-goto="js">secrets</button></div>
+        <div class="list-row">/_next/static/chunks/pages/auth.js</div>
+      </div>
+      <div class="pane" id="cat-api">
+        <div class="list-row">/v1/graphql <button class="linkish" type="button" data-goto="api">open</button></div>
+        <div class="list-row">/swagger.json</div>
+      </div>
+      <div class="pane" id="cat-admin">
+        <div class="list-row">/admin</div>
+        <div class="list-row">/actuator/env</div>
+      </div>
+      <div class="pane" id="cat-files">
+        <div class="list-row">/.git/config <button class="linkish" type="button" data-goto="nuclei">finding</button></div>
+        <div class="list-row">/.env</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="js">
+    <div class="sec-title"><div><h2>JS Secrets</h2><p>Öncelikli 500 dosyadan çıkan adaylar. Sekme süzüyor.</p></div></div>
+    <div class="tabs" data-tabs="jsf">
+      <button class="tab active" type="button" data-pane="js-all">All</button>
+      <button class="tab" type="button" data-pane="js-real">Real</button>
+      <button class="tab" type="button" data-pane="js-public">Public</button>
+    </div>
+    <div class="panel pane active" id="js-all">
+      <table>
+        <thead><tr><th>Verdict</th><th>Value</th><th>File</th></tr></thead>
+        <tbody>
+          <tr><td><span class="sev real">REAL</span></td><td class="mono">AKIAIOSFODNN7EXAMPLE</td><td class="mono">main.8f3a1c9b.js</td></tr>
+          <tr><td><span class="sev unknown">UNKNOWN</span></td><td class="mono">eyJhbGciOiJIUzI1NiJ9...</td><td class="mono">auth.js</td></tr>
+          <tr><td><span class="sev public">PUBLIC</span></td><td class="mono">pk_live_51Hexample</td><td class="mono">checkout.js</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel pane" id="js-real">
+      <div class="list-row">AKIAIOSFODNN7EXAMPLE · main.8f3a1c9b.js</div>
+    </div>
+    <div class="panel pane" id="js-public">
+      <div class="list-row">Stripe publishable key · checkout.js</div>
+    </div>
+  </section>
+
+  <section class="section" id="api">
+    <div class="sec-title"><div><h2>API Discovery</h2><p>Bulunan spec ve endpointler.</p></div></div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Kind</th><th>URL</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>OpenAPI</td><td class="mono">https://api.asus.com/swagger.json</td><td>200</td></tr>
+          <tr><td>GraphQL</td><td class="mono">https://api.asus.com/v1/graphql</td><td>200</td></tr>
+          <tr><td>REST</td><td class="mono">https://api.asus.com/v1/users</td><td>401</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="tech">
+    <div class="sec-title"><div><h2>Tech Priority</h2><p>Risk sırası. Satıra tıklayınca ilgili tarama açılır.</p></div></div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Score</th><th>Technology</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr class="click" data-goto="nuclei"><td>90</td><td>Spring Boot</td><td>Actuator exposure</td></tr>
+          <tr class="click" data-goto="extra"><td>70</td><td>nginx</td><td>Header gaps</td></tr>
+          <tr class="click" data-goto="api"><td>60</td><td>GraphQL</td><td>Introspection</td></tr>
+          <tr><td>20</td><td>Cloudflare</td><td>WAF in front</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="scans">
+    <div class="sec-title"><div><h2>Scan Center</h2><p>Run, durumu örnek olarak günceller. View details ilgili sayfayı açar.</p></div></div>
+    <div class="cards">
+      <article class="scan-card" id="card-xss">
+        <h4>XSS (Dalfox)</h4>
+        <p>Reflected XSS on high-value URLs, with headless proof.</p>
+        <div class="st" data-status>done · 3 findings</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="xss">View details</button></div>
+      </article>
+      <article class="scan-card" id="card-nuclei">
+        <h4>Nuclei</h4>
+        <p>CVE and DAST templates over the live URL set.</p>
+        <div class="st" data-status>done · 9 findings</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="nuclei">View details</button></div>
+      </article>
+      <article class="scan-card">
+        <h4>Open Redirect</h4>
+        <p>Redirect-looking parameters.</p>
+        <div class="st" data-status>done · 1 finding</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="openredirect">View details</button></div>
+      </article>
+      <article class="scan-card">
+        <h4>Network / Port</h4>
+        <p>Port discovery, then service versions.</p>
+        <div class="st" data-status>done · 4 open</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button></div>
+        <table>
+          <thead><tr><th>Host</th><th>Port</th><th>Service</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">api.asus.com</td><td class="mono">443/tcp</td><td>https nginx</td></tr>
+            <tr><td class="mono">dev.asus.com</td><td class="mono">22/tcp</td><td>ssh OpenSSH 8.9</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="scan-card">
+        <h4>CORS</h4>
+        <p>Origin reflection on alive hosts.</p>
+        <div class="st" data-status>done · 1 vulnerable</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="extra">View details</button></div>
+      </article>
+      <article class="scan-card">
+        <h4>Subdomain Takeover</h4>
+        <p>Dangling CNAME check.</p>
+        <div class="st" data-status>done · 1 candidate</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="extra">View details</button></div>
+      </article>
+      <article class="scan-card">
+        <h4>Cloud Bucket</h4>
+        <p>Public bucket listing from discovered names.</p>
+        <div class="st" data-status>done · 0 public</div>
+        <div class="toolbar"><button class="btn primary" type="button" data-run>Run</button><button class="btn" type="button" data-goto="extra">View details</button></div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="nuclei">
+    <div class="sec-title"><div><h2>Nuclei</h2><p>Şiddet süzgeci çalışır.</p></div></div>
+    <div class="tabs" data-tabs="nuc">
+      <button class="tab active" type="button" data-filter-table="nuc-tbl" data-sev="all">All</button>
+      <button class="tab" type="button" data-filter-table="nuc-tbl" data-sev="critical">Critical</button>
+      <button class="tab" type="button" data-filter-table="nuc-tbl" data-sev="high">High</button>
+      <button class="tab" type="button" data-filter-table="nuc-tbl" data-sev="medium">Medium</button>
+    </div>
+    <div class="panel">
+      <table id="nuc-tbl">
+        <thead><tr><th>Severity</th><th>Template</th><th>Matched</th></tr></thead>
+        <tbody>
+          <tr data-sev="critical"><td><span class="sev critical">critical</span></td><td>springboot-actuator</td><td class="mono">https://api.asus.com/actuator</td></tr>
+          <tr data-sev="critical"><td><span class="sev critical">critical</span></td><td>git-config</td><td class="mono">https://dev.asus.com/.git/config</td></tr>
+          <tr data-sev="high"><td><span class="sev high">high</span></td><td>exposed-env</td><td class="mono">https://dev.asus.com/.env</td></tr>
+          <tr data-sev="medium"><td><span class="sev medium">medium</span></td><td>missing-csp</td><td class="mono">https://www.asus.com</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="xss">
+    <div class="sec-title"><div><h2>XSS</h2><p>Doğrulanmış örnek ve test edilen adresler.</p></div></div>
+    <div class="poc">
+      <h4>Verified · reflected</h4>
+      <div>Parameter <b>q</b> on www.asus.com/search</div>
+      <code>https://www.asus.com/search?q=&lt;script&gt;alert(1)&lt;/script&gt;</code>
+      <div class="toolbar" style="margin-top:10px"><button class="btn" type="button" data-copy-text="https://www.asus.com/search?q=&lt;script&gt;alert(1)&lt;/script&gt;">Copy PoC</button></div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Type</th><th>Param</th><th>URL</th></tr></thead>
+        <tbody>
+          <tr><td>Verified</td><td class="mono">q</td><td class="mono">/search</td></tr>
+          <tr><td>Reflected</td><td class="mono">name</td><td class="mono">/support</td></tr>
+          <tr><td>Clean</td><td class="mono">page</td><td class="mono">/products</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="openredirect">
+    <div class="sec-title"><div><h2>Open Redirect</h2><p>Location kanarya hosta gidiyor.</p></div></div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Param</th><th>Test URL</th><th>Location</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="mono">next</td>
+            <td class="mono">https://login.asus.com/auth?next=https://s1ber.com</td>
+            <td class="mono">https://s1ber.com</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="extra">
+    <div class="sec-title"><div><h2>Extra Checks</h2><p>CORS, takeover ve bucket aynı sayfada, sekmeli.</p></div></div>
+    <div class="tabs" data-tabs="extra">
+      <button class="tab active" type="button" data-pane="ex-cors">CORS</button>
+      <button class="tab" type="button" data-pane="ex-take">Takeover</button>
+      <button class="tab" type="button" data-pane="ex-bucket">Buckets</button>
+    </div>
+    <div class="panel pane active" id="ex-cors">
+      <table>
+        <thead><tr><th>Host</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">https://www.asus.com</td><td>Reflects arbitrary Origin with credentials</td></tr>
+          <tr><td class="mono">https://api.asus.com</td><td>Not vulnerable</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel pane" id="ex-take">
+      <div class="list-row">old-shop.asus.com → CNAME shop.example.invalid · candidate</div>
+    </div>
+    <div class="panel pane" id="ex-bucket">
+      <div class="list-row">asus-assets.s3.amazonaws.com · private</div>
+    </div>
+  </section>
+
+  <section class="section" id="ai">
+    <div class="sec-title"><div><h2>AI Analysis</h2><p>Kayıtlı analiz kartları. Satır ilgili bölüme gider.</p></div></div>
+    <div class="cards">
+      <article class="scan-card">
+        <h4>Actuator on api.asus.com</h4>
+        <p>Unauthenticated env endpoint. Treat as a critical lead and confirm it is still live.</p>
+        <button class="btn" type="button" data-goto="nuclei">Open nuclei</button>
+      </article>
+      <article class="scan-card">
+        <h4>Verified XSS on /search</h4>
+        <p>Reflected in the q parameter. Proof URL is on the XSS page.</p>
+        <button class="btn" type="button" data-goto="xss">Open XSS</button>
+      </article>
+      <article class="scan-card">
+        <h4>Key in main bundle</h4>
+        <p>Format matches an AWS access key. Check whether it is still valid.</p>
+        <button class="btn" type="button" data-goto="js">Open secrets</button>
+      </article>
+      <article class="scan-card">
+        <h4>Login redirect</h4>
+        <p>next parameter sends the browser off-site.</p>
+        <button class="btn" type="button" data-goto="openredirect">Open redirect</button>
+      </article>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+var NAMES = {
+  overview:"dashboard", threatmap:"threat map", recon:"recon", subdomains:"subdomains",
+  alive:"alive hosts", urls:"all urls", params:"parameters", categorised:"categorised",
+  js:"js secrets", api:"api discovery", tech:"tech priority", scans:"scan center",
+  nuclei:"nuclei", xss:"xss", openredirect:"open redirect", extra:"extra checks", ai:"ai analysis"
+};
+function toast(msg){
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(function(){ t.classList.remove("show"); }, 1600);
+}
+function show(id){
+  if(!document.getElementById(id)) return;
+  document.querySelectorAll(".section").forEach(function(s){ s.classList.toggle("active", s.id===id); });
+  document.querySelectorAll(".nav-a[data-sid]").forEach(function(a){ a.classList.toggle("active", a.dataset.sid===id); });
+  var crumb = document.getElementById("crumb-sec");
+  if(crumb) crumb.textContent = " / " + (NAMES[id] || id);
+  var active = document.querySelector('.nav-a[data-sid="'+id+'"]');
+  if(active) active.scrollIntoView({block:"nearest"});
+  window.scrollTo(0,0);
+}
+document.querySelectorAll("[data-sid]").forEach(function(a){
+  a.addEventListener("click", function(){ show(a.dataset.sid); });
+});
+document.querySelectorAll("[data-goto]").forEach(function(el){
+  el.addEventListener("click", function(ev){
+    ev.preventDefault();
+    ev.stopPropagation();
+    show(el.dataset.goto);
+  });
+});
+document.querySelectorAll(".tabs").forEach(function(bar){
+  bar.querySelectorAll(".tab").forEach(function(tab){
+    tab.addEventListener("click", function(){
+      bar.querySelectorAll(".tab").forEach(function(t){ t.classList.remove("active"); });
+      tab.classList.add("active");
+      if(tab.dataset.pane){
+        var ids = [];
+        bar.querySelectorAll("[data-pane]").forEach(function(t){ ids.push(t.dataset.pane); });
+        ids.forEach(function(id){
+          var pane = document.getElementById(id);
+          if(pane) pane.classList.toggle("active", id===tab.dataset.pane);
+        });
+      }
+      if(tab.dataset.filterTable){
+        var sev = tab.dataset.sev;
+        document.querySelectorAll("#"+tab.dataset.filterTable+" tbody tr").forEach(function(row){
+          row.hidden = sev!=="all" && row.dataset.sev!==sev;
+        });
+      }
+    });
+  });
+});
+document.querySelectorAll(".vs-search").forEach(function(inp){
+  inp.addEventListener("input", function(){
+    var q = inp.value.toLowerCase();
+    var root = document.getElementById(inp.dataset.filter);
+    if(!root) return;
+    var rows = root.matches("table") ? root.querySelectorAll("tbody tr") : root.querySelectorAll(".list-row");
+    var n = 0;
+    rows.forEach(function(row){
+      var hide = q && row.textContent.toLowerCase().indexOf(q)===-1;
+      row.hidden = hide;
+      if(!hide) n++;
+    });
+    var cnt = document.getElementById(inp.dataset.filter+"-cnt");
+    if(cnt) cnt.textContent = String(n);
+  });
+});
+document.querySelectorAll("[data-copy]").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    var root = document.getElementById(btn.dataset.copy);
+    var lines = [];
+    root.querySelectorAll(".list-row").forEach(function(row){
+      if(!row.hidden) lines.push(row.innerText.replace(/\s+/g," ").trim());
+    });
+    navigator.clipboard.writeText(lines.join("\n")).then(function(){ toast("Copied "+lines.length+" lines"); }, function(){ toast("Copy failed"); });
+  });
+});
+document.querySelectorAll("[data-copy-text]").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    var text = btn.dataset.copyText.replace(/&lt;/g,"<").replace(/&gt;/g,">");
+    navigator.clipboard.writeText(text).then(function(){ toast("PoC copied"); }, function(){ toast("Copy failed"); });
+  });
+});
+document.querySelectorAll("[data-run]").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    var st = btn.closest(".scan-card").querySelector("[data-status]");
+    st.textContent = "running…";
+    st.style.color = "var(--yellow)";
+    btn.disabled = true;
+    setTimeout(function(){
+      st.textContent = "done · preview";
+      st.style.color = "var(--green)";
+      btn.disabled = false;
+      toast("Scan finished (preview)");
+    }, 700);
+  });
+});
+document.getElementById("export-btn").addEventListener("click", function(ev){
+  ev.stopPropagation();
+  document.getElementById("export-menu").classList.toggle("open");
+});
+document.querySelectorAll("[data-toast]").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    toast(btn.dataset.toast);
+    document.getElementById("export-menu").classList.remove("open");
+  });
+});
+function copyPath(){
+  var path = location.href;
+  navigator.clipboard.writeText(path).then(function(){ toast("Path copied"); }, function(){ toast(path); });
+  document.getElementById("export-menu").classList.remove("open");
+}
+document.getElementById("copy-path").addEventListener("click", copyPath);
+document.getElementById("copy-path-2").addEventListener("click", copyPath);
+document.addEventListener("click", function(){ document.getElementById("export-menu").classList.remove("open"); });
+document.querySelector(".actions").addEventListener("click", function(ev){ ev.stopPropagation(); });
+</script>
+</body>
+</html>

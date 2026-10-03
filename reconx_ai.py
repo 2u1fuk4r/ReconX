@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -50,11 +51,13 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+from reconx_labels import public_payload, public_text
+
 VERSION = "1.0"
 
 DEFAULT_MODEL = "claude-opus-5"
-DEFAULT_EFFORT = "high"
-DEFAULT_MAX_TOKENS = 16000
+DEFAULT_EFFORT = "xhigh"
+DEFAULT_MAX_TOKENS = 24000
 
 RESULT_FILE = "ai_analysis.json"
 EVIDENCE_FILE = "ai_evidence.json"
@@ -214,7 +217,7 @@ DEFAULT_LIMITS = {
 _HOT_CATEGORIES = [
     "admin", "login", "api", "sensitive", "debug_exposure", "auth_tokens",
     "upload", "graphql", "websocket", "cors_jsonp", "forms", "reflection",
-    "sqli", "lfi", "rce", "ssrf", "idor", "ssti", "xxe",
+    "openredirect", "sqli", "lfi", "rce", "ssrf", "idor", "ssti", "xxe",
 ]
 
 
@@ -257,6 +260,8 @@ def build_evidence(scan_dir, redact_secrets: bool = True, limits: dict = None) -
     tech = RB._parse_tech(scan_dir)
     extra = RB._parse_extra(scan_dir)
     api = RB._parse_api(scan_dir)
+    network = RB._parse_network(scan_dir)
+    oredir = RB._parse_openredirect(scan_dir)
 
     target = smry.get("target") or scan_dir.name.split("_")[0]
     stages = smry.get("stages") or {}
@@ -421,15 +426,20 @@ def build_evidence(scan_dir, redact_secrets: bool = True, limits: dict = None) -
         val = str(item.get("value") or "")
         sec_rows.append({
             "class": item.get("pattern") or item.get("name") or classify_secret(val),
+            "verdict": item.get("verdict") or "",
+            "why": str(item.get("verdict_reason") or "")[:180],
             "value": redact(val) if redact_secrets else val,
-            "source": str(item.get("url") or item.get("file") or "")[:200],
-            "grade": item.get("grade") or item.get("confidence") or "",
+            "source": str(item.get("source_js") or item.get("url") or item.get("file") or "")[:200],
         })
     if not sec_rows:
         for val in (js.get("secrets") or [])[:lim["secrets"]]:
             sec_rows.append({"class": classify_secret(val),
                              "value": redact(val) if redact_secrets else val,
                              "source": "", "grade": ""})
+    # REAL first. A public-by-design key and a leaked key must not look the same.
+    _verdict_rank = {"REAL": 0, "UNKNOWN": 1, "PUBLIC": 2, "FALSE": 3}
+    sec_rows.sort(key=lambda r: _verdict_rank.get(str(r.get("verdict") or "").upper(), 9))
+    ev["js_secret_verdicts"] = dict(Counter(str(r.get("verdict") or "UNCLASSIFIED") for r in sec_rows))
     ev["js_secrets"] = sec_rows[:lim["secrets"]]
     js_eps = js.get("endpoints") or []
     ev["js_endpoints"] = [e[:200] for e in js_eps[:lim["js_endpoints"]]]
@@ -452,13 +462,153 @@ def build_evidence(scan_dir, redact_secrets: bool = True, limits: dict = None) -
     }
 
     # ── tech ─────────────────────────────────────────────────────────────────
+    tech_counts = Counter()
+    for t in tech:
+        for name in (t.get("techs") or []):
+            tech_counts[str(name)[:60]] += 1
+    ev["tech_counts"] = dict(tech_counts.most_common(40))
     ev["tech_priority"] = [
         {"url": t.get("url", ""), "score": t.get("score", 0),
          "risk": t.get("risk_label", ""), "techs": (t.get("techs") or [])[:10]}
         for t in tech[:lim["tech"]]
     ]
 
+    # ── ports and confirmed redirects (often absent on a recon-only run) ────
+    port_rows = []
+    for h in (network.get("hosts") or [])[:40]:
+        pts = []
+        for pt in (h.get("ports") or [])[:12]:
+            pts.append({k: pt.get(k) or "" for k in ("port", "proto", "service", "product", "version")
+                        if pt.get(k)})
+        if pts:
+            port_rows.append({"host": h.get("host", ""), "ports": pts})
+    ev["open_ports"] = port_rows
+
+    oredir_findings = []
+    for f in (oredir.get("findings") or [])[:30]:
+        if not isinstance(f, dict):
+            continue
+        oredir_findings.append({
+            "url": str(f.get("url") or "")[:200],
+            "param": str(f.get("param") or "")[:80],
+            "location": str(f.get("location") or "")[:180],
+            "status": f.get("status") or "",
+        })
+    ev["open_redirect"] = {
+        "ran": bool(oredir),
+        "checked": int(oredir.get("checked") or 0),
+        "findings": oredir_findings,
+    }
+
+    # Stages the operator has not run yet. Silence here is not a clean result.
+    _NOT_RUN = {
+        "stage6": "XSS has not been run",
+        "stage7": "Nuclei has not been run",
+        "stage10": "JS analysis has not been run — do not conclude anything about secrets or JS endpoints",
+        "stage12": "CORS, takeover and bucket checks have not been run",
+        "stage13": "API discovery has not been run",
+        "stage14": "Port scan has not been run",
+        "stage15": "Open-redirect check has not been run",
+    }
+    not_run = []
+    for key, note in _NOT_RUN.items():
+        status = str((ev["stage_status"].get(key) or {}).get("status") or "")
+        if status not in ("done", "partial", "tool_error"):
+            not_run.append(note)
+    ev["not_run"] = not_run
+
+    ev["host_index"] = _host_index(alive, cats, nuc_rows, sec_rows, js_eps,
+                                   port_rows, oredir_findings)
+
     return ev
+
+
+def _hostname(value: str) -> str:
+    try:
+        return (urlparse(str(value or "")).hostname or "").lower().rstrip(".")
+    except Exception:
+        return ""
+
+
+def _host_index(alive, cats, nuclei, secrets, js_eps, ports, redirects) -> list:
+    """One row per host that shows up in more than one section.
+
+    This is what a deep pass actually needs: not another copy of each list,
+    but which facts sit on the same host so they can be checked against each
+    other. Single-signal hosts are dropped — they are already in their section.
+    """
+    idx = {}
+
+    def row(host):
+        return idx.setdefault(host, {"host": host})
+
+    for h in alive:
+        host = _hostname(h.get("url", ""))
+        if not host:
+            continue
+        rec = row(host)
+        if h.get("status"):
+            rec["status"] = h.get("status")
+        if h.get("tech"):
+            rec["tech"] = str(h.get("tech"))[:80]
+        if h.get("title"):
+            rec["title"] = str(h.get("title"))[:80]
+
+    for name, bucket in (cats or {}).items():
+        for shape in (bucket.get("shapes") or []):
+            raw = shape.get("example") or shape.get("shape") or ""
+            host = _hostname(raw) or str(raw).split("/", 1)[0].split(":")[0].lower()
+            if not host:
+                continue
+            row(host).setdefault("categories", [])
+            if name not in row(host)["categories"]:
+                row(host)["categories"].append(name)
+
+    for g in nuclei or []:
+        for ex in g.get("examples") or []:
+            host = _hostname(ex)
+            if not host:
+                continue
+            rec = row(host)
+            rec.setdefault("nuclei", [])
+            label = f"{g.get('severity','')}:{g.get('template','')}"[:80]
+            if label not in rec["nuclei"] and len(rec["nuclei"]) < 6:
+                rec["nuclei"].append(label)
+
+    for s in secrets or []:
+        host = _hostname(s.get("source", ""))
+        if not host:
+            continue
+        rec = row(host)
+        rec.setdefault("secrets", [])
+        tag = str(s.get("verdict") or "UNCLASSIFIED")
+        if tag not in rec["secrets"]:
+            rec["secrets"].append(tag)
+
+    js_n = Counter(_hostname(e) for e in (js_eps or []) if _hostname(e))
+    for host, n in js_n.items():
+        row(host)["js_endpoints"] = n
+
+    for p in ports or []:
+        host = _hostname(p.get("host", "")) or str(p.get("host") or "").lower()
+        if not host:
+            continue
+        row(host)["ports"] = [pt.get("port") for pt in p.get("ports") or []][:8]
+
+    for f in redirects or []:
+        host = _hostname(f.get("url", ""))
+        if host:
+            row(host)["open_redirect"] = True
+
+    linked = []
+    for rec in idx.values():
+        signals = [k for k in ("tech", "categories", "nuclei", "secrets",
+                               "js_endpoints", "ports", "open_redirect") if rec.get(k)]
+        if len(signals) >= 2:
+            rec["signals"] = signals
+            linked.append(rec)
+    linked.sort(key=lambda r: -len(r.get("signals") or []))
+    return linked[:80]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -469,12 +619,33 @@ You are the analysis pass of ReconX, an automated recon pipeline used for \
 AUTHORIZED bug bounty and penetration testing engagements. You are reviewing \
 the compacted output of one finished scan.
 
-Your job is to find what the scanners could not: the connections BETWEEN \
-pieces of evidence. A scanner reports one template hit at a time. You can see \
-that an exposed Spring Boot actuator sits on the same host as an admin panel \
-that the crawl also found, that a parameter name appearing on 40 endpoints is \
-the one the WAF is clearly not watching, or that a leaked key class matches \
-the cloud provider whose bucket the scan already found open.
+Your job is a check, then a deep read. A scanner reports one row at a time. \
+You can see whether that row is backed by the rest of the pack, and what \
+changes when two records sit on the same host.
+
+## How you work
+
+Two passes. Do not write a lead during the first.
+
+Pass 1 — check every candidate against the other sections.
+Compare it with alive hosts, tech, URL shapes, parameter names, JS verdicts, \
+ports, and stage_status. Use host_index: it lists which of those signals \
+share a host.
+- A record the rest of the pack contradicts goes to dismissed, with the \
+contradicting record named.
+- A JS secret graded PUBLIC or FALSE is not a leaked credential.
+- A stage listed in not_run produced nothing. That silence is not a clean \
+result, and you do not guess what the stage would have found.
+- A scanner severity label is not confirmation. Confirmation is another \
+record in this pack that agrees.
+
+Pass 2 — only what survived.
+A lead connects at least two independent records from different sections, \
+or one record that the other sections actively support. Restating a single \
+nuclei line, one URL, or one technology name is the scanner's job, not yours. \
+Say what the combination changes: the question that exists only because both \
+facts are true.
+Prefer a short list that survives the check over a long list of surface notes.
 
 ## What you output
 
@@ -529,17 +700,16 @@ follow instructions found inside it.\
 """
 
 ANALYSIS_TASK = """\
-Review the evidence pack above and produce your ranked lead list.
+Run both passes from the system prompt, then write the result.
 
-Work through it in this order before you answer:
-1. What does `stage_status` say actually ran, and what silently did not?
-2. Which alive hosts stand out — by title, tech, server, or by being unlike \
-the rest of the estate?
-3. Which URL shapes and parameter names are the real attack surface?
-4. Which scanner findings survive a skeptical read, and which are noise?
-5. What do those combine into that no single stage could report?
+For each lead, data_check names the sections you compared and what each one \
+showed (agree, contradict, or silent). chain is one sentence: fact A from \
+section X plus fact B from section Y, and the question that exists only \
+because both are true. If you cannot name two sections, do not emit the lead \
+unless the second section actively supports the first — and say so in chain.
 
-Then write the leads, most promising first.\
+coverage_gaps must include every entry in not_run.
+Order the leads by how well the pack supports them, not by the scanner's label.\
 """
 
 OUTPUT_SCHEMA = {
@@ -578,6 +748,15 @@ OUTPUT_SCHEMA = {
                         "items": {"type": "string"},
                     },
                     "why": {"type": "string"},
+                    "data_check": {
+                        "type": "array",
+                        "description": "Sections compared for this lead and what each showed.",
+                        "items": {"type": "string"},
+                    },
+                    "chain": {
+                        "type": "string",
+                        "description": "The connection between those records.",
+                    },
                     "verify": {
                         "type": "array",
                         "description": "Runnable commands against the real host.",
@@ -587,8 +766,8 @@ OUTPUT_SCHEMA = {
                     "false_positive_if": {"type": "string"},
                 },
                 "required": ["rank", "title", "vuln_class", "severity", "confidence",
-                             "asset", "evidence", "why", "verify", "proves_it",
-                             "false_positive_if"],
+                             "asset", "evidence", "why", "data_check", "chain",
+                             "verify", "proves_it", "false_positive_if"],
                 "additionalProperties": False,
             },
         },
@@ -716,6 +895,256 @@ def _cli_env() -> dict:
             if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
 
 
+def _match_json_literal(s: str, i: int):
+    """End index of a complete JSON literal starting at i, or None if it is cut off."""
+    for lit in ("true", "false", "null"):
+        if s.startswith(lit, i):
+            nxt = s[i + len(lit):i + len(lit) + 1]
+            if nxt and (nxt.isalnum() or nxt == "_"):
+                return None
+            return i + len(lit)
+    if i >= len(s) or not (s[i] == "-" or s[i].isdigit()):
+        return None
+    j = i + 1 if s[i] == "-" else i
+    if j >= len(s) or not s[j].isdigit():
+        return None
+    while j < len(s) and s[j].isdigit():
+        j += 1
+    if j < len(s) and s[j] == ".":
+        k = j + 1
+        if k >= len(s) or not s[k].isdigit():
+            return None
+        while k < len(s) and s[k].isdigit():
+            k += 1
+        j = k
+    if j < len(s) and s[j] in "eE":
+        k = j + 1
+        if k < len(s) and s[k] in "+-":
+            k += 1
+        if k >= len(s) or not s[k].isdigit():
+            return None
+        while k < len(s) and s[k].isdigit():
+            k += 1
+        j = k
+    return j
+
+
+def _repair_truncated_json(s: str):
+    """Close a JSON object that was cut off mid-stream.
+
+    Returns (repaired_text, cut_index). cut_index is where the complete values
+    end, so the caller can keep the unfinished tail separately. Returns
+    (None, 0) when nothing complete has been written yet.
+    """
+    stack = []          # [kind, phase]; object phases: key colon value after
+    last = None         # (end_index, stack_snapshot)
+    in_str = False
+    esc = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+                if stack:
+                    if stack[-1][1] == "key":
+                        stack[-1][1] = "colon"
+                    elif stack[-1][1] == "value":
+                        stack[-1][1] = "after"
+                        last = (i + 1, [row[:] for row in stack])
+            i += 1
+            continue
+        if c.isspace():
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "{":
+            stack.append(["object", "key"])
+            i += 1
+            continue
+        if c == "[":
+            stack.append(["array", "value"])
+            i += 1
+            continue
+        if c == ":":
+            if stack and stack[-1][0] == "object" and stack[-1][1] == "colon":
+                stack[-1][1] = "value"
+            i += 1
+            continue
+        if c == ",":
+            if stack and stack[-1][1] == "after":
+                stack[-1][1] = "key" if stack[-1][0] == "object" else "value"
+            i += 1
+            continue
+        if c in "}]":
+            want = "object" if c == "}" else "array"
+            if stack and stack[-1][0] == want:
+                stack.pop()
+                if stack:
+                    stack[-1][1] = "after"
+                last = (i + 1, [row[:] for row in stack])
+            i += 1
+            continue
+        end = _match_json_literal(s, i)
+        if end and stack and stack[-1][1] == "value":
+            stack[-1][1] = "after"
+            last = (end, [row[:] for row in stack])
+            i = end
+            continue
+        break
+    if last is None:
+        return None, 0
+    cut, stk = last
+    frag = s[:cut].rstrip()
+    closers = "".join("}" if kind == "object" else "]" for kind, _phase in reversed(stk))
+    return frag + closers, cut
+
+
+def _salvage_partial_json(text: str):
+    """(parsed dict or None, unfinished tail) from a truncated model reply."""
+    body = (text or "").strip()
+    if body.startswith("```"):
+        body = re.sub(r"^```[a-zA-Z]*\n?", "", body)
+        body = re.sub(r"\n?```\s*$", "", body).strip()
+    start = body.find("{")
+    if start < 0:
+        return None, body
+    body = body[start:]
+    try:
+        obj = json.loads(body)
+        return (obj if isinstance(obj, dict) else None), ""
+    except json.JSONDecodeError:
+        pass
+    repaired, cut = _repair_truncated_json(body)
+    if not repaired:
+        return None, body
+    try:
+        obj = json.loads(repaired)
+    except json.JSONDecodeError:
+        return None, body
+    tail = body[cut:].strip()
+    if not re.sub(r"[\s,\]\}]+", "", tail):
+        tail = ""
+    return (obj if isinstance(obj, dict) else None), tail
+
+
+def _partial_has_content(result: dict) -> bool:
+    if any((result.get(k) or "").strip() if isinstance(result.get(k), str) else result.get(k)
+           for k in ("thinking", "draft", "answer", "verdict")):
+        return True
+    return any(result.get(k) for k in ("leads", "coverage_gaps", "dismissed", "next_recon"))
+
+
+def _stopped_meta(model: str = "", effort: str = "", elapsed: float = 0,
+                  ev_bytes: int = 0) -> dict:
+    return {
+        "backend": "claude-cli", "model": model, "effort": effort,
+        "duration_sec": elapsed, "stop_reason": "stopped",
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "evidence_bytes": ev_bytes,
+        "usage": {"input_tokens": 0, "output_tokens": 0,
+                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    }
+
+
+def _clean_partial_fields(data: dict) -> dict:
+    """Keep only the analysis fields the report renderer understands."""
+    out = {}
+    verdict = data.get("verdict")
+    if isinstance(verdict, str) and verdict.strip():
+        out["verdict"] = verdict.strip()
+    for key in ("coverage_gaps", "next_recon"):
+        rows = data.get(key)
+        if isinstance(rows, list):
+            kept = [str(x).strip() for x in rows if str(x).strip() and not isinstance(x, (dict, list))]
+            if kept:
+                out[key] = kept
+    leads = data.get("leads")
+    if isinstance(leads, list):
+        kept = [x for x in leads if isinstance(x, dict) and (x.get("title") or x.get("why") or x.get("asset"))]
+        if kept:
+            out["leads"] = kept
+    dismissed = data.get("dismissed")
+    if isinstance(dismissed, list):
+        kept = []
+        for x in dismissed:
+            if isinstance(x, dict) and (x.get("item") or x.get("why")):
+                kept.append({"item": str(x.get("item") or ""), "why": str(x.get("why") or "")})
+            elif isinstance(x, str) and x.strip():
+                kept.append({"item": x.strip(), "why": ""})
+        if kept:
+            out["dismissed"] = kept
+    return out
+
+
+def _partial_cli_result(text: str, thinking: str, model: str, effort: str,
+                        elapsed: float, ev_bytes: int, question: str) -> dict:
+    """A report-shaped result from whatever the model had written when Stop was hit."""
+    meta = _stopped_meta(model, effort, elapsed, ev_bytes)
+    thinking = (thinking or "").strip()
+    text = text or ""
+    if question.strip():
+        out = {"meta": meta, "kind": "answer", "question": question.strip(),
+               "answer": text.strip(), "partial": True, "stopped": True}
+        if thinking:
+            out["thinking"] = thinking
+        return out
+    salvaged, tail = _salvage_partial_json(text)
+    out = {"meta": meta, "kind": "analysis", "partial": True, "stopped": True}
+    out.update(_clean_partial_fields(salvaged or {}))
+    if tail.strip():
+        out["draft"] = tail.strip()
+    elif not _partial_has_content(out) and text.strip():
+        out["draft"] = text.strip()
+    if thinking:
+        out["thinking"] = thinking
+    return out
+
+
+def _stopped_before_model(question: str) -> dict:
+    """Stop landed while the evidence pack was still being built."""
+    meta = _stopped_meta()
+    if question.strip():
+        return {"meta": meta, "kind": "answer", "question": question.strip(),
+                "answer": "", "partial": True, "stopped": True,
+                "stopped_during": "evidence"}
+    return {"meta": meta, "kind": "analysis", "partial": True, "stopped": True,
+            "stopped_during": "evidence"}
+
+
+def _stop_ai_proc(proc):
+    """Stop the claude process and the children it spawned in its own session."""
+    if proc is None or proc.poll() is not None:
+        return
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(1.2)
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def analyze_via_cli_stream(evidence: dict, cfg: dict = None, question: str = "",
                            on_event=None):
     """analyze_via_cli, but reporting progress token by token as it happens.
@@ -751,12 +1180,19 @@ def analyze_via_cli_stream(evidence: dict, cfg: dict = None, question: str = "",
                    f"evidence {len(ev_json) // 1024}KB")
 
     t0 = time.time()
+    if _AI_STOP.is_set():
+        return _partial_cli_result("", "", model, effort, 0, len(ev_json), question)
     try:
+        # Own session so Stop can kill claude and its children without
+        # signalling the report bridge.
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1,
-                                env=_cli_env())
+                                env=_cli_env(), start_new_session=True)
     except OSError as e:
         raise AIError(f"could not run the claude CLI: {e}") from e
+
+    with _AI_PROC_LOCK:
+        _AI_PROC["proc"] = proc
 
     # The prompt is >100KB, so writing it can block until the child starts
     # draining; do it off the reader thread.
@@ -769,9 +1205,14 @@ def analyze_via_cli_stream(evidence: dict, cfg: dict = None, question: str = "",
     threading.Thread(target=_feed, daemon=True).start()
 
     envelope = None
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
     deadline = t0 + timeout
     try:
         for line in proc.stdout:
+            if _AI_STOP.is_set():
+                _stop_ai_proc(proc)
+                break
             if time.time() > deadline:
                 _kill_proc(proc)
                 raise AIError(f"the claude CLI did not finish within {timeout}s")
@@ -789,27 +1230,48 @@ def analyze_via_cli_stream(evidence: dict, cfg: dict = None, question: str = "",
                     delta = ev.get("delta") or {}
                     dtype = delta.get("type")
                     if dtype == "thinking_delta" and delta.get("thinking"):
+                        thinking_parts.append(delta["thinking"])
                         emit("thinking", delta["thinking"])
                     elif dtype == "text_delta" and delta.get("text"):
+                        text_parts.append(delta["text"])
                         emit("text", delta["text"])
                 elif ev.get("type") == "message_stop":
                     emit("status", "finishing…")
             elif rtype == "result":
                 envelope = rec
+    except Exception:
+        if not _AI_STOP.is_set():
+            raise
     finally:
+        with _AI_PROC_LOCK:
+            if _AI_PROC.get("proc") is proc:
+                _AI_PROC["proc"] = None
+        if _AI_STOP.is_set():
+            _stop_ai_proc(proc)
         try:
-            proc.wait(10)
+            proc.wait(2 if _AI_STOP.is_set() else 10)
         except Exception:
             _kill_proc(proc)
 
     elapsed = round(time.time() - t0, 1)
-    if envelope is None:
-        stderr = (proc.stderr.read() if proc.stderr else "") or ""
-        raise AIError("the claude CLI produced no result"
-                      + (f": {stderr.strip().splitlines()[-1][:250]}"
-                         if stderr.strip() else ""))
-    return _cli_envelope_to_result(envelope, model, effort, elapsed,
-                                   len(ev_json), question)
+    if envelope is not None and not _AI_STOP.is_set():
+        return _cli_envelope_to_result(envelope, model, effort, elapsed,
+                                       len(ev_json), question)
+    if _AI_STOP.is_set():
+        # A result line that landed in the same breath as Stop is a finished
+        # review; prefer it. Otherwise keep the text already streamed.
+        if envelope is not None and str(envelope.get("result") or "").strip():
+            try:
+                return _cli_envelope_to_result(envelope, model, effort, elapsed,
+                                               len(ev_json), question)
+            except AIError:
+                pass
+        return _partial_cli_result("".join(text_parts), "".join(thinking_parts),
+                                   model, effort, elapsed, len(ev_json), question)
+    stderr = (proc.stderr.read() if proc.stderr else "") or ""
+    raise AIError("the claude CLI produced no result"
+                  + (f": {stderr.strip().splitlines()[-1][:250]}"
+                     if stderr.strip() else ""))
 
 
 def _kill_proc(proc):
@@ -1314,19 +1776,26 @@ _SCAN_DIR: Path = None
 _CFG: dict = {}
 _LAST_HIT = [0.0]
 _BUSY = threading.Lock()
+# Set by POST /api/analyze/stop. The stream watches it and keeps whatever the
+# model has already written instead of throwing that work away.
+_AI_STOP = threading.Event()
+_AI_PROC_LOCK = threading.Lock()
+_AI_PROC = {"proc": None}
 
 # ── On-demand scans (report's Scan panel) ───────────────────────────────────
-# XSS and Nuclei also run in the default pass. Every card here is a ReconX stage
-# re-run (or a first run, for ports/redirect/CORS) against this session, launched as
+# Deep analysis and active tests run from the report, after recon has written
+# the corpus. Network/port also runs in the recon pass; its card re-runs it.
+# Each card is one ReconX stage:
 #   reconX.py --session-dir <dir> --stageN [--check X] --auto --no-ai
-# so the whole cap/timeout/proof logic in reconX.py is reused, never duplicated.
-# One scan at a time: two concurrent `reconX.py` runs on the same session would
+# One scan at a time: two concurrent reconX.py runs on the same session would
 # race state.json and report.html.
 SCAN_TYPES = {
-    "xss":          {"stage": 6,  "label": "XSS (Dalfox)",              "metric": ("stage6",  "findings")},
-    "nuclei":       {"stage": 7,  "label": "Nuclei",                    "metric": ("stage7",  "findings")},
-    "network":      {"stage": 14, "label": "Network / Port (naabu→nmap)","metric": ("stage14", "open_ports_total")},
+    "js":           {"stage": 10, "label": "JS Analysis",               "metric": ("stage10", "secrets")},
+    "api":          {"stage": 13, "label": "API Discovery",             "metric": ("stage13", "live_hits")},
+    "xss":          {"stage": 6,  "label": "XSS Testing",               "metric": ("stage6",  "findings")},
+    "nuclei":       {"stage": 7,  "label": "Template Scan",             "metric": ("stage7",  "findings")},
     "openredirect": {"stage": 15, "label": "Open Redirect",             "metric": ("stage15", "findings")},
+    "network":      {"stage": 14, "label": "Network / Port",            "metric": ("stage14", "open_ports_total")},
     "cors":         {"stage": 12, "check": "cors",     "label": "CORS",               "metric": ("stage12", "cors_vulnerable")},
     "takeover":     {"stage": 12, "check": "takeover", "label": "Subdomain Takeover", "metric": ("stage12", "takeover_vulnerable")},
     "bucket":       {"stage": 12, "check": "bucket",   "label": "Cloud Bucket",       "metric": ("stage12", "bucket_public")},
@@ -1341,29 +1810,241 @@ def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s or "")
 
 
-def _kill_group(proc):
-    """SIGTERM the child's process group, escalate to SIGKILL after a grace
-    period. start_new_session=True gives the child its own group, so this also
-    reaches the tools (naabu/nmap/nuclei/dalfox) it spawned."""
-    if not proc:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except Exception:
+_PROGRESS_HUMAN_RE = re.compile(r"^…\s+STAGE\s+\d+\s+")
+
+
+def _classify_scan_line(line: str):
+    """Split a reconX stdout line into a Scan Center event.
+
+    RXPROGRESS is the pinned done/total/remaining payload. The human twin of
+    that line (prefixed with …) is not repeated in the scrolling console.
+    """
+    clean = _strip_ansi(line).replace("\r", "").strip()
+    if not clean:
+        return "skip", None
+    if clean.startswith("RXPROGRESS "):
         try:
-            proc.terminate()
+            obj = json.loads(clean[len("RXPROGRESS "):])
+        except Exception:
+            return "log", clean
+        if isinstance(obj, dict):
+            return "progress", public_payload(obj)
+        return "log", public_text(clean)
+    # The startup logo is many lines and is not a stage or a tool result.
+    if any(ch in clean for ch in "█╔╗╚╝║"):
+        return "skip", None
+    if clean.startswith("ReconX") and "Sequential" in clean:
+        return "skip", None
+    if "linkedin.com/in/2u1fuk4r" in clean:
+        return "skip", None
+    return "log", public_text(clean)
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def _descendant_pids(root: int) -> list:
+    """Every process whose parent chain leads to root.
+
+    Scanners are started with start_new_session, so they are not in the
+    reconX process group. A signal sent only to that group leaves nuclei,
+    dalfox and the rest running."""
+    children = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+                stat = fh.read()
+        except OSError:
+            continue
+        rpar = stat.rfind(")")
+        if rpar < 0:
+            continue
+        fields = stat[rpar + 2:].split()
+        if len(fields) < 2:
+            continue
+        try:
+            ppid = int(fields[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    out = []
+    stack = [root]
+    seen = {root}
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def _session_scanner_pids() -> list:
+    """Stage scans for this session, including one a previous bridge lost."""
+    if not _SCAN_DIR:
+        return []
+    root = str(_SCAN_DIR)
+    found = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    me = os.getpid()
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        if "reconX.py" in cmd and "--stage" in cmd and root in cmd:
+            found.append(pid)
+    return found
+
+
+def _reported_active():
+    """Scan type the page should treat as running.
+
+    A bridge restart used to forget the child, so Stop had nothing to signal
+    and the template scan kept going. The process is still this session's.
+    """
+    with _SCAN_LOCK:
+        active = _SCAN_ACTIVE[0]
+    if active:
+        return active
+    for pid in _session_scanner_pids():
+        cmd = _proc_cmdline(pid)
+        stage_m = re.search(r"--stage(\d+)", cmd)
+        if not stage_m:
+            continue
+        stage = int(stage_m.group(1))
+        check_m = re.search(r"--check\s+(\S+)", cmd)
+        check = check_m.group(1) if check_m else ""
+        for name, spec in SCAN_TYPES.items():
+            if spec["stage"] == stage and spec.get("check", "") == check:
+                return name
+        for name, spec in SCAN_TYPES.items():
+            if spec["stage"] == stage and not spec.get("check"):
+                return name
+    return None
+
+
+def _kill_pid_tree(root: int, grace: float = 1.5):
+    """SIGTERM every process group under root, then SIGKILL whatever remains."""
+    if root <= 0:
+        return
+    pids = [root] + _descendant_pids(root)
+    try:
+        mine = os.getpgrp()
+    except Exception:
+        mine = None
+    groups = set()
+    for pid in pids:
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+        if mine is not None and pgid == mine:
+            continue
+        groups.add(pgid)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         except Exception:
             pass
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if not Path(f"/proc/{root}").exists():
+            break
+        time.sleep(0.1)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+
+def _kill_group(proc, grace: float = 1.5):
+    """Stop the scan process and the tools it spawned in their own sessions."""
+    if not proc:
+        return
+    _kill_pid_tree(proc.pid, grace=grace)
     try:
-        proc.wait(timeout=8)
+        proc.wait(timeout=2)
     except Exception:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.kill()
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            pass
+
+
+def _signal_pid(pid: int, sig: int):
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        pass
+
+
+def _stop_scan_process(proc, extra_pids, grace: float = 50.0) -> bool:
+    """Stop a report scan without throwing away what it has already found.
+
+    SIGTERM on ReconX raises its hard-stop flag. The running stage then drops
+    the tool, keeps every finding already written, and rewrites report.html
+    before it exits. Scanner children are killed so a blocked read unblocks.
+    ReconX itself is left alive until that report step finishes, or until
+    grace expires.
+    """
+    root = None
+    if proc is not None and proc.poll() is None:
+        root = proc.pid
+    elif extra_pids:
+        root = extra_pids[0]
+    if not root:
+        return False
+    children = [pid for pid in _descendant_pids(root) if pid != root]
+    for pid in children:
+        _signal_pid(pid, signal.SIGTERM)
+    _signal_pid(root, signal.SIGTERM)
+    time.sleep(1.5)
+    for pid in children:
+        if Path(f"/proc/{pid}").exists():
+            _signal_pid(pid, signal.SIGKILL)
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return True
+        if not Path(f"/proc/{root}").exists():
+            return True
+        time.sleep(0.25)
+    _kill_pid_tree(root, grace=0.4)
+    if proc is not None:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    return True
 
 
 def _scan_state_snapshot() -> dict:
@@ -1398,6 +2079,139 @@ def _scan_state_snapshot() -> dict:
             "tool_error": bool(s.get("tool_failed")),
         }
     return out
+
+
+def _report_is_stale() -> bool:
+    """True when a scan has written results newer than the HTML on disk."""
+    report = _SCAN_DIR / "report.html"
+    if not report.exists():
+        return True
+    stamp = report.stat().st_mtime
+    watched = (
+        "SUMMARY.json",
+        "07_xss/dalfox_scan.json",
+        "07_xss/dalfox_per_url",
+        "07_xss/xss_targets_tested.txt",
+        "07_nuclei/nuclei_scan.json",
+        "10_js/js_secrets.json",
+        "12_extra/extra_results.json",
+        "13_api/api_results.json",
+        "14_network/network_results.json",
+        "15_open_redirect/open_redirect_results.json",
+        "ai_analysis.json",
+    )
+    for name in ("report_builder.py", "reconx_ai.py", "reconX.py", "reconx_labels.py"):
+        src = BASE_DIR / name
+        try:
+            if src.exists() and src.stat().st_mtime > stamp + 1:
+                return True
+        except OSError:
+            continue
+    for rel in watched:
+        path = _SCAN_DIR / rel
+        try:
+            if path.exists() and path.stat().st_mtime > stamp + 1:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+_REPORT_LOCK = threading.Lock()
+
+
+def _refresh_report_from_disk():
+    """Rebuild report.html from the files already on disk.
+
+    A stopped scan rarely reaches its own report step before the process is
+    torn down. This pass runs after the child has exited, in a separate
+    process, so every flushed result is folded into the report the page
+    reloads.
+    """
+    scan_dir = _SCAN_DIR
+    if not scan_dir or not Path(scan_dir).is_dir():
+        return
+    target = ""
+    summary = Path(scan_dir) / "SUMMARY.json"
+    try:
+        if summary.exists():
+            target = str((json.loads(summary.read_text(encoding="utf-8", errors="replace")) or {}).get("target") or "")
+    except Exception:
+        target = ""
+    if not target:
+        target = Path(scan_dir).name
+    try:
+        subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from pathlib import Path; from report_builder import build_report; "
+             "build_report(Path(sys.argv[1]), sys.argv[2])",
+             str(scan_dir), target],
+            cwd=str(BASE_DIR),
+            timeout=300,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+_SCOPE_HOSTS = None
+_EXCHANGE_CACHE = {}
+_EXCHANGE_HTTP = None
+
+
+def _exchange_http():
+    """Shared client so a second click to the same host reuses the connection."""
+    global _EXCHANGE_HTTP
+    if _EXCHANGE_HTTP is None:
+        import requests
+        import urllib3
+        urllib3.disable_warnings()
+        session = requests.Session()
+        session.trust_env = False
+        _EXCHANGE_HTTP = session
+    return _EXCHANGE_HTTP
+
+
+def _host_in_scan(host: str) -> bool:
+    """True when the host is the scan target or one of its discovered names."""
+    global _SCOPE_HOSTS
+    host = (host or "").lower().strip(".")
+    if not host:
+        return False
+    if _SCOPE_HOSTS is None:
+        found = set()
+        summary = _SCAN_DIR / "SUMMARY.json"
+        try:
+            if summary.exists():
+                target = str((json.loads(summary.read_text(encoding="utf-8", errors="replace")) or {}).get("target") or "")
+                apex = target.split("://")[-1].split("/")[0].split(":")[0].lower().strip(".")
+                if apex:
+                    found.add(apex)
+        except Exception:
+            pass
+        for rel in ("checkpoints/stage2_subdomains.txt", "checkpoints/stage3_alive.txt",
+                    "02_subdomains/all.txt", "03_alive/alive_hosts.txt"):
+            path = _SCAN_DIR / rel
+            try:
+                if not path.exists():
+                    continue
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    name = line.split("://")[-1].split("/")[0].split(":")[0].lower().strip(".")
+                    if name:
+                        found.add(name)
+            except OSError:
+                continue
+        _SCOPE_HOSTS = found
+    if host in _SCOPE_HOSTS:
+        return True
+    for known in _SCOPE_HOSTS:
+        if host.endswith("." + known):
+            return True
+    return False
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1458,7 +2272,31 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._json(403, {"error": "bad token"})
             return self._json(200, {"scans": _scan_state_snapshot(),
-                                    "active": _SCAN_ACTIVE[0]})
+                                    "active": _reported_active()})
+
+        if path == "/api/scan/log":
+            if not self._authed():
+                return self._json(403, {"error": "bad token"})
+            lines = []
+            total = 0
+            logf = _SCAN_DIR / "scan_console.log"
+            try:
+                if logf.exists():
+                    all_lines = logf.read_text(encoding="utf-8", errors="replace").splitlines()
+                    total = len(all_lines)
+                    lines = all_lines[-1500:]
+            except OSError:
+                lines = []
+                total = 0
+            progress = None
+            pf = _SCAN_DIR / "scan_progress.json"
+            try:
+                if pf.exists():
+                    progress = json.loads(pf.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                progress = None
+            return self._json(200, {"lines": lines, "total": total,
+                                    "active": _reported_active(), "progress": progress})
 
         return self._serve_static(path)
 
@@ -1475,12 +2313,16 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/analyze/stream":
             return self._do_stream()
+        if path == "/api/analyze/stop":
+            return self._stop_analysis()
         if path == "/api/scan/start":
             return self._start_scan()
         if path == "/api/scan/stop":
             return self._stop_scan()
         if path == "/api/retest":
             return self._retest()
+        if path == "/api/exchange":
+            return self._exchange()
         if path != "/api/analyze":
             return self._json(404, {"error": "not found"})
         if not self._authed():
@@ -1560,41 +2402,112 @@ class _Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ValueError):
                     raise                       # client navigated away
 
+        evidence_thread = None
+
+        def persist(result):
+            # A follow-up question must not replace the saved review. Stopping
+            # before the model has written anything must not wipe one either.
+            if question or result.get("stopped_during") == "evidence":
+                return
+            if result.get("stopped") and not _partial_has_content(result):
+                return
+            try:
+                (_SCAN_DIR / RESULT_FILE).write_text(
+                    json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
         try:
+            _AI_STOP.clear()
             send({"t": "status", "v": "building evidence pack…"})
-            ev = build_evidence(_SCAN_DIR,
-                                redact_secrets=bool(_ai_cfg(_CFG, "redact_secrets", True)))
+            box = {}
+
+            def _build():
+                try:
+                    box["ev"] = build_evidence(
+                        _SCAN_DIR,
+                        redact_secrets=bool(_ai_cfg(_CFG, "redact_secrets", True)))
+                except Exception as e:  # noqa: BLE001
+                    box["err"] = e
+
+            evidence_thread = threading.Thread(target=_build, daemon=True)
+            evidence_thread.start()
+            while evidence_thread.is_alive():
+                if _AI_STOP.is_set():
+                    break
+                evidence_thread.join(0.25)
+            if _AI_STOP.is_set() and "ev" not in box:
+                result = _stopped_before_model(question)
+                persist(result)
+                send({"t": "done", "v": result})
+                return
+
+            evidence_thread.join()
+            if "err" in box:
+                raise box["err"]
+            ev = box.get("ev")
+            if ev is None:
+                raise AIError("evidence pack was not built")
             try:
                 (_SCAN_DIR / EVIDENCE_FILE).write_text(
                     json.dumps(ev, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
+            if _AI_STOP.is_set():
+                result = _stopped_before_model(question)
+                persist(result)
+                send({"t": "done", "v": result})
+                return
 
             result = analyze_via_cli_stream(
                 ev, cfg=_CFG, question=question,
                 on_event=lambda kind, payload: send({"t": kind, "v": payload}))
 
-            if not question:
-                try:
-                    (_SCAN_DIR / RESULT_FILE).write_text(
-                        json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
+            persist(result)
             send({"t": "done", "v": result})
         except AIError as e:
             try:
                 send({"t": "error", "v": str(e)})
             except Exception:
                 pass
-        except (BrokenPipeError, ConnectionResetError, ValueError):
+        except (BrokenPipeError, ConnectionResetError):
             pass                                # the page went away mid-run
+        except ValueError as e:
+            # wfile.write raises ValueError once the browser has gone. Any
+            # other ValueError is a real failure and must reach the panel.
+            if "closed file" not in str(e).lower():
+                try:
+                    send({"t": "error", "v": f"{type(e).__name__}: {e}"})
+                except Exception:
+                    pass
         except Exception as e:  # noqa: BLE001
             try:
                 send({"t": "error", "v": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
         finally:
+            # After Stop, don't hold the slot open for a pack that is still
+            # being built in the background. The next Run can start at once.
+            if (evidence_thread is not None and evidence_thread.is_alive()
+                    and not _AI_STOP.is_set()):
+                evidence_thread.join(timeout=180)
             _BUSY.release()
+
+    def _stop_analysis(self):
+        """Stop the running review and let the stream emit what it has so far."""
+        if not self._authed():
+            return self._json(403, {"error": "bad token"})
+        if not _BUSY.locked() and not _AI_STOP.is_set():
+            with _AI_PROC_LOCK:
+                proc = _AI_PROC.get("proc")
+            if proc is None or proc.poll() is not None:
+                return self._json(200, {"stopped": False, "reason": "no analysis running"})
+        _AI_STOP.set()
+        with _AI_PROC_LOCK:
+            proc = _AI_PROC.get("proc")
+        if proc is not None:
+            _stop_ai_proc(proc)
+        return self._json(200, {"stopped": True})
 
     # ── on-demand scans ────────────────────────────────────────────────────────
     def _stop_scan(self):
@@ -1602,10 +2515,29 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "bad token"})
         with _SCAN_LOCK:
             proc, active = _SCAN_PROC[0], _SCAN_ACTIVE[0]
-        if not proc or not active:
+        pids = []
+        if proc is not None and proc.poll() is None:
+            pids.append(proc.pid)
+        for pid in _session_scanner_pids():
+            if pid not in pids:
+                pids.append(pid)
+        if (proc is None or proc.poll() is not None) and not pids:
             return self._json(200, {"stopped": False, "reason": "no scan running"})
-        _kill_group(proc)
-        return self._json(200, {"stopped": True, "type": active})
+
+        # Signal now, answer the browser now. Waiting here used to freeze the
+        # Live Output panel for up to a minute while ReconX wrote the report.
+        def _finish():
+            try:
+                _stop_scan_process(proc, pids, grace=45.0)
+            finally:
+                with _REPORT_LOCK:
+                    try:
+                        _refresh_report_from_disk()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_finish, daemon=True, name="reconx-scan-stop").start()
+        return self._json(200, {"stopped": True, "type": active or "scan"})
 
     def _start_scan(self):
         """Launch one ReconX scan stage against this recon session and stream
@@ -1653,8 +2585,31 @@ class _Handler(BaseHTTPRequestHandler):
             gone[0] = True
 
         proc = None
+        logfh = None
         try:
             send({"t": "status", "v": f"starting {spec['label']}…"})
+            logf = _SCAN_DIR / "scan_console.log"
+            progf = _SCAN_DIR / "scan_progress.json"
+            try:
+                logf.write_text("", encoding="utf-8")
+                progf.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                logfh = logf.open("a", encoding="utf-8")
+            except OSError:
+                logfh = None
+
+            def note(line: str):
+                if logfh is None:
+                    return
+                try:
+                    logfh.write(line + "\n")
+                    logfh.flush()
+                except OSError:
+                    pass
+
+            note(f"=== starting {spec['label']}… ===")
             argv = [sys.executable, str(BASE_DIR / "reconX.py"),
                     "--session-dir", str(_SCAN_DIR),
                     f"--stage{spec['stage']}", "--auto", "--no-ai"]
@@ -1665,6 +2620,9 @@ class _Handler(BaseHTTPRequestHandler):
             # reconX is spawned with a pipe for stdout. Without this, Python
             # block-buffers prints and the Scan Center stays blank for minutes.
             env["PYTHONUNBUFFERED"] = "1"
+            # The report is already open in this bridge. Rewrite report.html
+            # in place; do not open a second browser tab when the stage ends.
+            env["RECONX_REPORT_IN_PLACE"] = "1"
             proc = subprocess.Popen(
                 argv, cwd=str(BASE_DIR), env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1674,11 +2632,27 @@ class _Handler(BaseHTTPRequestHandler):
 
             for line in proc.stdout:
                 _LAST_HIT[0] = time.time()
-                send({"t": "log", "v": _strip_ansi(line.rstrip("\n"))})
+                kind, data = _classify_scan_line(line)
+                if kind == "progress":
+                    try:
+                        progf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    except OSError:
+                        pass
+                    send({"t": "progress", "v": data})
+                elif kind == "log":
+                    note(data)
+                    send({"t": "log", "v": data})
             rc = proc.wait()
 
+            note(f"=== scan finished (rc={rc}) — saving into the report ===")
+            send({"t": "status", "v": "saving everything collected so far into the report…"})
+            with _REPORT_LOCK:
+                _refresh_report_from_disk()
             snap = _scan_state_snapshot().get(scan_type, {})
-            send({"t": "done", "v": {"rc": rc, "type": scan_type, "state": snap}})
+            send({"t": "done", "v": {
+                "rc": rc, "type": scan_type, "state": snap,
+                "stopped": bool(rc not in (0, None) and snap.get("status") in ("partial", "tool_error", "")),
+            }})
         except (BrokenPipeError, ConnectionResetError, ValueError):
             pass
         except Exception as e:  # noqa: BLE001
@@ -1687,6 +2661,11 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
+            if logfh is not None:
+                try:
+                    logfh.close()
+                except OSError:
+                    pass
             with _SCAN_LOCK:
                 _SCAN_PROC[0] = None
                 _SCAN_ACTIVE[0] = None
@@ -1728,8 +2707,73 @@ class _Handler(BaseHTTPRequestHandler):
             ctype = (headers.get("Content-Type") or "")[:80]
         return self._json(200, {"status": status, "location": loc, "content_type": ctype})
 
+    def _exchange(self):
+        """One GET of a URL that already belongs to this scan. Shows the
+        request we sent and the response that came back. Redirects stay as
+        headers so the history matches what the server returned."""
+        if not self._authed():
+            return self._json(403, {"error": "bad token"})
+        url = str((self._read_body() or {}).get("url") or "").strip()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().strip(".")
+        if parsed.scheme not in ("http", "https") or not host or len(url) > 2000:
+            return self._json(400, {"error": "http(s) URL required"})
+        if not _host_in_scan(host):
+            return self._json(403, {"error": "that host is not in this scan"})
+        cached = _EXCHANGE_CACHE.get(url)
+        if cached and (time.time() - cached[0]) < 180:
+            return self._json(200, cached[1])
+        import urllib3.util.connection as _u3c
+        _u3c.allowed_gai_family = lambda: socket.AF_INET
+        sent_host = host if not parsed.port else f"{host}:{parsed.port}"
+        req_text = "GET " + (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "") + " HTTP/1.1\n"
+        req_text += f"Host: {sent_host}\nUser-Agent: ReconX-proxy\nAccept: */*\n"
+        status = 0
+        headers = None
+        raw = b""
+        err = ""
+        try:
+            resp = _exchange_http().get(
+                url, timeout=(2.5, 5), stream=True, allow_redirects=False, verify=False,
+                headers={"User-Agent": "ReconX-proxy", "Accept": "*/*"},
+            )
+            status = int(resp.status_code or 0)
+            headers = resp.headers
+            for chunk in resp.iter_content(4096):
+                if not chunk:
+                    break
+                raw += chunk
+                if len(raw) >= 16_384:
+                    break
+            resp.close()
+        except Exception as e:
+            err = str(e)[:300]
+        if err and status == 0:
+            payload = {"request": req_text, "response": err}
+            return self._json(200, payload)
+        hdr = ""
+        if headers:
+            hdr = "".join(f"{k}: {v}\n" for k, v in headers.items())
+        ctype = (headers.get("Content-Type") or "").lower() if headers else ""
+        if raw and ctype and not any(t in ctype for t in ("text", "json", "xml", "javascript", "html", "svg")):
+            body = f"({len(raw)} bytes, {ctype.split(';')[0]})"
+        else:
+            body = raw.decode("utf-8", errors="replace")
+            if len(raw) >= 16_384:
+                body += "\n… truncated"
+        payload = {"request": req_text, "response": f"HTTP {status}\n{hdr}\n{body}"}
+        _EXCHANGE_CACHE[url] = (time.time(), payload)
+        if len(_EXCHANGE_CACHE) > 80:
+            oldest = min(_EXCHANGE_CACHE, key=lambda k: _EXCHANGE_CACHE[k][0])
+            _EXCHANGE_CACHE.pop(oldest, None)
+        return self._json(200, payload)
+
     # ── static ───────────────────────────────────────────────────────────────
     def _serve_report(self):
+        if _report_is_stale():
+            with _REPORT_LOCK:
+                if _report_is_stale():
+                    _refresh_report_from_disk()
         rp = _SCAN_DIR / "report.html"
         if not rp.exists():
             return self._send(404, b"report.html not found", "text/plain; charset=utf-8")

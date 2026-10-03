@@ -4,8 +4,8 @@ import atexit, os, sys, re, json, yaml, time, logging, argparse, html, sqlite3, 
 import subprocess, shutil, threading, signal, shlex, csv, tempfile
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, unquote, urljoin
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
 # v6.9: stdout/stderr kodlamasini UTF-8'e zorla. cp1252 (Windows) veya C-locale
 #       (Linux/CI) ortamlarinda unicode banner/turkce karakterler
@@ -55,11 +55,16 @@ class C:
     MAGENTA = "\033[95m"
     WHITE   = "\033[97m"
 
-def info(m):  print(f"{C.BLUE}[*]{C.RESET} {m}", flush=True)
-def ok(m):    print(f"{C.GREEN}[✓]{C.RESET} {m}", flush=True)
-def warn(m):  print(f"{C.YELLOW}[!]{C.RESET} {m}", flush=True)
-def err(m):   print(f"{C.RED}[✗]{C.RESET} {m}", flush=True)
-def sub(m):   print(f"  {C.DIM}→{C.RESET} {m}", flush=True)
+# What the operator sees. The binary name stays in the log file and on disk;
+# the console, the progress line and Scan Center say what the step is doing.
+from reconx_labels import public_activity as _public_activity, public_text as _public_text
+
+
+def info(m):  print(f"{C.BLUE}[*]{C.RESET} {_public_text(m)}", flush=True)
+def ok(m):    print(f"{C.GREEN}[✓]{C.RESET} {_public_text(m)}", flush=True)
+def warn(m):  print(f"{C.YELLOW}[!]{C.RESET} {_public_text(m)}", flush=True)
+def err(m):   print(f"{C.RED}[✗]{C.RESET} {_public_text(m)}", flush=True)
+def sub(m):   print(f"  {C.DIM}→{C.RESET} {_public_text(m)}", flush=True)
 
 # v8.3: shared with _stream_tool()'s spinner thread so a live XSS-hit print
 # (see xss_live_hit below, called from a background reader thread while
@@ -107,32 +112,445 @@ def xss_live_hit(rec: dict):
 # garbling the menu/input() prompt with a \r-based frame mid-write.
 _SPINNER_PAUSE = threading.Event()
 
-def _spinner(stop_evt: threading.Event, label: str):
+# Set by stage() so every tool spinner can say which stage it belongs to.
+# Stages run one at a time, so a single slot is the current stage.
+_STAGE_CTX = {"n": None, "title": ""}
+# Pace of the current stage's per-item loop (arjun, nmap -sV). One run_cmd
+# is one item, so this process's own elapsed is not the average.
+_JOB_CLOCK = {"n": 0, "sec": 0.0}
+
+# Tools whose own stats line is "hosts finished / hosts queued". Until the
+# first stats line arrives, the input list size is a usable total.
+_HOST_PROGRESS_TOOLS = {"httpx", "dnsx", "naabu"}
+
+_HOSTS_PROGRESS_RE = re.compile(
+    r"Hosts:\s*([\d,]+)\s*/\s*([\d,]+)", re.I)
+_REQUESTS_PROGRESS_RE = re.compile(
+    r"Requests:\s*([\d,]+)\s*/\s*([\d,]+)", re.I)
+_RPS_RE = re.compile(r"\bRPS:\s*([\d,.]+)", re.I)
+_MATCHED_RE = re.compile(r"Matched:\s*([\d,]+)", re.I)
+_HOSTS_PLAIN_RE = re.compile(r"Hosts:\s*([\d,]+)(?!\s*/)", re.I)
+_TEMPLATES_RE = re.compile(r"Templates:\s*([\d,]+)", re.I)
+_BAR_PROGRESS_RE = re.compile(
+    r"(\d[\d,]*)\s+/\s+(\d[\d,]*)\s+.*?(\d+(?:\.\d+)?)\s*%")
+_NMAP_PHASE_RE = re.compile(r"Stats:.*undergoing\s+(.+)$", re.I)
+_NMAP_PCT_RE = re.compile(r"About\s+([\d.]+)%\s+done", re.I)
+_NMAP_INIT_RE = re.compile(r"^Initiating\s+(.+?)(?:\s+at\b|$)", re.I)
+_ARJUN_CHUNK_RE = re.compile(r"Processing chunks:\s*(\d+)\s*/\s*(\d+)", re.I)
+_NMAP_LEFT_RE = re.compile(r"\(([0-9:]+)\s+remaining\)", re.I)
+_STATUS_FRAC_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+class _Live:
+    """One stage's current subprocess. The reader thread writes it; the
+    spinner only reads it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.done = None
+        self.total = None
+        self.unit = ""
+        self.item = ""
+        self.rate = ""
+        self.note = ""
+        self.lines = 0
+        self.last_move = time.time()
+        self.job_locked = False
+        self.percent_only = False
+
+    def set_job(self, index, total, unit="", item=""):
+        with self.lock:
+            self.job_locked = True
+            self.percent_only = False
+            self.done = max(0, int(index) - 1)
+            self.total = max(0, int(total))
+            self.unit = unit or ""
+            self.item = (item or "")[:72]
+
+    def set_tool(self, done, total, unit="", rate="", note=""):
+        with self.lock:
+            if self.job_locked:
+                bits = []
+                if total:
+                    bits.append(f"{int(done):,}/{int(total):,}" + (f" {unit}" if unit else ""))
+                if note:
+                    bits.append(note)
+                if bits:
+                    self.note = " · ".join(bits)[:120]
+                if rate:
+                    self.rate = rate
+                return
+            self.percent_only = False
+            self.done = int(done)
+            self.total = int(total) if total else None
+            if unit:
+                self.unit = unit
+            if rate:
+                self.rate = rate
+            if note is not None:
+                self.note = (note or "")[:140]
+
+    def set_percent(self, pct, note=""):
+        with self.lock:
+            if self.job_locked:
+                extra = f"{float(pct):.0f}%"
+                if note:
+                    extra += "  " + note
+                self.note = extra[:120]
+                return
+            self.percent_only = True
+            self.done = int(round(float(pct)))
+            self.total = 100
+            if note:
+                self.note = note[:140]
+
+    def snapshot(self):
+        with self.lock:
+            return (self.done, self.total, self.unit, self.item,
+                    self.rate, self.note, self.lines, self.percent_only,
+                    self.job_locked, self.last_move)
+
+    def bump_line(self):
+        with self.lock:
+            self.lines += 1
+            self.last_move = time.time()
+
+
+def _fmt_clock(sec) -> str:
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _parse_count(raw) -> int:
+    return int(str(raw).replace(",", "").split(".", 1)[0] or 0)
+
+
+def _cmd_argv(cmd):
+    if isinstance(cmd, (list, tuple)):
+        return [str(a) for a in cmd]
+    try:
+        return shlex.split(str(cmd))
+    except Exception:
+        return str(cmd).split()
+
+
+def _tool_name(cmd) -> str:
+    argv = _cmd_argv(cmd)
+    return Path(argv[0]).name if argv else "cmd"
+
+
+def _input_list_count(cmd, stdin_file=None) -> int:
+    argv = _cmd_argv(cmd)
+    for i, arg in enumerate(argv):
+        if arg in ("-l", "-list", "--list") and i + 1 < len(argv):
+            path = Path(argv[i + 1])
+            if path.is_file():
+                n = _count_lines(path)
+                if n > 0:
+                    return n
+    if stdin_file:
+        n = _count_lines(stdin_file)
+        if n > 0:
+            return n
+    return 0
+
+
+def _stats_cli(help_text: str, interval: int = 2) -> str:
+    """Flags that make a ProjectDiscovery tool print a periodic stats line.
+    -si is only added when this build actually documents it."""
+    text = help_text or ""
+    if "-stats" not in text:
+        return ""
+    flags = "-stats"
+    if "-stats-interval" in text or "-si" in text:
+        flags += f" -si {max(1, int(interval))}"
+    return flags + " "
+
+
+def _seed_live(live: _Live, cmd, stdin_file=None, job=None):
+    if job and job.get("total"):
+        live.set_job(job.get("index") or 1, job.get("total") or 0,
+                     job.get("unit") or "", job.get("item") or "")
+        return
+    name = _tool_name(cmd)
+    if name == "httpx-toolkit":
+        name = "httpx"
+    if name not in _HOST_PROGRESS_TOOLS:
+        return
+    total = _input_list_count(cmd, stdin_file)
+    if total:
+        live.set_tool(0, total, unit="hosts")
+
+
+def _absorb_progress(line: str, live: _Live):
+    """Pull done/total out of a tool's own stats line. Hosts win over raw
+    request counts: httpx prints both, and the host counter is the one that
+    matches 'how many targets are done'."""
+    text = strip_ansi(line or "").strip()
+    if not text:
+        return
+    hosts = _HOSTS_PROGRESS_RE.search(text)
+    reqs = _REQUESTS_PROGRESS_RE.search(text)
+    rps_m = _RPS_RE.search(text)
+    rate = ""
+    if rps_m and _parse_count(rps_m.group(1)) > 0:
+        rate = f"RPS {rps_m.group(1)}"
+    if hosts:
+        done = _parse_count(hosts.group(1))
+        total = _parse_count(hosts.group(2))
+        plain_req = re.search(r"Requests:\s*([\d,]+)(?!\s*/)", text)
+        req_n = _parse_count(reqs.group(1)) if reqs else (
+            _parse_count(plain_req.group(1)) if plain_req else 0)
+        note = f"requests {req_n:,}" if req_n else ""
+        live.set_tool(done, total, unit="hosts", rate=rate, note=note)
+        return
+    if reqs:
+        done = _parse_count(reqs.group(1))
+        total = _parse_count(reqs.group(2))
+        bits = []
+        plain = _HOSTS_PLAIN_RE.search(text)
+        if plain:
+            bits.append(f"hosts {plain.group(1)}")
+        matched = _MATCHED_RE.search(text)
+        if matched:
+            bits.append(f"matched {matched.group(1)}")
+        templates = _TEMPLATES_RE.search(text)
+        if templates:
+            bits.append(f"templates {templates.group(1)}")
+        live.set_tool(done, total, unit="requests", rate=rate, note=" · ".join(bits))
+        return
+    chunks = _ARJUN_CHUNK_RE.search(text)
+    if chunks:
+        live.set_tool(int(chunks.group(1)), int(chunks.group(2)), unit="chunks")
+        return
+    init = _NMAP_INIT_RE.search(text)
+    if init:
+        with live.lock:
+            live.note = init.group(1).strip()[:80]
+        return
+    bar = _BAR_PROGRESS_RE.search(text)
+    if bar:
+        live.set_tool(_parse_count(bar.group(1)), _parse_count(bar.group(2)),
+                      unit="", rate=rate, note="")
+        return
+    about = _NMAP_PCT_RE.search(text)
+    if about:
+        left = _NMAP_LEFT_RE.search(text)
+        note = f"left {left.group(1)}" if left else ""
+        live.set_percent(about.group(1), note)
+        return
+    phase = _NMAP_PHASE_RE.search(text)
+    if phase:
+        with live.lock:
+            live.note = phase.group(1).strip()[:80]
+
+
+def _absorb_status_text(status, live: _Live):
+    """dalfox (and anything else) reports progress by writing status['text']
+    as 'target 3/10 (30%) · …' instead of a stats line."""
+    if not status:
+        return
+    text = str(status.get("text") or "").strip()
+    if not text:
+        return
+    frac = _STATUS_FRAC_RE.search(text)
+    if not frac:
+        with live.lock:
+            if live.done is None and not live.job_locked:
+                live.note = text[:140]
+        return
+    total = int(frac.group(2))
+    if total <= 0:
+        return
+    rest = re.sub(r"^\s*\(\s*[\d.]+%\s*\)\s*", "", text[frac.end():]).lstrip(" ·")
+    live.set_tool(int(frac.group(1)), total, unit="targets", note=rest)
+
+
+def _progress_payload(label: str, started: float, live: _Live) -> dict:
+    """Numbers behind the progress line. The Scan Center reads the same dict
+    as JSON (RXPROGRESS) so the report can pin done/total, remaining and elapsed
+    instead of scrolling the line away."""
+    elapsed = max(0.0, time.time() - started)
+    done, total, unit, item, rate, note, lines, percent_only, job_locked, last_move = live.snapshot()
+    pct = None
+    eta = None
+    done_out = None
+    total_out = None
+    if percent_only and done is not None:
+        pct = int(round(float(done)))
+    elif done is not None and total:
+        done_out = int(done)
+        total_out = int(total)
+        pct = int(round(max(0.0, min(100.0, 100.0 * done_out / total_out)))) if total_out else 0
+        if done_out < total_out:
+            if job_locked and _JOB_CLOCK["n"] > 0:
+                avg = _JOB_CLOCK["sec"] / _JOB_CLOCK["n"]
+                remaining_after = max(0, total_out - (done_out + 1))
+                eta = max(0.0, avg - elapsed) + avg * remaining_after
+            elif done_out > 0 and elapsed >= 0.5:
+                eta = elapsed * (total_out - done_out) / done_out
+            if eta is not None and eta < 1:
+                eta = None
+    stall = 0
+    if done is None and elapsed >= 15 and (time.time() - last_move) >= 15:
+        stall = int(time.time() - last_move)
+    return {
+        "stage": _STAGE_CTX.get("n"),
+        "label": _public_text(label or ""),
+        "done": done_out,
+        "total": total_out,
+        "pct": pct,
+        "unit": unit or "",
+        "eta_sec": int(eta) if eta else None,
+        "elapsed_sec": int(elapsed),
+        "rate": _public_text(rate or ""),
+        "note": _public_text(note or ""),
+        "item": _public_text(item or ""),
+        "lines": int(lines or 0),
+        "stall_sec": stall,
+        "percent_only": bool(percent_only),
+    }
+
+
+def _format_progress(p: dict) -> str:
+    stage_n = p.get("stage")
+    head = f"STAGE {stage_n}  {p.get('label') or ''}" if stage_n is not None else str(p.get("label") or "")
+    bits = [head]
+    if p.get("percent_only") and p.get("pct") is not None:
+        bits.append(f"{p['pct']}%")
+    elif p.get("done") is not None and p.get("total"):
+        unit_s = f" {p['unit']}" if p.get("unit") else ""
+        bits.append(f"{int(p['done']):,}/{int(p['total']):,}{unit_s}")
+        if p.get("pct") is not None:
+            bits.append(f"{p['pct']}%")
+        if p.get("eta_sec"):
+            bits.append(f"left {_fmt_clock(p['eta_sec'])}")
+    bits.append(f"elapsed {_fmt_clock(p.get('elapsed_sec') or 0)}")
+    if p.get("rate"):
+        bits.append(p["rate"])
+    if p.get("note"):
+        bits.append(p["note"])
+    if p.get("item"):
+        bits.append(p["item"])
+    elif not p.get("total") and p.get("lines"):
+        n = int(p["lines"])
+        low = str(p.get("label") or "").lower()
+        if "url" in low:
+            word = "url" if n == 1 else "urls"
+        else:
+            word = "line" if n == 1 else "lines"
+        bits.append(f"{n:,} {word}")
+    if p.get("stall_sec"):
+        bits.append(f"no new output for {_fmt_clock(p['stall_sec'])}")
+    return "   ".join(bits)
+
+
+def _render_progress(label: str, started: float, live: _Live) -> str:
+    return _format_progress(_progress_payload(label, started, live))
+
+
+def _paint_progress(frame: str, text: str, tty: bool, payload: dict = None):
+    body = f"  {C.CYAN}{frame}{C.RESET} {C.DIM}{text}{C.RESET}"
+    with _PRINT_LOCK:
+        if not tty and payload:
+            # One JSON line per beat. The report's Scan Center pins this;
+            # a pipe has no carriage-return, so the human line would scroll away.
+            print("RXPROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
+        if tty:
+            sys.stdout.write("\r" + body + "\033[K")
+            sys.stdout.flush()
+        else:
+            print(body, flush=True)
+
+
+def _show_progress(frame: str, label: str, started: float, live: _Live, tty: bool):
+    payload = _progress_payload(label, started, live)
+    _paint_progress(frame, _format_progress(payload), tty, None if tty else payload)
+
+
+_PULSE_LOCK = threading.Lock()
+_PULSE_AT = {"t": 0.0}
+
+
+def _pulse_job(label: str, started: float, done: int, total: int,
+               unit: str = "", item: str = "", note: str = "", force: bool = False):
+    """Progress for an in-process loop (JS, CORS, API probes, canary checks).
+    Throttled to about once a second so a tight loop does not flood the pipe."""
+    now = time.time()
+    finished = bool(total) and int(done) >= int(total)
+    with _PULSE_LOCK:
+        if (not force and not finished and int(done) > 1
+                and (now - _PULSE_AT["t"]) < 1.0):
+            return
+        _PULSE_AT["t"] = now
+    live = _Live()
+    if total:
+        live.set_tool(int(done), int(total), unit=unit, note=note or "")
+    if item or not total:
+        with live.lock:
+            if item:
+                live.item = str(item)[:72]
+            if not total:
+                live.lines = int(done or 0)
+                live.note = (note or "")[:140]
+    _show_progress("…", _public_activity(label), started, live, sys.stdout.isatty())
+
+
+def _clear_progress(tty: bool):
+    if not tty:
+        return
+    with _PRINT_LOCK:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
+def _spinner(stop_evt: threading.Event, label: str, started: float, live: _Live):
     frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
     i = 0
+    tty = sys.stdout.isatty()
     # A pipe (the Scan Center live console) never sees a carriage-return
-    # spinner — those frames sit in a buffer until a newline. Emit one
-    # progress line every 20s instead, so a long tool looks alive.
-    if not sys.stdout.isatty():
-        last_beat = time.time()
+    # spinner. Print a fresh line when the count moves, and at least every
+    # few seconds, so a long httpx/naabu run is visible there too.
+    if not tty:
+        last_beat = None
+        last_sig = None
         while not stop_evt.is_set():
-            if time.time() - last_beat >= 20:
-                print(f"  {C.DIM}… {label} still running{C.RESET}", flush=True)
-                last_beat = time.time()
-            time.sleep(0.5)
+            now = time.time()
+            snap = live.snapshot()
+            sig = (snap[0], snap[6])
+            moved = sig != last_sig and (snap[0] not in (None, 0) or snap[6])
+            due = last_beat is None and now - started >= 0.6
+            due = due or (last_beat is not None and moved and now - last_beat >= 1.0)
+            due = due or (last_beat is not None and now - last_beat >= 3)
+            if due:
+                _show_progress("…", label, started, live, False)
+                last_beat = now
+                last_sig = sig
+            time.sleep(0.3)
+        # A tool that finished before the first heartbeat does not need a
+        # progress line of its own — the result line printed next is enough.
+        if last_beat is not None and (live.snapshot()[0], live.snapshot()[6]) != last_sig:
+            _show_progress("…", label, started, live, False)
         return
     while not stop_evt.is_set():
         if _SPINNER_PAUSE.is_set():
             time.sleep(0.05)
             continue
-        sys.stdout.write(f"\r  {C.CYAN}{frames[i % len(frames)]}{C.RESET} {C.DIM}{label}{C.RESET}   ")
-        sys.stdout.flush()
+        _show_progress(frames[i % len(frames)], label, started, live, True)
         i += 1
-        time.sleep(0.08)
-    sys.stdout.write(f"\r{' ' * (len(label) + 22)}\r")
-    sys.stdout.flush()
+        time.sleep(0.12)
+    _clear_progress(True)
 
 def stage(n, t):
+    t = _public_text(t)
+    _STAGE_CTX["n"] = n
+    _STAGE_CTX["title"] = t
+    _JOB_CLOCK["n"] = 0
+    _JOB_CLOCK["sec"] = 0.0
     print(f"\n{C.CYAN}{C.BOLD}{'═'*60}\n  STAGE {n}: {t}\n{'═'*60}{C.RESET}", flush=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -143,6 +561,55 @@ ANSI_RE  = re.compile(r"\x1b\[[0-9;]*m")
 
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s or "")
+
+def _is_reconx_banner_line(text: str) -> bool:
+    """The startup logo. Scan Center runs one process per button, so this
+    block used to land in the live console on every click."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if any(ch in s for ch in "█╔╗╚╝║"):
+        return True
+    if s.startswith("ReconX") and "Sequential" in s:
+        return True
+    if "linkedin.com/in/2u1fuk4r" in s:
+        return True
+    return False
+
+def _pipe_echo(line: str):
+    """Copy one tool line to stdout when a pipe is listening (Scan Center).
+
+    A real terminal keeps the single-line spinner instead; dumping every
+    line there fights the redraw. JSON records stay out — a finding callback
+    already prints those as a readable hit.
+    """
+    if sys.stdout.isatty():
+        return
+    text = strip_ansi(line or "").replace("\r", "").strip()
+    if not text or _is_reconx_banner_line(text):
+        return
+    if text.startswith("{") and text.endswith("}"):
+        return
+    with _PRINT_LOCK:
+        print(text, flush=True)
+
+def _useful_stderr_lines(text: str, limit: int = 6) -> list:
+    """The lines an operator needs from a failed tool. ASCII logos and blank
+    padding are dropped; a fatal line wins over the banner that precedes it."""
+    lines = []
+    for raw in (text or "").splitlines():
+        line = strip_ansi(raw).strip()
+        if not line:
+            continue
+        if "projectdiscovery.io" in line.lower():
+            continue
+        if re.fullmatch(r"[_/\\|.\- \t]+", line):
+            continue
+        lines.append(line)
+    fatal = [ln for ln in lines if re.search(
+        r"\[(FTL|ERR|FATAL)\]|\berror\b|\bfailed\b|doesn't exist|not found|no valid",
+        ln, re.I)]
+    return (fatal or lines)[:limit]
 
 # ── DNS resilience ────────────────────────────────────────────────────────────
 # Labs / VPNs / cloud sandboxes routinely block outbound UDP/53 to public
@@ -373,6 +840,11 @@ def load_config(path=None):
             "dalfox_test_path_only": False,
             "dalfox_path_only_max": 100,
             "dalfox_dedup_query_params": True,
+            # XSS only runs on one example of each parameter, and only after a
+            # live request shows that parameter's value coming back in the page.
+            "xss_reflected_only": True,
+            "xss_reflect_threads": 20,
+            "xss_reflect_timeout": 8,
             # v9.3: skip dalfox's own parameter mining by default. ReconX already
             # feeds dalfox a corpus of real crawled/wayback URLs with their params
             # present, so dalfox re-guessing param names is mostly redundant — and
@@ -403,6 +875,8 @@ def load_config(path=None):
             # fuzzing a URL after the first verified hit; 180s keeps that hit
             # and moves on so the rest of the list is actually scanned.
             "dalfox_per_url_sec": 420,
+            # 0 = one dalfox process per CPU, never two at once against the same host.
+            "dalfox_parallel_jobs": 0,
             "dalfox_workers": 40,
             "dalfox_delay_ms": 0,
             "dalfox_stall_timeout_sec": 0,
@@ -415,10 +889,14 @@ def load_config(path=None):
             "cors_test_origin": "https://reconx-cors-probe.invalid",
             "open_redirect_canary": "example.com",
             "cloud_bucket_timeout": 10,
-            "js_secrets_max_files": 200,
+            "cloud_enum_threads": 8,
+            "cloud_enum_timeout": 900,
+            # 0 = every in-scope JS file, no wall-clock cutoff. Stage 10 is a
+            # Scan Center pass that runs after the report, so it can take the time.
+            "js_secrets_max_files": 0,
             "js_secrets_concurrency": 15,
             "js_secrets_request_timeout": 12,
-            "js_secrets_budget_sec": 1800,
+            "js_secrets_budget_sec": 0,
             "js_secrets_patterns": "aws,gcp,azure,slack,stripe,github,jwt,private_key",
             "crtsh_timeout": 20,
             "chaos_enabled": False,
@@ -654,6 +1132,9 @@ tools:
   dalfox_test_path_only: {str(t.get('dalfox_test_path_only', False)).lower()}
   dalfox_path_only_max: {t.get('dalfox_path_only_max', 100)}
   dalfox_dedup_query_params: {str(t.get('dalfox_dedup_query_params', True)).lower()}
+  xss_reflected_only: {str(t.get('xss_reflected_only', True)).lower()}
+  xss_reflect_threads: {t.get('xss_reflect_threads', 20)}
+  xss_reflect_timeout: {t.get('xss_reflect_timeout', 8)}
   # Skip dalfox's own param mining: "all" (fastest, skip dict+DOM) | "dom" | "dict" | "" (full mining)
   dalfox_skip_mining: {_yq(t.get('dalfox_skip_mining', 'all'))}
   # Per-target cost trims (XSS-focused): skip non-XSS probes / dalfox's own headless DOM check
@@ -662,7 +1143,7 @@ tools:
   dalfox_max_targets: {t.get('dalfox_max_targets', 0)}
   dalfox_time_budget_sec: {t.get('dalfox_time_budget_sec', 10800)}
   dalfox_per_url_sec: {t.get('dalfox_per_url_sec', 420)}
-  dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 1)}
+  dalfox_parallel_jobs: {t.get('dalfox_parallel_jobs', 0)}
   dalfox_parallel_min: {t.get('dalfox_parallel_min', 8)}
   dalfox_workers: {t.get('dalfox_workers', 40)}
   dalfox_delay_ms: {t.get('dalfox_delay_ms', 0)}
@@ -676,10 +1157,12 @@ tools:
   cors_test_origin: {_yq(t.get('cors_test_origin', 'https://reconx-cors-probe.invalid'))}
   open_redirect_canary: {_yq(t.get('open_redirect_canary', 'example.com'))}
   cloud_bucket_timeout: {t.get('cloud_bucket_timeout', 10)}
-  js_secrets_max_files: {t.get('js_secrets_max_files', 200)}
+  cloud_enum_threads: {t.get('cloud_enum_threads', 8)}
+  cloud_enum_timeout: {t.get('cloud_enum_timeout', 900)}
+  js_secrets_max_files: {t.get('js_secrets_max_files', 0)}
   js_secrets_concurrency: {t.get('js_secrets_concurrency', 15)}
   js_secrets_request_timeout: {t.get('js_secrets_request_timeout', 12)}
-  js_secrets_budget_sec: {t.get('js_secrets_budget_sec', 1800)}
+  js_secrets_budget_sec: {t.get('js_secrets_budget_sec', 0)}
   crtsh_timeout: {t.get('crtsh_timeout', 20)}
   dnsx_enabled: {str(t.get('dnsx_enabled', True)).lower()}
 """
@@ -784,23 +1267,51 @@ def _dalfox_caps() -> dict:
     _DALFOX_CAPS_CACHE["caps"] = caps
     return caps
 
+_PRIVATE_HOST_CACHE = {}
+# Names that are never in a public archive. .lab is not an ICANN TLD; the
+# others are reserved for local use (RFC 6761 / RFC 6762).
+_LOCAL_NAME_SUFFIXES = (
+    ".local", ".localhost", ".lab", ".internal", ".lan", ".home",
+    ".intranet", ".test", ".invalid", ".example",
+)
+
 def _is_private_or_local_host(host: str) -> bool:
-    """v8.3: true for a loopback/private/link-local IP (RFC1918, 127.0.0.0/8,
-    169.254.0.0/16, etc.) or a bare "localhost". Used to skip archive-based
-    discovery tools (gau: wayback/commoncrawl/otx/urlscan) that CANNOT ever
-    have data for a non-routable address — retrying them against one is
-    guaranteed-wasted time, confirmed against a real scan: gau burned ~160s
-    across 3 attempts + retry waits, all 0 lines, against a 192.168.x.x
-    target that a local dev/lab site (like ReconX's own vuln-lab) commonly
-    runs on. A public IP or real domain is unaffected — this only ever
-    returns True for addresses no public archive could possibly have."""
-    h = (host or "").strip().lower()
-    if not h or h == "localhost":
+    """True for a loopback/private/link-local address, a local-only name
+    (.lab, .local, localhost), or a name whose every address is private.
+
+    Archive tools (gau: wayback/commoncrawl/otx/urlscan) cannot have data
+    for any of these. A previous run still spent 117s in gau against
+    harbor.lab, because the check only looked at literal IP strings and
+    the name itself is not an IP — it resolves to 127.0.0.1."""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h or h in ("localhost", "localhost.localdomain"):
+        return True
+    if any(h.endswith(suf) for suf in _LOCAL_NAME_SUFFIXES):
         return True
     try:
-        return ipaddress.ip_address(h).is_private
+        ip = ipaddress.ip_address(h)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified)
     except ValueError:
-        return False
+        pass
+    cached = _PRIVATE_HOST_CACHE.get(h)
+    if cached is not None:
+        return cached
+    private = False
+    try:
+        import socket
+        infos = socket.getaddrinfo(h, None)
+        flags = []
+        for info in infos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            flags.append(bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified))
+        private = bool(flags) and all(flags)
+    except Exception:
+        private = False
+    _PRIVATE_HOST_CACHE[h] = private
+    return private
 
 def _pd_httpx():
     for cand in ("httpx-toolkit", "httpx"):
@@ -893,7 +1404,7 @@ def discover_nuclei_templates(cfg_override: str = "") -> str:
         for line in out.splitlines():
             line = line.strip()
             if "/" in line and _dir_has_templates(Path(line)):
-                ok(f"Nuclei templates (nuclei -tl): {line}")
+                ok(f"Template catalog: {line}")
                 return line
     except Exception:
         pass
@@ -1062,12 +1573,22 @@ class _IS:
 
 _INT = _IS
 _INT.start_watcher()
-signal.signal(signal.SIGINT,  _INT.handle)
-signal.signal(signal.SIGTERM, lambda s, f: (
-    setattr(_INT, "_hard", True),
-    _INT._raw_sigint.set(),
-    print(f"\n{C.RED}[✗] SIGTERM{C.RESET}", flush=True)
-))
+# signal.signal() is only legal on the main thread. The report bridge imports
+# this module from a request thread (URL identity for the evidence pack). Doing
+# the registration there used to raise ValueError and the AI run died instantly.
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGINT,  _INT.handle)
+    def _sigterm_handler(s, f):
+        if _INT._hard:
+            return
+        _INT._hard = True
+        _INT._op_skip = True
+        _INT._stage_skip = True
+        _INT._notice = "hard"
+        _INT._raw_sigint.set()
+        print(f"\n{C.RED}[✗] Stop requested — checkpointing and writing findings into the report{C.RESET}",
+              flush=True)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
 # ── Tor-based auto IP rotation (block-triggered fallback) ────────────────────
 # v8.8: normal, engellenmeyen istekler HER ZAMAN dogrudan (ya da kullanicinin
@@ -1588,10 +2109,8 @@ _REFLECTION_PARAM_NAMES = {
     "q", "s", "search", "query", "keyword", "keywords", "term", "text", "txt",
     "msg", "message", "comment", "comments", "name", "username", "uname", "email",
     "subject", "title", "content", "body", "desc", "description",
-    "redirect", "redirect_uri", "redirect_url", "return", "returnurl", "return_url",
-    "next", "goto", "url", "u", "target", "dest", "destination", "continue",
-    "callback", "jsonp", "ref", "referrer", "referer", "host", "page", "view",
-    "template", "lang", "locale", "filter", "sort", "tag", "category", "cat",
+    "jsonp", "ref", "referrer", "referer", "host", "page", "view",
+    "template", "lang", "locale", "tag",
     "input", "value", "error", "err", "feedback", "note", "reason",
 }
 
@@ -1606,9 +2125,145 @@ def _has_reflection_param(qs: str) -> bool:
             return True
         # tfSearch, searchQuery — the echoed field is the suffix, not the
         # whole name. Only the longer names, so "q"/"id" don't match everything.
+        if _is_open_redirect_name(kl):
+            continue
         if any(len(n) >= 5 and kl.endswith(n) for n in _REFLECTION_PARAM_NAMES):
             return True
     return False
+
+
+_OPEN_REDIRECT_PARAM_NAMES = {
+    "url", "next", "redirect", "redirect_uri", "redirect_url", "redirect_to",
+    "return", "returl", "returnurl", "returnuri", "return_uri", "return_url",
+    "returnto", "return_to", "dest", "destination", "continue", "continue_url",
+    "goto", "target", "redir", "redir_url", "out", "to", "callback", "forward",
+    "rurl", "go", "back", "backurl", "origin", "success_url", "checkout_url",
+    "location", "next_url", "u", "image_url",
+}
+
+# One example per name. id=1 and id=2 are the same test. Search boxes stay in
+# the XSS list; these names are the ones that usually hit a query.
+_SQLI_PARAM_NAMES = {
+    "id", "uid", "pid", "cid", "nid", "tid", "fid", "gid", "aid", "bid",
+    "cat", "category", "item", "itemid", "product", "productid", "prod",
+    "artist", "sort", "order", "orderby", "sortby", "filter", "column",
+    "col", "table", "where", "news", "newsid", "thread", "forum", "num",
+    "no", "pageid", "userid", "groupid",
+}
+
+_SQL_ERROR_RE = re.compile(
+    r"(union(?:[\s/+]|%20)+all(?:[\s/+]|%20)+select|union(?:[\s/+]|%20)+select|"
+    r"you have an error in your sql|sql syntax|mysql_|ora-\d{4,5}|"
+    r"pg_query\(|sqlstate|odbc sql|ole db|microsoft jet database|"
+    r"warning:\s*mysql|sqlexception|xp_cmdshell|information_schema)",
+    re.I)
+
+
+def _is_open_redirect_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n or _is_xss_param_name(n):
+        return False
+    if n in _OPEN_REDIRECT_PARAM_NAMES or "redirect" in n:
+        return True
+    return n.endswith("url") or n.endswith("uri")
+
+
+def _is_xss_param_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in _REFLECTION_PARAM_NAMES:
+        return True
+    return any(len(tok) >= 5 and n.endswith(tok) for tok in _REFLECTION_PARAM_NAMES)
+
+
+_DOM_PARAM_NAMES = {
+    "callback", "jsonp", "hash", "fragment", "src", "href", "html", "template",
+    "location", "dom", "redirect", "url", "next", "return", "returnurl", "returl",
+    "return_url", "goto", "dest", "redir", "source", "document", "innerhtml",
+}
+
+_STORED_PARAM_NAMES = {
+    "comment", "comments", "message", "msg", "content", "body", "title",
+    "post", "review", "feedback", "desc", "description", "subject", "name",
+    "note", "reply", "text", "guestbook",
+}
+
+_STORED_PATH_RE = re.compile(
+    r"(comment|guestbook|forum|message|feedback|review|profile|contact|"
+    r"register|reply|board|post|thread)",
+    re.I)
+
+
+def _is_dom_param_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in _DOM_PARAM_NAMES or "redirect" in n or n.endswith("callback"):
+        return True
+    return n.endswith("url") or n.endswith("uri")
+
+
+def _is_stored_param_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return bool(n) and n in _STORED_PARAM_NAMES
+
+
+def _is_stored_path(path: str) -> bool:
+    return bool(_STORED_PATH_RE.search(path or ""))
+
+
+def _xss_param_label(url: str) -> str:
+    try:
+        names = _xss_param_names(urlparse(url).query)
+    except Exception:
+        names = ()
+    if names:
+        return ", ".join(names)
+    try:
+        return urlparse(url).path or "/"
+    except Exception:
+        return url
+
+
+def _xss_kind_label(url: str) -> str:
+    try:
+        pr = urlparse(url)
+        names = _xss_param_names(pr.query)
+        path = pr.path or ""
+    except Exception:
+        names, path = (), ""
+    kinds = []
+    if any(_is_xss_param_name(n) for n in names):
+        kinds.append("reflected")
+    if any(_is_dom_param_name(n) for n in names):
+        kinds.append("dom")
+    if any(_is_stored_param_name(n) for n in names) or (not names and _is_stored_path(path)):
+        kinds.append("stored")
+    return "+".join(kinds) or "parameter"
+
+
+def _is_sqli_param_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in _SQLI_PARAM_NAMES:
+        return True
+    return n.endswith("_id") and len(n) <= 24
+
+
+def _url_has_sql_error(url: str) -> bool:
+    try:
+        blob = unquote(unquote(url or ""))
+    except Exception:
+        blob = url or ""
+    return bool(_SQL_ERROR_RE.search(blob))
+
+
+def _static_asset_path(path: str) -> bool:
+    return bool(re.search(
+        r"\.(txt|xml|jpg|jpeg|png|gif|css|ico|svg|map|pdf|zip|woff2?)$",
+        path or "", re.I))
 
 # v6.13: cloud storage bucket URL/hostname deseni
 _PAT_CLOUD_BUCKET = re.compile(
@@ -1701,6 +2356,22 @@ def _split_host_port(s: str) -> tuple:
         return host, parsed.port
     except Exception:
         return _extract_domain_from_any(raw), None
+
+
+def _canon_url(url: str) -> str:
+    """Same page with or without a trailing slash is one row."""
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return (url or "").strip().rstrip("/")
+    port = f":{parsed.port}" if parsed.port else ""
+    path = parsed.path or ""
+    if path.endswith("/") and path != "/":
+        path = path.rstrip("/")
+    if path == "/":
+        path = ""
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme}://{host}{port}{path}{query}"
 
 
 def _etc_hosts_names(domain: str) -> list:
@@ -1883,6 +2554,220 @@ def _get_http_client(cfg: dict):
         return _py_requests, False
     return None, False
 
+_PAGE_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_PAGE_OBFUSCATED_RE = re.compile(
+    r"([A-Za-z0-9._%+\-]{1,64})\s*(?:\[at\]|\(at\)|\{at\}|\sat\s)\s*([A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+    re.I,
+)
+_PAGE_TEL_RE = re.compile(r"""(?:href=["']tel:|tel:)([^"'<>\s]+)""", re.I)
+_PAGE_MAILTO_RE = re.compile(r"""mailto:([^"'?\s>]+)""", re.I)
+_PAGE_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+\d{1,3}[\s.\-]?)?(?:\(?\d{2,4}\)?[\s.\-])\d{3,4}[\s.\-]\d{3,4}(?!\d)"
+)
+_SKIP_EMAIL_HOSTS = {
+    "example.com", "example.org", "domain.com", "email.com", "sentry.io",
+    "wixpress.com", "schema.org", "w3.org", "jquery.com", "github.com",
+    "googleapis.com", "gstatic.com", "cloudflare.com", "wordpress.org",
+}
+
+
+def _page_identity(html_text: str) -> dict:
+    """Title, public emails and phone numbers from a page already fetched."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text or "")
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    if m:
+        title = re.sub(r"<[^>]+>", " ", m.group(1))
+        title = re.sub(r"\s+", " ", title).strip()[:180]
+    emails, seen_e = [], set()
+    found_emails = list(_PAGE_EMAIL_RE.findall(text))
+    found_emails += [f"{a}@{b}" for a, b in _PAGE_OBFUSCATED_RE.findall(text)]
+    found_emails += [unquote(m) for m in _PAGE_MAILTO_RE.findall(text)]
+    for raw in found_emails:
+        em = raw.lower().strip(".").strip()
+        host = em.rsplit("@", 1)[-1]
+        if host in _SKIP_EMAIL_HOSTS or host.endswith((
+                ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")):
+            continue
+        if any(host.endswith("." + skip) for skip in _SKIP_EMAIL_HOSTS):
+            continue
+        if em in seen_e:
+            continue
+        seen_e.add(em)
+        emails.append(em)
+        if len(emails) >= 12:
+            break
+    phones, seen_p = [], set()
+
+    def _keep_phone(raw):
+        digits = re.sub(r"\D", "", raw or "")
+        if len(digits) < 10 or len(digits) > 15:
+            return ""
+        if not digits.startswith(("0", "90")):
+            return ""
+        if len(set(digits)) < 3:
+            return ""
+        pretty = re.sub(r"\s+", " ", (raw or "").strip())[:32]
+        if pretty in seen_p:
+            return ""
+        seen_p.add(pretty)
+        return pretty
+
+    for raw in _PAGE_TEL_RE.findall(text):
+        pretty = _keep_phone(unquote(raw))
+        if pretty:
+            phones.append(pretty)
+    if len(phones) < 8:
+        for raw in _PAGE_PHONE_RE.findall(text):
+            pretty = _keep_phone(raw)
+            if pretty:
+                phones.append(pretty)
+            if len(phones) >= 8:
+                break
+    if len(phones) < 8:
+        for raw in re.findall(r"(?<!\d)(?:\+90[\s.\-]?)?0?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{2}[\s.\-]?\d{2}(?!\d)", text):
+            pretty = _keep_phone(raw)
+            if pretty:
+                phones.append(pretty)
+            if len(phones) >= 8:
+                break
+    return {"title": title, "emails": emails, "phones": phones}
+
+
+_CONTACT_PATHS = (
+    "/iletisim", "/iletisim/", "/contact", "/contact/", "/contact-us",
+    "/kunye", "/hakkimizda", "/about", "/about-us", "/communication",
+    "/tr/iletisim", "/en/contact",
+)
+_CONTACT_URL_RE = re.compile(r"iletisim|contact|kunye|hakkimizda|about-us|reach-us|bize-ulas", re.I)
+
+
+def lookup_nameservers(domain: str) -> list:
+    """Public NS records. dig, then host. Empty when DNS has no answer."""
+    domain = (domain or "").strip().rstrip(".")
+    if not domain or _is_private_or_local_host(domain):
+        return []
+    found = []
+
+    def _add(token):
+        token = (token or "").strip().rstrip(".").lower()
+        if token and "." in token and token not in found and not token[0].isdigit():
+            found.append(token)
+
+    for argv in (["dig", "+short", "NS", domain], ["host", "-t", "NS", domain]):
+        if not tool_exists(argv[0]):
+            continue
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            if "name server" in line.lower():
+                _add(line.split()[-1])
+            else:
+                _add(line.split()[0])
+        if found:
+            break
+    return found[:8]
+
+
+def harvest_public_contacts(bases, cfg, extra_urls=None, blobs=None, limit=8) -> dict:
+    """Emails and phone numbers published on the site: mailto/tel plus a few
+    contact pages. Stops after `limit` page fetches."""
+    emails, phones, sources = [], [], []
+    seen_e, seen_p, seen_u = set(), set(), set()
+
+    def _take_ident(ident, src):
+        added = False
+        for em in ident.get("emails") or []:
+            if em not in seen_e:
+                seen_e.add(em)
+                emails.append(em)
+                added = True
+        for ph in ident.get("phones") or []:
+            if ph not in seen_p:
+                seen_p.add(ph)
+                phones.append(ph)
+                added = True
+        if added and src and src not in sources:
+            sources.append(src)
+
+    for blob in blobs or []:
+        _take_ident(_page_identity(str(blob)), "")
+    urls = []
+    for base in bases or []:
+        base = (base or "").strip().rstrip("/")
+        if not base.startswith("http"):
+            continue
+        urls.append(base + "/")
+        urls.extend(base + path for path in _CONTACT_PATHS)
+    for extra in extra_urls or []:
+        if isinstance(extra, str) and extra.startswith("http"):
+            urls.append(extra.split("#", 1)[0])
+    fetched = 0
+    for url in urls:
+        if fetched >= limit:
+            break
+        if url in seen_u:
+            continue
+        seen_u.add(url)
+        probe = http_probe(url, cfg or {}, timeout=8)
+        fetched += 1
+        if not probe.get("ok"):
+            continue
+        before = (len(emails), len(phones))
+        _take_ident({"emails": probe.get("emails") or [], "phones": probe.get("phones") or []}, url)
+        if (len(emails), len(phones)) != before and url not in sources:
+            sources.append(url)
+        # The homepage usually links the real contact page under a path we
+        # did not guess. Queue a few of those before the fetch budget ends.
+        if fetched == 1:
+            try:
+                client, is_cffi = _get_http_client(cfg or {})
+                if client is not None:
+                    kw = dict(timeout=8, allow_redirects=True, verify=False, headers=pick_header_strategy("", cfg or {}))
+                    if is_cffi:
+                        kw["impersonate"] = (cfg or {}).get("settings", {}).get("curl_cffi_impersonate", "chrome110")
+                    page = client.get(url, **kw)
+                    html = getattr(page, "text", "") or ""
+                    for href in re.findall(r"""href=["']([^"'#]+)""", html, re.I):
+                        if not _CONTACT_URL_RE.search(href):
+                            continue
+                        abs_u = urljoin(url, href).split("#", 1)[0]
+                        if abs_u.startswith("http") and abs_u not in seen_u:
+                            urls.insert(fetched, abs_u)
+                            if sum(1 for u in urls if _CONTACT_URL_RE.search(u)) > 6:
+                                break
+            except Exception:
+                pass
+    return {"emails": emails[:16], "phones": phones[:8], "sources": sources[:12]}
+
+
+def _merge_contacts(*parts) -> dict:
+    emails, phones, sources = [], [], []
+    seen_e, seen_p = set(), set()
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        for em in part.get("emails") or []:
+            em = str(em).strip().lower()
+            if em and em not in seen_e:
+                seen_e.add(em)
+                emails.append(em)
+        for ph in part.get("phones") or []:
+            ph = str(ph).strip()
+            if ph and ph not in seen_p:
+                seen_p.add(ph)
+                phones.append(ph)
+        for src in part.get("sources") or []:
+            if src and src not in sources:
+                sources.append(src)
+    return {"emails": emails[:16], "phones": phones[:8], "sources": sources[:12]}
+
+
 def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
     client, is_cffi = _get_http_client(cfg)
     if client is None:
@@ -1909,10 +2794,11 @@ def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
         status = int(getattr(r, "status_code", 0) or 0)
         body = ""
         try:
-            body = (getattr(r, "text", "") or "")[:1200]
+            body = (getattr(r, "text", "") or "")[:500000]
         except Exception:
             body = ""
-        waf = fingerprint_waf(hdrs, status=status, body_snip=body)
+        ident = _page_identity(body)
+        waf = fingerprint_waf(hdrs, status=status, body_snip=body[:1200])
         return {
             "ok": True,
             "client": "curl_cffi" if is_cffi else "requests",
@@ -1926,6 +2812,9 @@ def http_probe(url: str, cfg: dict, timeout: int = 15) -> dict:
             "headers": {k: str(v)[:500] for k, v in list(hdrs.items())[:50]},
             "proxy": proxy or "",
             "waf_fingerprint": waf,
+            "title": ident.get("title") or "",
+            "emails": ident.get("emails") or [],
+            "phones": ident.get("phones") or [],
         }
     except Exception as e:
         return {"ok": False, "client": "curl_cffi" if is_cffi else "requests",
@@ -1939,6 +2828,46 @@ def _flip_scheme(url: str) -> str:
         return ""
     other = "http" if p.scheme == "https" else "https"
     return urlunparse((other, p.netloc, "", "", "", ""))
+
+
+_WW_SKIP = {
+    "country", "ip", "script", "x-powered-by", "uncommonheaders",
+    "redirectlocation", "via", "cookies", "status", "title",
+}
+
+
+def _techs_from_whatweb_blob(blob: str) -> list:
+    """Plugin labels from one WhatWeb summary or one-line scan row."""
+    blob = re.sub(r"^\s*\[\d{3}[^\]]*\]\s*", "", blob or "")
+    out = []
+    for part in blob.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name = part.split("[", 1)[0].strip()
+        low = name.lower()
+        if not name or low in _WW_SKIP or low.startswith("country"):
+            continue
+        if re.match(r"^\d{3}\b", name):
+            continue
+        bracket = ""
+        m = re.search(r"\[([^\]]+)\]", part)
+        if m:
+            bracket = m.group(1).strip()
+        if low == "httpserver":
+            brackets = re.findall(r"\[([^\]]+)\]", part)
+            label = next((b.strip() for b in brackets if "/" in b), "")
+            if not label and brackets:
+                label = brackets[-1].strip()
+        elif bracket and bracket.lower() not in name.lower():
+            ver = bracket.split()[0]
+            label = f"{name} {ver}".strip() if ver else name
+        else:
+            label = name
+        label = re.sub(r"\s+", " ", label).strip()
+        if label and label not in out and len(label) <= 48:
+            out.append(label)
+    return out
 
 # ── Webhook notification (v8.1) ────────────────────────────────────────────────
 def send_webhook_notification(cfg: dict, target: str, summary: dict) -> bool:
@@ -2203,7 +3132,8 @@ _XSS_TRIGGER_JS = r"""
     'mousedown','mouseup','mousemove','cut','paste','copy','input','change',
     'keydown','keyup','keypress','animationstart','animationend','transitionend',
     'pointerover','pointerenter','pointerdown','touchstart','load','error','toggle',
-    'play','loadstart','wheel','scroll','select','drag','dragstart'];
+    'play','playing','loadstart','loadeddata','canplay','canplaythrough',
+    'wheel','scroll','select','drag','dragstart'];
   const els = document.querySelectorAll('*');
   els.forEach(el => {
     try { if (el.focus) el.focus(); } catch(e){}
@@ -2276,9 +3206,29 @@ def _headless_chrome(nav_timeout_sec=15):
         return None
 
 
+def _load_xss_verified(out_dir: Path) -> list:
+    vf = Path(out_dir) / "xss_verified.json"
+    if not vf.exists():
+        return []
+    try:
+        data = json.loads(vf.read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_xss_verified(out_dir: Path, rows: list) -> None:
+    try:
+        (Path(out_dir) / "xss_verified.json").write_text(
+            json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int = 15,
                                    nav_timeout_sec: int = 15, budget_sec: int = 900,
-                                   payloads_per_point: int = 4, max_checks: int = 60) -> list:
+                                   payloads_per_point: int = 4, max_checks: int = 60,
+                                   honor_skip: bool = True) -> list:
     """Replay each XSS candidate PoC in headless Chromium; screenshot the ones
     where a real alert()/confirm()/prompt() actually fires. Never raises, never
     blocks the pipeline — returns [] on any setup failure.
@@ -2291,9 +3241,10 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
     except Exception:
         UnexpectedAlertPresentException = TimeoutException = Exception  # type: ignore
 
+    prior = _load_xss_verified(out_dir)
     with_url = [f for f in (findings or []) if str(f.get("url", "")).startswith("http")]
     if not with_url:
-        return []
+        return prior
 
     # Prioritise: dalfox "V" first, then one representative per (base-path, param)
     # so we don't spend the whole budget on 20 near-identical search-box hits.
@@ -2336,7 +3287,7 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
     if drv is None:
         warn(f"XSS verification skipped (no headless browser) — {len(with_url):,} candidate(s) "
              f"remain in the report as unconfirmed text.")
-        return []
+        return prior
 
     shots_dir = out_dir / "screenshots"
     shots_dir.mkdir(parents=True, exist_ok=True)
@@ -2352,7 +3303,9 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
     for i, f in enumerate(picked):
         if checks >= max_checks or (time.time() - t0) > budget_sec:
             break
-        if _INT.stage_skip():
+        # A single stop ends the fuzzer. The proof pass still runs for findings
+        # already collected (honor_skip=False). A second Ctrl+C aborts that too.
+        if _INT.hard() or (honor_skip and _INT.stage_skip()):
             break
         # once an injection point is proven, don't burn budget on its other payloads
         if _key(f) in confirmed_points:
@@ -2410,17 +3363,24 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
                 except Exception:
                     pass
 
-            fname = f"xss_{'confirmed' if confirmed else 'checked'}_{i+1}.png"
+            seq = len(list(shots_dir.glob("xss_*.png"))) + 1
+            fname = f"xss_{'confirmed' if confirmed else 'verified'}_{seq}.png"
             fpath = shots_dir / fname
-            if confirmed:
+            # Dalfox type V already broke out of context. Keep a picture of that
+            # page even when the dialog hook does not fire (media handlers).
+            save_shot = confirmed or str(f.get("type", "")).strip().upper() == v_type
+            if save_shot:
+                banner = ("XSS CONFIRMED — dialog fired: " + (dtext or "(empty)")
+                          if confirmed else
+                          "XSS VERIFIED — payload rendered in the page")
                 try:
                     drv.execute_script(
                         "var b=document.createElement('div');"
-                        "b.textContent='\U0001F534 XSS CONFIRMED — dialog fired: '+arguments[0];"
+                        "b.textContent=arguments[0];"
                         "b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;"
                         "background:#dc2626;color:#fff;font:bold 15px sans-serif;padding:10px 14px;"
                         "text-align:center';document.documentElement.appendChild(b);",
-                        dtext or "(empty)")
+                        banner)
                 except Exception:
                     pass
                 try:
@@ -2434,7 +3394,7 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
                 confirmed_points.add(_key(f))
             results.append({
                 "url": url, "param": f.get("param", ""), "payload": f.get("payload", ""),
-                "screenshot": (f"07_xss/screenshots/{fname}" if (confirmed and fpath.exists()) else ""),
+                "screenshot": (f"07_xss/screenshots/{fname}" if (save_shot and fpath.exists()) else ""),
                 "dialog_confirmed": confirmed, "dialog_text": dtext,
                 "orig_type": orig_type,
                 "confirmed_upgrade": bool(confirmed and orig_type != v_type),
@@ -2453,23 +3413,34 @@ def capture_xss_alert_screenshots(findings: list, out_dir: Path, max_shots: int 
             pass
     _HEADLESS_CACHE["profiles"] = []
 
-    # v8.6-fix: persist verification results to a file too, not only into
-    # SUMMARY.json's stage6 entry — a later partial run (--resume -s 7) that
-    # rewrites SUMMARY would otherwise erase which findings were confirmed.
-    try:
-        (out_dir / "xss_verified.json").write_text(
-            json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    # A stop that lands before the first page load must not wipe proofs
+    # already written for earlier verified hits.
+    if checks == 0:
+        return prior
+    merged = []
+    seen = set()
+    for row in list(prior) + results:
+        if not isinstance(row, dict):
+            continue
+        key = (row.get("url"), row.get("payload"))
+        if key in seen:
+            merged = [r for r in merged if (r.get("url"), r.get("payload")) != key]
+        seen.add(key)
+        merged.append(row)
+    _save_xss_verified(out_dir, merged)
 
-    confirmed_n = sum(1 for r in results if r["dialog_confirmed"])
+    confirmed_n = sum(1 for r in merged if r.get("dialog_confirmed"))
+    shot_n = sum(1 for r in merged if r.get("screenshot"))
     if confirmed_n:
         ok(f"XSS VERIFIED: {confirmed_n:,} finding(s) fired a real dialog in headless Chromium "
            f"(screenshots saved) — treat these as proven.")
+    elif shot_n:
+        ok(f"XSS verification: {shot_n:,} verified page(s) captured. "
+           f"No dialog fired on its own — the screenshot still shows the payload in the page.")
     elif results:
         ok(f"XSS verification: replayed {len(results):,} candidate(s), none auto-fired a dialog "
            f"(may still be exploitable in the right context — check manually).")
-    return results
+    return merged
 
 
 # ── File utilities ────────────────────────────────────────────────────────────
@@ -2567,11 +3538,11 @@ STAGE_TITLES = {
     0:  "URL Seed Mode",
     1:  "Initial Reconnaissance",
     2:  "Subdomain Enumeration",
-    3:  "Host Validation — httpx",
+    3:  "Host Validation",
     4:  "URL Discovery",
     5:  "URL Categorisation",
-    6:  "XSS Testing — Dalfox",
-    7:  "Nuclei Vulnerability Scan",
+    6:  "XSS Testing",
+    7:  "Template Vulnerability Scan",
     8:  "Authenticated Crawl",
     9:  "Param Discovery",
     10: "JS Endpoint / Secret Analysis",
@@ -2947,15 +3918,261 @@ def _query_param_shape(qs: str) -> str:
         pairs = parse_qsl(qs, keep_blank_values=True)
     except Exception:
         return qs
-    names = sorted({k for k, _ in pairs if k})
+    names = sorted({_xss_param_name(k) for k, _ in pairs if _xss_param_name(k)})
     return ",".join(names) if names else qs
+
+
+def _xss_param_name(key: str) -> str:
+    name = (key or "").strip().lower()
+    if name.endswith("[]"):
+        name = name[:-2]
+    return name
+
+
+def _xss_test_rank(url: str) -> tuple:
+    """Search and text parameters before redirect parameters.
+
+    Alphabetical order put Register.asp?RetURL ahead of Search.asp?tfSearch,
+    so the obvious reflected XSS waited behind a long redirect check.
+    """
+    try:
+        names = _xss_param_names(urlparse(url).query)
+    except Exception:
+        names = ()
+    high = {
+        "q", "s", "search", "query", "keyword", "keywords", "term", "text", "txt",
+        "name", "comment", "comments", "msg", "message", "input", "content",
+        "body", "title", "tfsearch",
+    }
+    rank = 1
+    for name in names:
+        if name in high or name.endswith("search") or name.endswith("query") or name.endswith("keyword"):
+            rank = 0
+            break
+        if name in {"url", "next", "redirect", "redirect_uri", "redirect_url", "return",
+                    "returnurl", "returl", "goto", "dest", "destination", "continue",
+                    "callback", "redir"} or "redirect" in name or name.endswith("url"):
+            rank = 2
+    return (rank, len(url or ""))
+
+
+def _xss_param_names(qs: str) -> tuple:
+    found = set()
+    for key, _val in parse_qsl(qs or "", keep_blank_values=True):
+        name = _xss_param_name(key)
+        if name:
+            found.add(name)
+    return tuple(sorted(found))
+
+
+def _xss_injection_point(url: str):
+    """Host, path, and parameter names. The value does not matter.
+
+    Search.asp?tfSearch=a and Search.asp?tfSearch=Mert are one injection
+    point. A finding on the first value covers the rest."""
+    try:
+        pr = urlparse(url)
+    except Exception:
+        return None
+    names = _xss_param_names(pr.query)
+    if not pr.hostname or not names:
+        return None
+    return ((pr.hostname or "").lower(), (pr.path or "/").lower(), names)
+
+
+def _xss_example_rank(url: str) -> tuple:
+    """Prefer a short, plain value over a payload already sitting in the query."""
+    try:
+        q = urlparse(url).query or ""
+    except Exception:
+        q = url or ""
+    decoded = q
+    for _ in range(3):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    dirty = any(tok in decoded.lower() for tok in (
+        "<script", "alert(", "javascript:", "onerror=", "onload="))
+    return (1 if dirty else 0, len(url or ""))
+
+
+def unique_xss_urls(urls: list) -> list:
+    """One URL per injection point.
+
+    page=1 and page=2 are the same parameter. /item/1 and /item/2 are the
+    same route. A second URL is kept only when it adds a parameter name that
+    route has not already covered, so each name is tested once.
+    """
+    grouped = {}
+    for url in urls or []:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        names = _xss_param_names(parsed.query)
+        if not names or not parsed.hostname:
+            continue
+        route = ((parsed.hostname or "").lower(),
+                 _path_shape(parsed.path or "/").rstrip("/") or "/")
+        grouped.setdefault(route, []).append((names, url))
+    chosen = []
+    for items in grouped.values():
+        items.sort(key=lambda item: (-len(item[0]), len(item[1])))
+        covered = set()
+        for names, url in items:
+            if not any(name not in covered for name in names):
+                continue
+            covered.update(names)
+            chosen.append(url)
+    return chosen
+
+
+def unique_xss_params(urls: list) -> list:
+    """One URL per parameter name on a host.
+
+    Search.asp?tfSearch=a and Forum.asp?tfSearch=Mert are the same parameter,
+    so only the cleaner example is tested. A path with no query is a stored
+    form and is kept once per route.
+    """
+    ranked = sorted(urls or [], key=lambda u: (_xss_test_rank(u), _xss_example_rank(u), len(u)))
+    covered = {}
+    paths = set()
+    chosen = []
+    for url in ranked:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        host = (parsed.hostname or "").lower()
+        if not host:
+            continue
+        names = _xss_param_names(parsed.query)
+        if not names:
+            shape = (host, (_path_shape(parsed.path or "/").rstrip("/") or "/").lower())
+            if shape in paths:
+                continue
+            paths.add(shape)
+            chosen.append(url)
+            continue
+        have = covered.setdefault(host, set())
+        if not any(name not in have for name in names):
+            continue
+        have.update(names)
+        chosen.append(url)
+    return chosen
+
+
+def probe_live_reflected(urls, cfg, threads: int = 20, timeout: int = 8,
+                         header_for=None) -> tuple:
+    """Keep a URL only when it answers and a parameter value comes back.
+
+    Each parameter is sent with its own marker in one request. Parameters
+    whose marker is absent are dropped, so XSS testing does not repeat a
+    dead or non-reflecting name. Returns (kept_urls, stats).
+    """
+    stats = {"probed": len(urls or []), "live": 0, "reflected": 0, "dead": 0, "error": ""}
+    # Plain requests: a burst of canary checks must honor the timeout. The
+    # browser-impersonation client stacks up and stops respecting it.
+    client = _py_requests if _py_requests is not None else None
+    is_cffi = False
+    if client is None:
+        client, is_cffi = _get_http_client(cfg)
+    if client is None:
+        stats["error"] = "no_http_client"
+        return [], stats
+    if not urls:
+        return [], stats
+    settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
+    impersonate = settings.get("curl_cffi_impersonate", "chrome110")
+    proxy = _resolve_proxy(cfg)
+    connect_timeout = min(3, max(1, int(timeout or 8)))
+    workers = max(1, min(int(threads or 1), len(urls)))
+
+    def _one(url):
+        try:
+            parsed = urlparse(url)
+            pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        except Exception:
+            return "dead", None
+        seen = set()
+        targets = []
+        for key, value in pairs:
+            name = _xss_param_name(key)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            targets.append((key, value))
+        if not targets:
+            return "dead", None
+        host = parsed.hostname or ""
+        headers = header_for(url) if header_for else pick_header_strategy(host, cfg)
+        kw = dict(timeout=(connect_timeout, timeout), allow_redirects=True,
+                  headers=headers, verify=False)
+        if proxy:
+            kw["proxies"] = {"http": proxy, "https": proxy}
+        if is_cffi:
+            kw["impersonate"] = impersonate
+        # One parameter per request. Replacing every value at once hides a
+        # real reflection: a non-numeric id makes this ASP.NET page return an
+        # empty body, so NewsAd (which does echo) never gets rendered.
+        reflected = []
+        saw_page = False
+        for key, value in targets:
+            token = f"rx{len(reflected)}{random.randrange(100000, 999999)}"
+            probe_pairs = []
+            replaced = False
+            for k, v in pairs:
+                if not replaced and k == key:
+                    probe_pairs.append((k, token))
+                    replaced = True
+                else:
+                    probe_pairs.append((k, v))
+            probe_url = urlunparse(parsed._replace(query=urlencode(probe_pairs), fragment=""))
+            try:
+                response = client.get(probe_url, **kw)
+                status = int(getattr(response, "status_code", 0) or 0)
+                body = (getattr(response, "text", "") or "")[:400000]
+            except Exception:
+                continue
+            if status not in (0, 404, 410) and body.strip():
+                saw_page = True
+            if token and token in body:
+                kept_value = value.strip() if (value or "").strip() and len(value) <= 80 else "1"
+                reflected.append((key, kept_value))
+        if reflected:
+            kept = urlunparse(parsed._replace(query=urlencode(reflected), fragment=""))
+            return "hit", kept
+        if saw_page:
+            return "live", None
+        return "dead", None
+
+    kept = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, url) for url in urls]
+        for future in as_completed(futures):
+            try:
+                kind, url = future.result()
+            except Exception:
+                stats["dead"] += 1
+                continue
+            if kind == "hit" and url:
+                stats["live"] += 1
+                stats["reflected"] += 1
+                kept.append(url)
+            elif kind == "live":
+                stats["live"] += 1
+            else:
+                stats["dead"] += 1
+    return kept, stats
 
 # ── URL Categorisation (SQLite streaming) ─────────────────────────────────────
 def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_only_max: int = 100,
                           dedup_query_params: bool = True):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cats = ["params", "reflection", "forms", "admin", "login", "api", "sensitive", "other", "xss_targets"]
+    cats = ["params", "reflection", "forms", "admin", "login", "api", "sensitive", "other",
+            "xss_targets", "openredirect", "sqli"]
     db_path = out_dir / ".categorise_dedup.sqlite"
     if db_path.exists():
         try: db_path.unlink()
@@ -2972,6 +4189,17 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
     _mem_seen = set()
     _path_shapes_seen = set()
     _query_shapes_seen = set()
+    xss_best, redir_best, sqli_best = {}, {}, {}
+
+    def _remember(bucket, url, key, rank):
+        if not key or _static_asset_path(urlparse(url).path or ""):
+            return
+        cur = bucket.get(key)
+        if cur is None or rank(url) < rank(cur):
+            bucket[key] = url
+
+    def _sqli_rank(url):
+        return (0 if _url_has_sql_error(url) else 1, _xss_example_rank(url))
 
     def _w(cat, url):
         try:
@@ -3010,24 +4238,36 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
                 if _PAT_API.search(path):       _w("api", url)
                 if qs:
                     _w("params", url)
-                    if _has_reflection_param(qs):
-                        _w("reflection", url)
-                    # v8.2: dedupe what actually reaches dalfox by (host,
-                    # path-shape, sorted param-names) — ?id=1, ?id=2, ?id=3
-                    # on the same path all probe the exact same injection
-                    # point, so only the FIRST example of each unique shape
-                    # is sent. params.txt above stays complete/undeduped
-                    # (other stages may want every literal URL), this only
-                    # trims dalfox's own target list.
+                    names = _xss_param_names(qs)
+                    host = (parsed.hostname or parsed.netloc or "").lower()
+                    path_key = (parsed.path or "/").lower()
+                    xss_names = tuple(n for n in names if _is_xss_param_name(n))
+                    dom_names = tuple(n for n in names if _is_dom_param_name(n))
+                    stored_names = tuple(n for n in names if _is_stored_param_name(n))
+                    redir_names = tuple(n for n in names if _is_open_redirect_name(n))
+                    sqli_names = tuple(n for n in names if _is_sqli_param_name(n))
+                    keep_names = tuple(dict.fromkeys([*xss_names, *dom_names, *stored_names]))
+                    if redir_names:
+                        _remember(redir_best, url, (host, path_key, redir_names), _xss_example_rank)
+                    if keep_names:
+                        # Key is the parameter names, not the path. A second URL
+                        # with the same parameter does not get its own row.
+                        _remember(xss_best, url, (host, keep_names), _xss_example_rank)
+                    if sqli_names:
+                        _remember(sqli_best, url, (host, path_key, sqli_names), _sqli_rank)
+                    elif _url_has_sql_error(url):
+                        _remember(sqli_best, url, (host, path_key, ("__sql_error__",)), _sqli_rank)
+                    # XSS targets are the unique reflection examples, written
+                    # once after the file is scanned. Every extra value of the
+                    # same parameter used to land here and the XSS scan walked
+                    # all of them.
                     if dedup_query_params:
-                        q_shape = f"{parsed.netloc}{_path_shape(path)}?{_query_param_shape(qs)}"
+                        q_shape = (f"{(parsed.netloc or '').lower()}"
+                                   f"{_path_shape(path).lower()}?{_query_param_shape(qs)}")
                         if q_shape in _query_shapes_seen:
                             counts["xss_targets_query_dedup_skipped"] += 1
                         else:
                             _query_shapes_seen.add(q_shape)
-                            _w("xss_targets", url)
-                    else:
-                        _w("xss_targets", url)
                 else:
                     # v8.2: query string'i olmayan (path-only) URL'ler de dalfox'a
                     # gonderilir — dalfox kendi path-reflection + mining motoruyla
@@ -3041,6 +4281,11 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
                             _w("xss_targets", url)
                             if counts["xss_targets"] > before:
                                 counts["xss_targets_path_only"] += 1
+                    host_only = (parsed.hostname or "").lower()
+                    if _is_stored_path(path):
+                        _remember(xss_best, url,
+                                  (host_only, ("__stored__", (_path_shape(path).rstrip("/") or "/").lower())),
+                                  _xss_example_rank)
                     if _PAT_FORM.search(path):
                         _w("forms", url)
                     elif not any([_PAT_SENSITIVE.search(path), _PAT_ADMIN.search(path),
@@ -3049,6 +4294,14 @@ def categorise_streaming(url_file, out_dir, test_path_only: bool = True, path_on
                 batch += 1
                 if batch % 2000 == 0:
                     conn.commit()
+        xss_urls = unique_xss_params(list(xss_best.values()))
+        for url in xss_urls:
+            _w("reflection", url)
+            _w("xss_targets", url)
+        for url in redir_best.values():
+            _w("openredirect", url)
+        for url in sqli_best.values():
+            _w("sqli", url)
     finally:
         try:
             conn.commit()
@@ -3129,7 +4382,7 @@ def _kill_tree(proc, grace: float = 3.0):
 
 def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
             silent=False, stream=False, retries=2, retry_delay=5, stdin_file=None,
-            cwd=None):
+            cwd=None, job=None):
     # v8.8: stage_skip() zaten hard()'i de kapsar — "stage'i atla" secildiginde
     # bu stage'in KALAN cagrilari hic baslatilmadan atlanir (once baslatilip
     # hemen ardindan oldurulmesini beklemek yerine).
@@ -3139,7 +4392,8 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
     while True:
         _ok, _txt = _run_once(cmd, out_file=out_file, timeout=timeout,
                               log=log, label=label, silent=silent, stream=stream,
-                              attempt=_attempt, stdin_file=stdin_file, cwd=cwd)
+                              attempt=_attempt, stdin_file=stdin_file, cwd=cwd,
+                              job=job)
         if _INT.hard() or _INT.interrupted():
             return _ok, _txt
         file_lines = _count_lines(out_file) if (out_file and Path(out_file).exists() and Path(out_file).stat().st_size > 0) else 0
@@ -3163,6 +4417,7 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
                 lbl = shlex.split(cmd)[0]
             except Exception:
                 lbl = cmd.split()[0] if cmd.strip() else "cmd"
+        lbl = _public_activity(lbl)
         print(
             f"  {C.YELLOW}↻{C.RESET} {C.DIM}{lbl}{C.RESET} — "
             f"{C.YELLOW}0 lines, retry {_attempt}/{retries}{C.RESET} "
@@ -3177,7 +4432,8 @@ def run_cmd(cmd, out_file=None, timeout=120, log=None, label="",
             except: pass
 
 def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
-              silent=False, stream=False, attempt=0, stdin_file=None, cwd=None):
+              silent=False, stream=False, attempt=0, stdin_file=None, cwd=None,
+              job=None):
     if _INT.stage_skip():
         return False, ""
     if label:
@@ -3189,6 +4445,7 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
             label = shlex.split(cmd)[0]
         except Exception:
             label = cmd.split()[0] if str(cmd).strip() else "cmd"
+    label = _public_activity(label)
     start = time.time()
     if not silent:
         sub(f"{label}...")
@@ -3198,6 +4455,61 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
     stderr_buf  = [b""]
     timed_out   = [False]
     ctrl_killed = [False]
+    live        = _Live()
+    _seed_live(live, cmd, stdin_file=stdin_file, job=job)
+
+    def _drain(pipe, parts):
+        # BufferedReader.read(n) waits until n bytes or EOF, so a stats line
+        # would sit invisible until the tool exited. A raw read returns
+        # whatever is already there.
+        fd = pipe.fileno()
+        buf = b""
+        try:
+            while True:
+                try:
+                    chunk = os.read(fd, 1024)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                parts.append(chunk)
+                buf += chunk
+                while True:
+                    npos = buf.find(b"\n")
+                    rpos = buf.find(b"\r")
+                    if npos < 0 and rpos < 0:
+                        break
+                    # A carriage return is the tool redrawing one status line.
+                    # The meter already tracks that. A newline is a finished
+                    # line of tool output and belongs in the live console.
+                    if npos >= 0 and (rpos < 0 or npos <= rpos):
+                        split_at = npos
+                        finished = True
+                    else:
+                        split_at = rpos
+                        finished = False
+                    line_b = buf[:split_at]
+                    buf = buf[split_at + 1:]
+                    if not line_b.strip():
+                        continue
+                    decoded = line_b.decode("utf-8", "replace")
+                    try:
+                        _absorb_progress(decoded, live)
+                    except Exception:
+                        pass
+                    live.bump_line()
+                    if finished:
+                        _pipe_echo(decoded)
+            if buf.strip():
+                try:
+                    _absorb_progress(buf.decode("utf-8", "replace"), live)
+                except Exception:
+                    pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
 
     def _worker():
         try:
@@ -3210,18 +4522,26 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      start_new_session=True, cwd=cwd)
                 proc_ref[0] = p
-                out, err_out = p.communicate()
+                out_parts, err_parts = [], []
+                t_out = threading.Thread(target=_drain, args=(p.stdout, out_parts), daemon=True)
+                t_err = threading.Thread(target=_drain, args=(p.stderr, err_parts), daemon=True)
+                t_out.start()
+                t_err.start()
+                p.wait()
+                t_out.join(3)
+                t_err.join(3)
+                stdout_buf[0] = b"".join(out_parts)
+                stderr_buf[0] = b"".join(err_parts)
             finally:
                 if stdin_handle:
                     stdin_handle.close()
-            stdout_buf[0] = out or b""
-            stderr_buf[0] = err_out or b""
         except Exception as ex:
             stderr_buf[0] = str(ex).encode()
 
     worker      = threading.Thread(target=_worker, daemon=True)
     stop_spin   = threading.Event()
-    spin_thread = threading.Thread(target=_spinner, args=(stop_spin, label), daemon=True)
+    spin_thread = threading.Thread(
+        target=_spinner, args=(stop_spin, label, start, live), daemon=True)
     worker.start()
     if not silent:
         spin_thread.start()
@@ -3262,14 +4582,17 @@ def _run_once(cmd, out_file=None, timeout=120, log=None, label="",
         elif timed_out[0]:
             warn(f"{label} timed out ({timeout}s) — skipping")
         elif rc == 0:
-            ok(f"{label} ({elapsed}s) — {lc:,} lines")
+            unit = "line" if lc == 1 else "lines"
+            ok(f"{label} ({elapsed}s) — {lc:,} {unit}")
         else:
             warn(f"{label} exit {rc} ({elapsed}s)")
-            _snippet = strip_ansi(etxt).strip().splitlines()
-            if _snippet:
-                for _sl in _snippet[:6]:
-                    if _sl.strip():
-                        print(f"  {C.DIM}  └ {_sl.strip()[:160]}{C.RESET}", flush=True)
+            # On a pipe those stderr lines were already echoed as they arrived.
+            if sys.stdout.isatty():
+                for _sl in _useful_stderr_lines(etxt):
+                    print(f"  {C.DIM}  └ {_public_text(_sl[:160])}{C.RESET}", flush=True)
+    if live.job_locked and not ctrl_killed[0]:
+        _JOB_CLOCK["n"] += 1
+        _JOB_CLOCK["sec"] += elapsed
     _INT.reset_op()
     return (not timed_out[0] and not ctrl_killed[0] and rc == 0), txt
 
@@ -3308,51 +4631,47 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
     stalled     = [False]
     proc_ref    = [None]
     stop_spin  = threading.Event()
-    spin_label = label or (cmd[0] if isinstance(cmd, list) else cmd.split()[0])
+    spin_label = _public_activity(label or (cmd[0] if isinstance(cmd, list) else cmd.split()[0]))
+    live = _Live()
+    _seed_live(live, cmd)
 
     def _spin_ticker():
         frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
         i = 0
-        if not sys.stdout.isatty():
-            last_beat = time.time()
+        tty = sys.stdout.isatty()
+        # v8.3: shared _PRINT_LOCK with xss_live_hit() — a live finding
+        # print (from a dalfox line_cb, also running on the reader
+        # thread) and this spinner redraw both touch stdout with \r; the
+        # lock keeps one from garbling mid-write into the other.
+        if not tty:
+            last_beat = None
+            last_sig = None
             while not stop_spin.is_set():
-                if time.time() - last_beat >= 20:
-                    elapsed = int(time.time() - start)
-                    live = ""
-                    if status:
-                        live = str(status.get("text") or "")
-                    extra = f" {live}" if live else ""
-                    print(f"  {C.DIM}… {spin_label}{extra} — "
-                          f"{total_lines[0]:,} lines, {elapsed}s{C.RESET}", flush=True)
-                    last_beat = time.time()
-                time.sleep(0.5)
+                _absorb_status_text(status, live)
+                now = time.time()
+                snap = live.snapshot()
+                sig = (snap[0], snap[6])
+                moved = sig != last_sig and (snap[0] not in (None, 0) or snap[6])
+                due = last_beat is None and now - start >= 0.6
+                due = due or (last_beat is not None and moved and now - last_beat >= 1.0)
+                due = due or (last_beat is not None and now - last_beat >= 3)
+                if due:
+                    _show_progress("…", spin_label, start, live, False)
+                    last_beat = now
+                    last_sig = sig
+                time.sleep(0.3)
+            if last_beat is not None and (live.snapshot()[0], live.snapshot()[6]) != last_sig:
+                _show_progress("…", spin_label, start, live, False)
             return
         while not stop_spin.is_set():
             if _SPINNER_PAUSE.is_set():
                 time.sleep(0.05)
                 continue
-            elapsed = round(time.time() - start, 0)
-            # v8.3: shared _PRINT_LOCK with xss_live_hit() — a live finding
-            # print (from a dalfox line_cb, also running on the reader
-            # thread) and this spinner redraw both touch stdout with \r; the
-            # lock keeps one from garbling mid-write into the other.
-            live = ""
-            if status:
-                live = str(status.get("text") or "")
-            with _PRINT_LOCK:
-                sys.stdout.write(
-                    f"\r  {C.CYAN}{frames[i % len(frames)]}{C.RESET} "
-                    f"{C.DIM}{spin_label}{C.RESET} "
-                    + (f"{C.WHITE}{live}{C.RESET} " if live else "")
-                    + f"{C.DIM}processing {total_lines[0]:,} lines{C.RESET} "
-                      f"{C.DIM}{int(elapsed)}s{C.RESET}   "
-                )
-                sys.stdout.flush()
+            _absorb_status_text(status, live)
+            _show_progress(frames[i % len(frames)], spin_label, start, live, True)
             i += 1
             time.sleep(0.12)
-        with _PRINT_LOCK:
-            sys.stdout.write(f"\r{' ' * 120}\r")
-            sys.stdout.flush()
+        _clear_progress(True)
 
     spin_thread = threading.Thread(target=_spin_ticker, daemon=True)
 
@@ -3367,8 +4686,12 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
             )
             proc_ref[0] = p
             buf = b""
+            out_fd = p.stdout.fileno()
             while True:
-                chunk = p.stdout.read(256)
+                try:
+                    chunk = os.read(out_fd, 1024)
+                except OSError:
+                    break
                 if not chunk:
                     break
                 buf += chunk
@@ -3379,8 +4702,14 @@ def _stream_tool(cmd, timeout: int, log=None, label: str = "",
                     if not line:
                         continue
                     total_lines[0] += 1
+                    live.bump_line()
+                    try:
+                        _absorb_progress(line, live)
+                    except Exception:
+                        pass
                     if line_cb:
                         line_cb(line)
+                    _pipe_echo(line)
             p.wait()
             rc[0] = p.returncode
         except Exception as ex:
@@ -3731,27 +5060,44 @@ def perform_request_login(request_file: str, cfg: dict, timeout: int = 60, log=N
 # ══════════════════════════════════════════════════════════════════════════════
 # v6.13: CORS / Subdomain Takeover / Cloud Bucket helper functions
 # ══════════════════════════════════════════════════════════════════════════════
+def _timed_get(url: str, cfg: dict, headers: dict, timeout: int = 12):
+    """One GET with a connect timeout that is actually honored.
+
+    The browser-impersonation client stacks calls and stops respecting
+    timeout=, which made CORS and bucket checks look stuck. These checks
+    only need the status and a header or a short body."""
+    client = _py_requests if _py_requests is not None else None
+    is_cffi = False
+    if client is None:
+        client, is_cffi = _get_http_client(cfg)
+    if client is None:
+        return None
+    connect = min(3, max(1, int(timeout or 12)))
+    kw = dict(timeout=(connect, int(timeout or 12)), allow_redirects=True,
+              headers=headers, verify=False)
+    proxy = _resolve_proxy(cfg)
+    if proxy:
+        kw["proxies"] = {"http": proxy, "https": proxy}
+    if is_cffi:
+        kw["impersonate"] = _cfg_get(cfg, "settings", "curl_cffi_impersonate", default="chrome110")
+    return client.get(url, **kw)
+
+
 def check_cors_misconfig(url: str, cfg: dict, log=None) -> dict:
     """Origin header'i yansitilan/wildcard+credentials birlesimini test eder.
     Sadece header inceler; hicbir exploit/veri sizdirma denemesi yapmaz."""
-    res = {"url": url, "vulnerable": False, "detail": "", "acao": "", "acac": ""}
-    client, is_cffi = _get_http_client(cfg)
-    if client is None:
-        return res
+    res = {"url": url, "vulnerable": False, "detail": "", "acao": "", "acac": "", "checked": False}
     test_origin = (_cfg_get(cfg, "tools", "cors_test_origin",
                              default="https://reconx-cors-probe.invalid") or "").strip()
     host = _extract_domain_from_any(url) or ""
     headers = pick_header_strategy(host, cfg)
     headers["Origin"] = test_origin
     try:
-        kw = dict(timeout=12, allow_redirects=True, headers=headers)
-        kw["verify"] = False
-        proxy = _resolve_proxy(cfg)
-        if proxy:
-            kw["proxies"] = {"http": proxy, "https": proxy}
-        if is_cffi:
-            kw["impersonate"] = _cfg_get(cfg, "settings", "curl_cffi_impersonate", default="chrome110")
-        r = client.get(url, **kw)
+        r = _timed_get(url, cfg, headers, timeout=12)
+        if r is None:
+            res["detail"] = "no HTTP client"
+            return res
+        res["checked"] = True
         hdrs = {str(k).lower(): str(v) for k, v in (getattr(r, "headers", {}) or {}).items()}
         acao = hdrs.get("access-control-allow-origin", "")
         acac = hdrs.get("access-control-allow-credentials", "").lower()
@@ -3802,20 +5148,11 @@ def check_subdomain_takeover(host_url: str, cfg: dict, log=None) -> dict:
     if not match:
         return res
     service, sigs = match
-    client, is_cffi = _get_http_client(cfg)
-    if client is None:
-        res["detail"] = f"CNAME -> {service} detected but HTTP verification could not run"
-        return res
     try:
-        kw = dict(timeout=10, allow_redirects=True,
-                  headers=pick_header_strategy(domain, cfg))
-        kw["verify"] = False
-        proxy = _resolve_proxy(cfg)
-        if proxy:
-            kw["proxies"] = {"http": proxy, "https": proxy}
-        if is_cffi:
-            kw["impersonate"] = _cfg_get(cfg, "settings", "curl_cffi_impersonate", default="chrome110")
-        r = client.get(f"https://{domain}", **kw)
+        r = _timed_get(f"https://{domain}", cfg, pick_header_strategy(domain, cfg), timeout=10)
+        if r is None:
+            res["detail"] = f"CNAME -> {service} detected but HTTP verification could not run"
+            return res
         body = (getattr(r, "text", "") or "").lower()
         for sig in sigs:
             if sig in body:
@@ -3861,24 +5198,143 @@ def find_cloud_bucket_candidates(url_files: list) -> list:
     return sorted(found)
 
 
+def _cloud_enum_script() -> tuple:
+    """(argv0..., cwd) for cloud_enum. Empty argv0 means it is not installed."""
+    system = shutil.which("cloud_enum") or shutil.which("cloud_enum.py")
+    if system:
+        return [system], None
+    local = Path.home() / ".local" / "share" / "reconx" / "cloud_enum" / "cloud_enum.py"
+    if local.exists():
+        return [sys.executable, str(local)], str(local.parent)
+    return [], None
+
+
+def _bucket_keywords(target: str) -> list:
+    """The name a bucket is usually built from: the organisation label, not every host."""
+    host = (target or "").strip().lower()
+    host = host.split("://")[-1].split("/")[0].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    skip = {"www", "com", "net", "org", "edu", "gov", "ac", "co", "io", "lab",
+            "local", "tr", "uk", "de", "fr", "app", "dev", "www2"}
+    labels = [p for p in host.split(".") if p and p not in skip]
+    keys = []
+    for label in labels[:2]:
+        key = re.sub(r"[^a-z0-9-]", "", label)
+        if len(key) >= 3 and key not in keys:
+            keys.append(key)
+    return keys[:2]
+
+
+def run_cloud_enum(keywords: list, out_dir: Path, cfg: dict) -> dict:
+    """Find open and protected buckets for these names. Read-only.
+
+    cloud_enum probes AWS S3, Azure and Google Cloud. Hits are returned for
+    the report; the tool is not asked to download object bodies.
+    """
+    out = {"ran": False, "error": "", "hits": [], "keywords": list(keywords or [])}
+    argv0, cwd = _cloud_enum_script()
+    if not argv0:
+        out["error"] = "cloud_enum is not installed"
+        return out
+    if not keywords:
+        out["error"] = "no keyword could be derived from the target"
+        return out
+    threads = int(_cfg_get(cfg, "tools", "cloud_enum_threads", default=8) or 8)
+    threads = max(1, min(threads, 20))
+    budget = int(_cfg_get(cfg, "tools", "cloud_enum_timeout", default=900) or 900)
+    budget = max(30, budget)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logf = out_dir / "cloud_enum.jsonl"
+    try:
+        logf.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    argv = list(argv0)
+    for key in keywords:
+        argv += ["-k", key]
+    argv += ["-t", str(threads), "-f", "json", "-l", str(logf)]
+    info(f"Cloud bucket: cloud_enum keywords {', '.join(keywords)} "
+         f"(AWS S3, Azure, Google Cloud, {threads} threads, {budget}s cap)")
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, start_new_session=True)
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+    t0 = time.time()
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if _INT.stage_skip() or (time.time() - t0) > budget:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.kill()
+                break
+            text = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if not text or text.endswith("complete..."):
+                continue
+            if text.startswith("FILES:") or text.startswith("->"):
+                continue
+            sub(text[:200])
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+    out["ran"] = True
+    hits = []
+    seen = set()
+    try:
+        for line in logf.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            url = str(rec.get("target") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            access = str(rec.get("access") or "").lower()
+            platform = str(rec.get("platform") or "").lower()
+            provider = {"aws": "AWS S3", "azure": "Azure", "gcp": "Google Cloud"}.get(platform, platform or "cloud")
+            public = access == "public"
+            hits.append({
+                "url": url,
+                "provider": provider,
+                "status": "exists_public" if public else "exists_protected",
+                "public_listing": public,
+                "detail": str(rec.get("msg") or ("public listing" if public else "exists, access denied")),
+            })
+    except OSError:
+        pass
+    out["hits"] = hits
+    return out
+
+
 def check_cloud_bucket(bucket_url: str, provider: str, cfg: dict, log=None) -> dict:
     """Bucket'in var olup olmadigini ve genel listelemeye acik olup olmadigini kontrol eder.
     Yalnizca GET/HEAD ile okur — yazma/silme denemesi asla yapilmaz."""
     res = {"url": bucket_url, "provider": provider, "status": "unknown", "public_listing": False, "detail": ""}
-    client, is_cffi = _get_http_client(cfg)
-    if client is None:
-        return res
     timeout = int(_cfg_get(cfg, "tools", "cloud_bucket_timeout", default=10))
     try:
-        kw = dict(timeout=timeout, allow_redirects=True,
-                  headers={"User-Agent": _pick_ua()})
-        kw["verify"] = False
-        proxy = _resolve_proxy(cfg)
-        if proxy:
-            kw["proxies"] = {"http": proxy, "https": proxy}
-        if is_cffi:
-            kw["impersonate"] = _cfg_get(cfg, "settings", "curl_cffi_impersonate", default="chrome110")
-        r = client.get(bucket_url, **kw)
+        r = _timed_get(bucket_url, cfg, {"User-Agent": _pick_ua()}, timeout=timeout)
+        if r is None:
+            res["detail"] = "no HTTP client"
+            return res
         status = int(getattr(r, "status_code", 0) or 0)
         body = (getattr(r, "text", "") or "")[:4000]
         bl = body.lower()
@@ -4451,7 +5907,8 @@ class ReconPipeline:
             threads = self._tuned_threads(min(base_threads, 80), 80)
             httpx_json = d / "httpx_authenticated.json"
             httpx_cmd = (
-                f"{httpx_bin} -l {seed_file} -no-color -threads {threads} -timeout 20 -retries 2 "
+                f"{httpx_bin} -l {seed_file} -no-color {_stats_cli(_help_text(httpx_bin), 2)}"
+                f"-threads {threads} -timeout 20 -retries 2 "
                 f"-follow-redirects -status-code -title -tech-detect -content-length "
                 + (f"-http-proxy {_resolve_proxy(self.cfg)} " if _TOR_ACTIVE.is_set() else "")
                 + _hdr_args_httpx(auth_headers)
@@ -4600,7 +6057,7 @@ class ReconPipeline:
                            f"(the other scheme did not connect)")
             (d / "http_probe.json").write_text(json.dumps(probe, ensure_ascii=False, indent=2), encoding="utf-8")
             if probe.get("ok"):
-                ok(f"HTTP probe: {probe.get('status')} ({probe.get('client')}) "
+                ok(f"HTTP probe: {probe.get('status')} "
                    f"server={probe.get('server','?')} len={probe.get('len','?')}")
                 waf = probe.get("waf_fingerprint") or []
                 if waf:
@@ -4627,9 +6084,13 @@ class ReconPipeline:
                 return True
             return any(s in head for s in ("no match for", "not found", "no data found", "no entries found"))
 
-        _, whois_out = run_cmd(["whois", tgt], timeout=T["whois"], log=self.log,
-                               label="whois", retries=0)
-        if _whois_miss(whois_out):
+        if _is_private_or_local_host(tgt):
+            sub(f"whois skipped: {tgt} is local or private — a public whois record does not exist")
+            whois_out = ""
+        else:
+            _, whois_out = run_cmd(["whois", tgt], timeout=T["whois"], log=self.log,
+                                   label="whois", retries=0)
+        if _whois_miss(whois_out) and not _is_private_or_local_host(tgt):
             labels = [p for p in tgt.split(".") if p]
             parent = ".".join(labels[-2:]) if len(labels) > 2 else ""
             if parent and parent != tgt:
@@ -4645,6 +6106,26 @@ class ReconPipeline:
                     whois_out = alt
         if whois_out.strip() and not _whois_miss(whois_out):
             (d / "whois.txt").write_text(whois_out, encoding="utf-8", errors="replace")
+        nameservers = lookup_nameservers(tgt)
+        if nameservers:
+            (d / "dns.txt").write_text("\n".join(f"NS {ns}" for ns in nameservers) + "\n", encoding="utf-8")
+            sub(f"DNS lookup: {', '.join(nameservers[:4])}")
+        contact_bases = []
+        if probe.get("ok") and probe.get("final_url"):
+            contact_bases.append(probe["final_url"])
+        elif probe.get("ok") and probe.get("url"):
+            contact_bases.append(probe["url"])
+        contact_bases.append(f"https://{tgt}")
+        contact_bases.append(f"https://www.{tgt}")
+        contact_bases.append(f"http://www.{tgt}")
+        found = harvest_public_contacts(contact_bases, self.cfg, limit=8)
+        if probe.get("emails") or probe.get("phones"):
+            found = _merge_contacts(found, {"emails": probe.get("emails") or [],
+                                            "phones": probe.get("phones") or [],
+                                            "sources": [probe.get("final_url") or probe.get("url") or ""]})
+        if found.get("emails") or found.get("phones"):
+            (d / "contacts.json").write_text(json.dumps(found, ensure_ascii=False, indent=2), encoding="utf-8")
+            sub(f"Site contacts: {len(found.get('emails') or [])} email, {len(found.get('phones') or [])} phone")
         if tool_exists("whatweb"):
             # v8.3-fix: was bare "{tgt}" (no scheme/port -> whatweb assumes
             # :80) — now the real seed scheme+port when one is known (see
@@ -4674,7 +6155,8 @@ class ReconPipeline:
         if tool_exists("nmap"):
             nmap_target = target_ip if target_ip else tgt
             run_cmd(
-                f"nmap -sV -sC --open -T4 --top-ports 1000 --min-rate 250 --version-intensity 2 {nmap_target} -oN {d}/nmap.txt",
+                f"nmap -v -sV -sC --open -T4 --top-ports 1000 --min-rate 250 --version-intensity 2 "
+                f"--stats-every 5s {nmap_target} -oN {d}/nmap.txt",
                 timeout=T["nmap"], log=self.log, label="nmap", retries=1, retry_delay=5
             )
         else:
@@ -4780,6 +6262,164 @@ class ReconPipeline:
         info(f"Total unique subdomains: {n:,}")
         self.summary["stage2"] = {"status": "done", "count": n}
 
+    def _fingerprint_target_list(self, urls) -> tuple:
+        """One origin per live host. The apex is always first, then www, then
+        the rest. A dead apex is still included so -d fingerprints the main
+        domain the same way -u does, and falls through to www when that is
+        the host that actually answered."""
+        by_host = {}
+        for raw in urls or []:
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            if not raw.startswith(("http://", "https://")):
+                raw = self._host_url(raw)
+            try:
+                parsed = urlparse(raw)
+            except Exception:
+                continue
+            host = (parsed.hostname or "").lower()
+            if not host or not parsed.scheme or not parsed.netloc:
+                continue
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            prev = by_host.get(host)
+            if prev is None or (parsed.scheme == "https" and prev.startswith("http://")):
+                by_host[host] = origin
+        apex = (self.target or "").strip().lower()
+        ordered = []
+        if apex and apex in by_host:
+            ordered.append(by_host.pop(apex))
+        elif apex:
+            ordered.append(self._host_url(apex))
+        www = f"www.{apex}" if apex else ""
+        if www and www in by_host:
+            ordered.append(by_host.pop(www))
+        ordered.extend(sorted(by_host.values()))
+        seen = set()
+        unique = []
+        for origin in ordered:
+            if origin in seen:
+                continue
+            seen.add(origin)
+            unique.append(origin)
+        cap = int(_cfg_get(self.cfg, "settings", "fingerprint_host_cap", default=60) or 60)
+        cap = max(1, cap)
+        return unique[:cap], max(0, len(unique) - cap)
+
+    def _main_fingerprint_url(self, urls) -> str:
+        """Prefer the apex when it answered. Otherwise the www host, which is
+        the site most apex names redirect to. Last resort is the apex URL
+        itself so the main domain is still tested."""
+        by_host = {}
+        for raw in urls or []:
+            raw = (raw or "").strip()
+            if not raw.startswith(("http://", "https://")):
+                continue
+            try:
+                parsed = urlparse(raw)
+            except Exception:
+                continue
+            host = (parsed.hostname or "").lower()
+            if host and host not in by_host:
+                by_host[host] = f"{parsed.scheme}://{parsed.netloc}"
+        apex = (self.target or "").strip().lower()
+        if apex and apex in by_host:
+            return by_host[apex]
+        www = f"www.{apex}" if apex else ""
+        if www and www in by_host:
+            return by_host[www]
+        return self._host_url(apex or self.target)
+
+    def _fingerprint_web_estate(self, urls):
+        """whatweb/wafw00f for every live host. Stage 1 only ever sees the
+        apex, and an apex that does not answer on :443 leaves an empty
+        technology log while www and the subdomains are up. This pass runs
+        after host validation, always includes the main domain, and writes a
+        one-line record per host plus a detailed report for the main site."""
+        targets, omitted = self._fingerprint_target_list(urls)
+        if not targets:
+            return
+        d = self.out / "01_recon"
+        d.mkdir(parents=True, exist_ok=True)
+        listing = d / "fingerprint_targets.txt"
+        write_lines(listing, targets)
+        main = self._main_fingerprint_url(urls)
+        if main not in targets:
+            main = targets[0]
+        info(f"Fingerprinting {len(targets):,} host(s), main site {main}")
+        if omitted:
+            sub(f"{omitted:,} further hosts left for a later pass "
+                f"(settings.fingerprint_host_cap)")
+        probe_path = d / "http_probe.json"
+        probe = {}
+        if probe_path.exists():
+            try:
+                probe = json.loads(probe_path.read_text(encoding="utf-8", errors="replace")) or {}
+            except Exception:
+                probe = {}
+        if not probe.get("ok"):
+            fresh = http_probe(main, self.cfg, timeout=12)
+            if not fresh.get("ok"):
+                alt = _flip_scheme(main)
+                if alt:
+                    alt_probe = http_probe(alt, self.cfg, timeout=8)
+                    if alt_probe.get("ok"):
+                        fresh = alt_probe
+                        main = alt
+            if fresh.get("ok"):
+                probe_path.write_text(json.dumps(fresh, ensure_ascii=False, indent=2), encoding="utf-8")
+                ok(f"HTTP probe: {fresh.get('status')} server={fresh.get('server', '?')} ({main})")
+        if tool_exists("whatweb"):
+            ww = d / "whatweb.txt"
+            already = ""
+            if ww.exists() and ww.stat().st_size > 40:
+                already = ww.read_text(encoding="utf-8", errors="replace")
+            if main not in already:
+                if ww.exists():
+                    try:
+                        ww.unlink()
+                    except Exception:
+                        pass
+                run_cmd(
+                    ["whatweb", main, "-a", "3", "--open-timeout=10", "--read-timeout=30",
+                     f"--log-verbose={ww}"],
+                    timeout=T["whatweb"], log=self.log, label="whatweb", retries=0,
+                )
+            brief = d / "whatweb_hosts.txt"
+            if brief.exists():
+                try:
+                    brief.unlink()
+                except Exception:
+                    pass
+            run_cmd(
+                ["whatweb", f"--input-file={listing}", "-a", "1",
+                 "--open-timeout=8", "--read-timeout=20",
+                 f"--log-brief={brief}"],
+                timeout=T["whatweb"], log=self.log, label="whatweb", retries=0,
+            )
+            if brief.exists() and brief.stat().st_size > 0:
+                ok(f"Technology fingerprint: {_count_lines(brief):,} hosts → {brief.name}")
+        else:
+            sub("whatweb not found")
+        if tool_exists("wafw00f"):
+            waf_out = d / "wafw00f_hosts.txt"
+            run_cmd(
+                ["wafw00f", "-i", str(listing), "-a", "--no-colors", "-o", str(waf_out)],
+                timeout=min(3600, max(T["wafw00f"], 25 * len(targets))),
+                log=self.log, label="wafw00f", retries=0,
+            )
+            if waf_out.exists() and waf_out.stat().st_size > 0:
+                prev = ""
+                existing = d / "wafw00f.txt"
+                if existing.exists():
+                    prev = existing.read_text(encoding="utf-8", errors="replace")
+                fresh = waf_out.read_text(encoding="utf-8", errors="replace")
+                existing.write_text((prev.rstrip() + "\n" + fresh).strip() + "\n",
+                                    encoding="utf-8", errors="replace")
+                ok(f"WAF detection: {len(targets):,} hosts")
+        else:
+            sub("wafw00f not found")
+
     # ── Stage 3 ───────────────────────────────────────────────────────────────
     def _run_httpx_alive_probe(self, target_file: Path, out_dir: Path, label: str = "httpx",
                                 probe_ports: bool = True) -> tuple:
@@ -4840,8 +6480,9 @@ class ReconPipeline:
         else:
             ports_flag = ""
         tor_flag = f"-http-proxy {_resolve_proxy(self.cfg)} " if _TOR_ACTIVE.is_set() else ""
+        stats_flag = _stats_cli(hh, 2)
         httpx_cmd = (
-            f"{httpx_bin} -l {target_file} {noc_flag} "
+            f"{httpx_bin} -l {target_file} {noc_flag} {stats_flag}"
             f"-threads {threads} -timeout 20 -retries 2 {fr_flag} "
             f"-status-code -title -tech-detect -ip -server -content-length -response-time "
             f"{fav_flag} "
@@ -4882,7 +6523,7 @@ class ReconPipeline:
         if not alive_urls and _count_lines(target_file) > 0:
             warn(f"{label} returned no hosts — retrying with a plain request")
             plain = (
-                f"{httpx_bin} -l {target_file} -silent {noc_flag} "
+                f"{httpx_bin} -l {target_file} -silent {noc_flag} {stats_flag}"
                 f"-timeout 15 -retries 1 {fr_flag} "
                 f"-status-code -title -tech-detect -ip -server -content-length "
                 f"-response-time {json_flag} -o {json_out}"
@@ -4893,7 +6534,7 @@ class ReconPipeline:
         return alive_urls, status_cnt
 
     def stage3_alive(self):
-        stage(3, "Host Validation — httpx")
+        stage(3, "Host Validation")
         d = self.out / "03_alive"
         if self._cp_ok("stage3_alive"):
             n = _count_lines(self._cp("stage3_alive"))
@@ -4903,10 +6544,10 @@ class ReconPipeline:
         sub_file = self._cp("stage2_subdomains")
         if not sub_file.exists() or sub_file.stat().st_size == 0:
             warn("No subdomain file — using domain directly")
-            n = checkpoint(self._cp("stage3_alive"),
-                           [self._host_url(self.target)],
-                           "alive-fallback")
+            fallback = [self._host_url(self.target)]
+            n = checkpoint(self._cp("stage3_alive"), fallback, "alive-fallback")
             self.summary["stage3"] = {"status": "done", "count": n, "note": "fallback"}
+            self._fingerprint_web_estate(fallback)
             return
         httpx_bin = _pd_httpx()
         if not httpx_bin:
@@ -4916,6 +6557,7 @@ class ReconPipeline:
             urls = sorted({s if s.startswith("http") else self._host_url(s) for s in subs})
             n = checkpoint(self._cp("stage3_alive"), urls, "alive-nohttpx")
             self.summary["stage3"] = {"status": "done", "count": n, "note": "no-httpx"}
+            self._fingerprint_web_estate(urls)
             return
         alive_urls, status_cnt = self._run_httpx_alive_probe(sub_file, d, label=httpx_bin)
         total_scanned = sum(status_cnt.values()) if status_cnt else 0
@@ -4934,7 +6576,7 @@ class ReconPipeline:
         if bool(_cfg_get(self.cfg, "tools", "dnsx_enabled", default=True)) and tool_exists("dnsx"):
             try:
                 dnsx_tmp = d / "dnsx_validated.txt"
-                run_cmd(f"dnsx -l {self._cp('stage3_alive')} -o {dnsx_tmp} -silent",
+                run_cmd(f"dnsx -l {self._cp('stage3_alive')} {_stats_cli(_help_text('dnsx'), 2)}-silent -o {dnsx_tmp}",
                         timeout=300, log=self.log, label="dnsx", retries=1, retry_delay=3)
                 if dnsx_tmp.exists() and dnsx_tmp.stat().st_size > 0:
                     dnsx_valid = [l.strip() for l in dnsx_tmp.read_text(errors="ignore").splitlines() if l.strip()]
@@ -4947,6 +6589,7 @@ class ReconPipeline:
         n = checkpoint(self._cp("stage3_alive"), alive_urls, "alive-hosts")
         info(f"Alive hosts: {n:,}")
         self.summary["stage3"] = {"status": "done", "count": n, "block_ratio": round(self.block_ratio, 4)}
+        self._fingerprint_web_estate(alive_urls)
 
     def _prune_dead_urls(self, raw_all: Path, out_dir: Path) -> tuple:
         """v8.2: gau/katana bring back URLs from historical archives (Wayback,
@@ -4995,7 +6638,7 @@ class ReconPipeline:
         fc_flag = f"-fc {codes}" if codes else ""
         prune_http_timeout = 15
         cmd = (
-            f"{httpx_bin} -l {raw_all} {noc_flag} -silent "
+            f"{httpx_bin} -l {raw_all} {noc_flag} -silent {_stats_cli(hh, 2)}"
             f"-threads {threads} -timeout {prune_http_timeout} -retries 1 {fc_flag} "
             + _hdr_args_httpx(headers)
             + f" -o {pruned_file}"
@@ -5177,10 +6820,53 @@ class ReconPipeline:
         n_final = _count_lines(final_file)
         shutil.copy2(final_file, self._cp("stage4_urls"))
         info(f"Total unique URLs: {n:,}" + (f" — {n_final:,} live after pruning" if final_file != raw_all else ""))
+        self._harvest_contacts_from_urls(url_files, alive_hosts)
         self.summary["stage4"] = {
             "status": "done", "count": n_final, "count_before_pruning": n,
             "canonicalized": bool(normalize), "prune": prune_stats,
         }
+
+    def _harvest_contacts_from_urls(self, url_files, alive_hosts):
+        """Pull mailto/tel out of discovery output, then open a few contact pages."""
+        blobs = []
+        contact_urls = []
+        for src in url_files or []:
+            try:
+                text = Path(src).read_text(errors="ignore") if Path(src).exists() else ""
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            blobs.append(text)
+            for line in text.splitlines():
+                low = line.lower()
+                if low.startswith("http") and _CONTACT_URL_RE.search(line) and self._is_in_scope_url(line):
+                    contact_urls.append(line.strip())
+                if len(contact_urls) >= 12:
+                    break
+        bases = []
+        for host in alive_hosts or []:
+            if host.startswith("http"):
+                p = urlparse(host)
+                if p.scheme and p.netloc:
+                    bases.append(f"{p.scheme}://{p.netloc}")
+            if len(bases) >= 3:
+                break
+        bases.append(f"https://{self.target}")
+        bases.append(f"https://www.{self.target}")
+        found = harvest_public_contacts(bases, self.cfg, extra_urls=contact_urls[:6], blobs=blobs, limit=6)
+        dest = self.out / "01_recon" / "contacts.json"
+        prev = {}
+        if dest.exists():
+            try:
+                prev = json.loads(dest.read_text(errors="ignore")) or {}
+            except Exception:
+                prev = {}
+        merged = _merge_contacts(prev, found)
+        if merged.get("emails") or merged.get("phones"):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+            sub(f"Site contacts: {len(merged['emails'])} email, {len(merged['phones'])} phone")
 
     # ── Stage 5 ───────────────────────────────────────────────────────────────
     def stage5_categorise(self):
@@ -5199,7 +6885,7 @@ class ReconPipeline:
         path_only_added = counts.pop("xss_targets_path_only", 0)
         query_dedup_skipped = counts.pop("xss_targets_query_dedup_skipped", 0)
 
-        for name in ["reflection", "xss_targets", "params", "forms"]:
+        for name in ["reflection", "xss_targets", "params", "forms", "openredirect", "sqli"]:
             p = d / f"{name}.txt"
             if p.exists() and p.stat().st_size > 0:
                 shutil.copy2(p, self._cp(f"stage5_{name}"))
@@ -5453,8 +7139,9 @@ class ReconPipeline:
         _dalfox_stall_sec = int(_cfg_get(self.cfg, "tools", "dalfox_stall_timeout_sec", default=0) or 0)
         _cap_note = (f" (per-URL cap {int(timeout_sec)}s)" if timeout_sec
                      else ("" if _dalfox_stall_sec else " (no stall limit — only the stage time ceiling applies)"))
-        info(f"Dalfox is running against {_count_lines(xss_file):,} targets "
-             f"— progress streams below, runtime scales with the target count{_cap_note}")
+        if _count_lines(xss_file) != 1:
+            info(f"Dalfox is running against {_count_lines(xss_file):,} targets "
+                 f"— progress streams below, runtime scales with the target count{_cap_note}")
 
         # v8.3: live XSS-hit display. On dalfox v2.x (Go), DalLog("PRINT", ...)
         # writes each finding's raw JSON both to its -o output file AND to
@@ -5758,6 +7445,73 @@ class ReconPipeline:
         res["file_json"] = str(json_f)
         return res
 
+    def _flush_xss_progress(self, d: Path, results, finished, incomplete, total: int, started: float):
+        """Write findings collected so far so a report refresh mid-scan can see them.
+
+        The merged file is otherwise written only when every URL has finished.
+        A refresh before that used to open the old report, with an empty XSS section.
+        """
+        try:
+            lines = []
+            findings_n = 0
+            for _url, record in results:
+                if not record:
+                    continue
+                findings_n += int(record.get("findings") or 0)
+                pj = record.get("file_json") or ""
+                if pj and Path(pj).exists():
+                    for ln in Path(pj).read_text(encoding="utf-8", errors="replace").splitlines():
+                        if ln.strip():
+                            lines.append(ln.rstrip("\n"))
+            out = d / "dalfox_scan.json"
+            out.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+            stage = {
+                "status": "partial",
+                "findings": findings_n,
+                "count": findings_n,
+                "file_json": str(out),
+                "tool_failed": False,
+                "interrupted": False,
+                "budget_hit": False,
+                "duration_sec": round(time.time() - started, 1),
+                "targets_count": total,
+                "targets_finished": len(finished),
+                "targets_incomplete": len(incomplete),
+            }
+            self.summary["stage6"] = {**self.summary.get("stage6", {}), **stage}
+            sf = self.out / "SUMMARY.json"
+            prior = {}
+            if sf.exists():
+                try:
+                    prior = json.loads(sf.read_text(encoding="utf-8", errors="replace")) or {}
+                except Exception:
+                    prior = {}
+            stages = dict(prior.get("stages") or {})
+            stages["stage6"] = {**stages.get("stage6", {}), **stage}
+            prior["stages"] = stages
+            prior.setdefault("target", self.target)
+            tmp = sf.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(prior, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(sf)
+        except Exception:
+            pass
+
+    def _dalfox_job_count(self, host_count: int) -> int:
+        """How many XSS URLs to run at once. 0 in config means one per CPU.
+        Never more than the number of distinct hosts, so one host is not
+        fuzzed by two processes at the same time."""
+        raw = _cfg_get(self.cfg, "tools", "dalfox_parallel_jobs", default=0)
+        try:
+            jobs = int(0 if raw is None else raw)
+        except (TypeError, ValueError):
+            jobs = 0
+        if jobs <= 0:
+            jobs = os.cpu_count() or 4
+        jobs = max(1, min(jobs, 8))
+        if host_count > 0:
+            jobs = min(jobs, host_count)
+        return jobs
+
     def _run_dalfox_per_url(self, xss_file: Path, d: Path, run_tag: str) -> dict:
         """Scan each URL in its own dalfox process with a wall-clock cap.
 
@@ -5778,37 +7532,121 @@ class ReconPipeline:
         stage_budget = min(stage_budget, T["dalfox"]) if stage_budget > 0 else T["dalfox"]
         one_dir = d / "dalfox_per_url"
         one_dir.mkdir(parents=True, exist_ok=True)
-        info(f"Dalfox: {len(urls)} URLs, one process each, {per}s cap per URL "
-             f"(stage ceiling {stage_budget}s)")
+        hosts = {(urlparse(u).hostname or "").lower() for u in urls}
+        jobs = self._dalfox_job_count(len(hosts))
+        if jobs == 1:
+            info(f"XSS testing {len(urls)} URL(s), one at a time, {per}s cap per URL "
+                 f"(stage ceiling {stage_budget}s)")
+        else:
+            info(f"XSS testing {len(urls)} URL(s), {jobs} at a time across {len(hosts)} hosts, "
+                 f"{per}s cap per URL (stage ceiling {stage_budget}s)")
 
-        finished, incomplete = [], []
+        finished, incomplete, skipped = [], [], []
+        hit_points = set()
         results = []
         t0 = time.time()
-        for i, u in enumerate(urls):
-            if _INT.hard() or _INT.interrupted() or getattr(self, "_budget_fired", False):
-                break
-            remaining = stage_budget - (time.time() - t0)
-            if remaining < 20:
-                break
-            cap = max(20, min(per, int(remaining)))
-            cf = one_dir / f"u{i}.txt"
-            write_lines(cf, [u])
-            info(f"Dalfox URL {i + 1}/{len(urls)} — cap {cap}s — {u[:120]}")
-            r = self._run_dalfox_once(cf, one_dir, f"u{i}", timeout_sec=cap)
-            results.append((u, r))
-            if r.get("stopped_after_hit"):
-                finished.append(u)
+        pending = list(enumerate(urls))
+        busy = set()
+        futures = {}
+        stop = False
+
+        def _drop_same_point(point):
+            if not point:
+                return
+            kept, n = [], 0
+            for item in pending:
+                if _xss_injection_point(item[1]) == point:
+                    skipped.append(item[1])
+                    n += 1
+                else:
+                    kept.append(item)
+            pending[:] = kept
+            if n:
+                names = ", ".join(point[2]) or "parameter"
+                info(f"XSS: {names} on {point[1]} already has a finding — "
+                     f"skipping {n} more value(s) of the same parameter")
+
+        def _take(record, url):
+            if record.get("stopped_after_hit"):
+                finished.append(url)
+                return False
+            if getattr(self, "_budget_fired", False) or record.get("interrupted"):
+                incomplete.append(url)
+                return True
+            if record.get("per_url_capped") or record.get("budget_hit") or record.get("tool_failed"):
+                incomplete.append(url)
+                return False
+            finished.append(url)
+            return False
+
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            while pending or futures:
+                if _INT.hard() or _INT.interrupted() or getattr(self, "_budget_fired", False):
+                    stop = True
+                remaining = stage_budget - (time.time() - t0)
+                if remaining < 20:
+                    stop = True
+                if not stop:
+                    looked = 0
+                    limit = len(pending)
+                    while pending and len(futures) < jobs and looked < limit:
+                        i, u = pending.pop(0)
+                        looked += 1
+                        point = _xss_injection_point(u)
+                        if point and point in hit_points:
+                            skipped.append(u)
+                            continue
+                        host = (urlparse(u).hostname or "").lower()
+                        if host in busy:
+                            pending.append((i, u))
+                            continue
+                        busy.add(host)
+                        cap = max(20, min(per, int(remaining)))
+                        cf = one_dir / f"u{i}.txt"
+                        write_lines(cf, [u])
+                        param = _xss_param_label(u)
+                        kind = _xss_kind_label(u)
+                        info(f"XSS testing {i + 1}/{len(urls)} — parameter {param} — {kind} — {u[:160]}")
+                        _pulse_job("XSS testing", t0, i, len(urls), unit="urls",
+                                   item=f"{i + 1}/{len(urls)} parameter {param}",
+                                   note=kind, force=True)
+                        fut = pool.submit(self._run_dalfox_once, cf, one_dir, f"u{i}", cap)
+                        futures[fut] = (u, host)
+                if not futures:
+                    break
+                done, _pending_futs = wait(set(futures), timeout=0.5, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    u, host = futures.pop(fut)
+                    busy.discard(host)
+                    try:
+                        record = fut.result()
+                    except Exception as exc:
+                        record = {"tool_failed": True, "tool_error": str(exc)}
+                    results.append((u, record))
+                    if _take(record, u):
+                        stop = True
+                    if int(record.get("findings") or 0) > 0 or record.get("stopped_after_hit"):
+                        point = _xss_injection_point(u)
+                        if point and point not in hit_points:
+                            hit_points.add(point)
+                            _drop_same_point(point)
+                    self._flush_xss_progress(d, results, finished, incomplete, len(urls), t0)
+                    v_hits = [f for f in (record.get("findings_list") or [])
+                              if str(f.get("type", "")).strip().upper() == "V"
+                              and str(f.get("url", "")).startswith("http")]
+                    if v_hits and not _INT.hard():
+                        capture_xss_alert_screenshots(
+                            v_hits, d, max_shots=len(v_hits), max_checks=len(v_hits),
+                            nav_timeout_sec=int(_cfg_get(self.cfg, "settings", "timeout", default=15) or 15),
+                            budget_sec=180, payloads_per_point=len(v_hits))
+        for _i, u in pending:
+            if u in skipped or u in finished or u in incomplete:
                 continue
-            if getattr(self, "_budget_fired", False) or r.get("interrupted"):
-                incomplete.append(u)
-                break
-            if r.get("per_url_capped") or r.get("budget_hit") or r.get("tool_failed"):
-                incomplete.append(u)
-                continue
-            finished.append(u)
+            incomplete.append(u)
 
         write_lines(d / "xss_targets_finished.txt", finished)
         write_lines(d / "xss_targets_incomplete.txt", incomplete)
+        write_lines(d / "xss_targets_skipped_same_param.txt", skipped)
 
         merged = {
             "workers": 0, "delay_ms": 0, "blocked_hits": 0, "total_lines": 0,
@@ -5819,6 +7657,7 @@ class ReconPipeline:
             "targets_count": len(urls),
             "targets_finished": len(finished),
             "targets_incomplete": len(incomplete),
+            "targets_skipped_same_param": len(skipped),
             "findings_list": [], "dalfox_meta": None, "suspicious_empty": False,
         }
         json_f = d / f"dalfox_{run_tag}.json"
@@ -5843,7 +7682,7 @@ class ReconPipeline:
                 pt = r.get("file_txt", "")
                 if pt and Path(pt).exists():
                     tout.write(Path(pt).read_text(errors="ignore"))
-        not_started = len(urls) - len(finished) - len(incomplete)
+        not_started = len(urls) - len(finished) - len(incomplete) - len(skipped)
         if getattr(self, "_budget_fired", False):
             merged["budget_hit"] = True
             merged["tool_error"] = (
@@ -5874,12 +7713,14 @@ class ReconPipeline:
         several hosts. Everything else — single host, v3, small list — takes
         the plain sequential path."""
         n = _count_lines(xss_file)
-        jobs = int(_cfg_get(self.cfg, "tools", "dalfox_parallel_jobs", default=1) or 1)
-        min_targets = int(_cfg_get(self.cfg, "tools", "dalfox_parallel_min", default=8) or 8)
         per_url = int(_cfg_get(self.cfg, "tools", "dalfox_per_url_sec", default=420) or 0)
-        if jobs <= 1 or n < min_targets or _dalfox_caps().get("is_v3") or not tool_exists("dalfox"):
-            if per_url > 0 and n > 1:
-                return self._run_dalfox_per_url(xss_file, d, run_tag)
+        # Per-URL cap is the normal path. Parallelism lives inside it: several
+        # hosts at once, still one process per host, each with its own cap.
+        if per_url > 0 and n > 1:
+            return self._run_dalfox_per_url(xss_file, d, run_tag)
+        jobs = self._dalfox_job_count(n)
+        min_targets = int(_cfg_get(self.cfg, "tools", "dalfox_parallel_min", default=8) or 8)
+        if jobs <= 1 or n < min_targets or not tool_exists("dalfox"):
             return self._run_dalfox_once(xss_file, d, run_tag)
 
         try:
@@ -5967,7 +7808,7 @@ class ReconPipeline:
         return merged
 
     def stage6_xss(self):
-        stage(6, "XSS Testing — Dalfox")
+        stage(6, "XSS Testing")
         candidates = [
             self._cp("stage5_xss_targets"),
             self.out / "05_categorized" / "xss_targets.txt",
@@ -6012,6 +7853,11 @@ class ReconPipeline:
             raw = [l.strip() for l in xss_file.read_text(errors="ignore").splitlines() if l.strip()]
         except Exception:
             raw = []
+        reflection_urls = set()
+        ref_file = self.out / "05_categorized" / "reflection.txt"
+        if ref_file.exists():
+            reflection_urls = {ln.strip() for ln in ref_file.read_text(errors="ignore").splitlines() if ln.strip()}
+        raw = list(reflection_urls) + [u for u in raw if u not in reflection_urls]
         clean, seen_shape = [], {}
         for u in raw:
             if not u.startswith(("http://", "https://")):
@@ -6028,76 +7874,145 @@ class ReconPipeline:
                 qs_l = (pr.query or "").lower()
                 if "%00" in u.lower() or qs_l.startswith(".") or qs_l.startswith("%2e"):
                     continue
-                # Archive rows that already ARE someone else's payload, not a
-                # parameter. Testing those burns the budget and never returns.
-                decoded_q = pr.query or ""
-                for _ in range(4):
-                    nxt = unquote(decoded_q)
-                    if nxt == decoded_q:
-                        break
-                    decoded_q = nxt
-                decoded_q = decoded_q.lower()
-                if any(tok in decoded_q for tok in (
-                        "<script", "onerror=", "javascript:", "alert(",
-                        "createelement(", "union select", "xp_cmdshell",
-                        "/etc/passwd")):
-                    continue
                 if re.search(r"\.(txt|xml|jpg|jpeg|png|gif|css|ico|svg|map|pdf|zip)$",
                              pr.path or "", re.I):
                     continue
-                params = tuple(sorted(k.lower() for k, _ in parse_qsl(pr.query) if k))
-                reflect = _has_reflection_param(pr.query)
+                params = _xss_param_names(pr.query)
+                in_reflection = u in reflection_urls
+                if not in_reflection:
+                    decoded_q = pr.query or ""
+                    for _ in range(4):
+                        nxt = unquote(decoded_q)
+                        if nxt == decoded_q:
+                            break
+                        decoded_q = nxt
+                    decoded_q = decoded_q.lower()
+                    if any(tok in decoded_q for tok in (
+                            "<script", "onerror=", "javascript:", "alert(",
+                            "createelement(", "union select", "xp_cmdshell",
+                            "/etc/passwd")):
+                        continue
             except Exception:
                 continue
-            shape = ((pr.hostname or "").lower(), pr.path.rstrip("/"), params)
+            # One row per parameter. Search.asp?tfSearch=a and
+            # Search.asp?tfSearch=Mert are the same injection point, so the
+            # XSS list keeps a single example. The full reflection file stays
+            # untouched for the categorised view.
+            if not params:
+                # Stored pages (contact-us, forum, register) have no query.
+                # Locale copies of the same route are one test.
+                if in_reflection or _is_stored_path(pr.path or ""):
+                    parts = [s for s in (pr.path or "/").split("/") if s]
+                    tail = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[0] if parts else "/")
+                    shape = ((pr.hostname or "").lower(), tail.lower(), ())
+                    if shape not in seen_shape:
+                        seen_shape[shape] = len(clean)
+                        clean.append((u, 0, True))
+                    continue
+                shape = ((pr.hostname or "").lower(),
+                         _path_shape(pr.path or "/").rstrip("/") or "/",
+                         ())
+                if shape not in seen_shape:
+                    seen_shape[shape] = len(clean)
+                    clean.append((u, 0, False))
+                continue
+            point = _xss_injection_point(u)
+            shape = point or ((pr.hostname or "").lower(),
+                              (pr.path or "/").lower(),
+                              params)
             if shape in seen_shape:
-                # Same injection point. Keep the shorter example so a clean
-                # ?tfsearch=a wins over an archive value like ?tfSearch=%253.
                 i = seen_shape[shape]
-                if len(u) < len(clean[i][0]):
-                    clean[i] = (u, len(params), reflect)
+                prev = clean[i]
+                if _xss_example_rank(u) < _xss_example_rank(prev[0]):
+                    clean[i] = (u, len(params), in_reflection or prev[2])
+                elif in_reflection and not prev[2]:
+                    clean[i] = (prev[0], prev[1], True)
                 continue
             seen_shape[shape] = len(clean)
-            clean.append((u, len(params), reflect))
-        # Ranking, best first:
-        #   1. a parameter whose NAME is one people actually echo back into the
-        #      page (q/search/redirect/name/msg/... — _REFLECTION_PARAM_NAMES)
-        #   2. any other parameterised URL
-        #   3. path-only URLs
-        # then shorter URL first inside each tier (less likely to be crawler junk).
-        # This costs zero extra requests — it is pure ordering — but it decides
-        # WHICH URLs fill the tools.dalfox_max_targets budget, so the cap now
-        # spends itself on the endpoints most likely to actually reflect.
-        clean.sort(key=lambda t: (0 if (t[1] and t[2]) else (1 if t[1] else 2), len(t[0])))
-        _param_urls = [u for u, n, _r in clean if n]
-        _reflect_urls = [u for u, n, r in clean if n and r]
-        def _take(seq):
-            seq = list(seq)
-            return seq if _dfx_max <= 0 else seq[:_dfx_max]
-        if _dfx_path_only or len(_param_urls) < 5:
-            # keep path-only URLs too (config opted in, or too few real
-            # injection points to fill a useful run)
-            final = _take(u for u, _n, _r in clean)
+            clean.append((u, len(params), in_reflection))
+        reflect_kept = [u for u, n, is_ref in clean if is_ref and n]
+        stored_kept = [u for u, n, is_ref in clean if is_ref and not n]
+        other_params = [u for u, n, is_ref in clean if n and not is_ref]
+        unique = unique_xss_urls(other_params)
+        unique.sort(key=_xss_test_rank)
+        reflect_kept.sort(key=_xss_test_rank)
+        require_reflection = bool(_cfg_get(self.cfg, "tools", "xss_reflected_only", default=True))
+        try:
+            reflect_threads = int(_cfg_get(self.cfg, "tools", "xss_reflect_threads", default=20) or 20)
+        except (TypeError, ValueError):
+            reflect_threads = 20
+        try:
+            reflect_timeout = int(_cfg_get(self.cfg, "tools", "xss_reflect_timeout", default=8) or 8)
+        except (TypeError, ValueError):
+            reflect_timeout = 8
+
+        def _xss_headers(url):
+            host = urlparse(url).hostname or self.target
+            headers = pick_header_strategy(host, self.cfg)
+            if self.has_auth():
+                headers = self._auth_headers(headers)
+            return headers
+
+        if require_reflection and unique:
+            probed, reflect_stats = probe_live_reflected(
+                unique, self.cfg, threads=reflect_threads, timeout=reflect_timeout,
+                header_for=_xss_headers)
+            if reflect_stats.get("error") == "no_http_client":
+                warn("Reflection check skipped — no HTTP client, testing the unique parameter list")
+                probed = unique
+            else:
+                sub(f"Other parameters: {len(unique):,} unique "
+                    f"→ {reflect_stats['live']:,} live, {reflect_stats['reflected']:,} reflected")
         else:
-            # every URL dalfox tests without a query param costs ~30s of DOM
-            # mining for near-zero XSS yield — drop them
-            final = _take(_param_urls)
-        if not final:
-            # v8.7-fix: this fallback used to skip the scope check applied in
-            # the `clean` loop above — re-apply it here too, otherwise an
-            # empty `clean`/`final` (e.g. every URL failing urlparse or the
-            # scope check) fed a raw, unfiltered slice straight to dalfox.
-            final = _take(u for u in raw
-                          if u.startswith(("http://", "https://")) and self._is_in_scope_url(u))
-        _n_reflect = sum(1 for u in final if u in set(_reflect_urls))
-        if _reflect_urls:
-            sub(f"XSS target ranking: {_n_reflect} of the {len(final)} selected carry a "
-                f"reflection-prone parameter ({len(_reflect_urls)} found in total) — those go first")
+            probed = unique
+        seen_final = set()
+        final = []
+        for u in reflect_kept + stored_kept + probed:
+            if u in seen_final:
+                continue
+            seen_final.add(u)
+            final.append(u)
+        before_unique = len(final)
+        final = unique_xss_params(final)
+        if before_unique != len(final):
+            sub(f"XSS list {before_unique} → {len(final)} (same parameter on another URL is not tested again)")
+        sub(f"XSS targets: {len(reflection_urls):,} reflection URLs → {len(reflect_kept):,} parameters"
+            f" + {len(stored_kept):,} stored routes + {len(probed):,} other parameters")
+        if _dfx_max > 0:
+            final = final[:_dfx_max]
+        info(f"XSS testing {len(final)} URL(s) — reflected, DOM and stored, one URL per parameter")
+        if final:
+            for n, queued in enumerate(final, 1):
+                sub(f"{n}/{len(final)} parameter {_xss_param_label(queued)} "
+                    f"({_xss_kind_label(queued)}) {queued[:140]}")
+            _pulse_job("XSS testing", time.time(), 0, len(final), unit="urls",
+                       item=f"1/{len(final)} parameter {_xss_param_label(final[0])}",
+                       note=_xss_kind_label(final[0]), force=True)
+        tested_f = d / "xss_targets_tested.txt"
+        if _dfx_path_only:
+            path_only = [u for u, n, _r in clean if not n]
+            room = _dfx_path_only and (path_only[:int(_cfg_get(
+                self.cfg, "tools", "dalfox_path_only_max", default=100) or 100)])
+            if room:
+                final = list(final) + [u for u in room if u not in set(final)]
+        if not final and not require_reflection:
+            final = [u for u in raw
+                     if u.startswith(("http://", "https://")) and self._is_in_scope_url(u)]
+            if _dfx_max > 0:
+                final = final[:_dfx_max]
         tested_f = d / "xss_targets_tested.txt"
         write_lines(tested_f, final)
         xss_file = tested_f
+        if not final:
+            warn("No live reflected parameters — XSS stage skipped")
+            self.summary["stage6"] = {
+                "status": "skipped", "reason": "no_reflected_params",
+                "collected": len(raw), "unique": len(unique),
+            }
+            self.xss_results = {"findings": [], "file_txt": "", "file_json": "", "count": 0}
+            return
         if len(raw) > len(final):
-            why = "cleanup + unique injection points"
+            why = "unique, live, reflected parameters"
             if _dfx_max > 0:
                 why += f" + tools.dalfox_max_targets={_dfx_max} cap"
             sub(f"Dalfox targets {len(raw)} → {len(final)} ({why})")
@@ -6131,7 +8046,8 @@ class ReconPipeline:
                 nav_timeout_sec=int(_cfg_get(self.cfg, "settings", "timeout", default=15) or 15),
                 budget_sec=int(_cfg_get(self.cfg, "settings", "xss_verify_budget_sec", default=3600) or 3600),
                 payloads_per_point=int(_cfg_get(self.cfg, "settings", "xss_verify_payloads_per_point", default=4) or 4),
-                max_checks=int(_cfg_get(self.cfg, "settings", "xss_verify_max_checks", default=60) or 60))
+                max_checks=int(_cfg_get(self.cfg, "settings", "xss_verify_max_checks", default=60) or 60),
+                honor_skip=False)
             # v8.5-fix: the "R"→"RV" promotion (a Reflected finding ReconX
             # itself proved fires a real dialog on headless replay) happens in
             # report_builder.py's _parse_xss() instead of here — the report
@@ -6146,6 +8062,8 @@ class ReconPipeline:
         blind_interactions = []
         if interactsh_session and interactsh_session.get("available"):
             listen_after = int(_cfg_get(self.cfg, "tools", "blind_xss_listen_after_sec", default=90) or 90)
+            if _INT.hard():
+                listen_after = 0
             stop_interactsh_session(interactsh_session, extra_listen_sec=listen_after)
             blind_interactions = parse_interactsh_interactions(interactsh_session.get("log_file"))
             if blind_interactions:
@@ -6164,6 +8082,26 @@ class ReconPipeline:
         run["blind_interactions"] = blind_interactions
         run["blind_callback_used"] = (interactsh_session or {}).get("domain", "") or manual_blind
         run["screenshots"] = xss_screenshots
+        disk_findings = 0
+        try:
+            for pj in (d / "dalfox_per_url").glob("dalfox_*.json"):
+                if pj.stat().st_size <= 0:
+                    continue
+                for line in pj.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict) and str(rec.get("type") or "").upper() in ("V", "R", "RV"):
+                        disk_findings += 1
+        except Exception:
+            disk_findings = 0
+        if disk_findings > int(run.get("findings") or 0):
+            run["findings"] = disk_findings
+            run["count"] = disk_findings
         self.xss_results = run
         _stage6_status = "tool_error" if run.get("tool_failed") else (
             "partial" if (run.get("interrupted") or run.get("budget_hit")) else "done")
@@ -6530,8 +8468,7 @@ class ReconPipeline:
 
         info(f"Nuclei is running against {_count_lines(targets):,} targets "
              f"(templates={res['template_path']}"
-             f"{', tags=' + extra_tags if extra_tags else ''}) — progress is printed "
-             f"every {stats_interval}s below")
+             f"{', tags=' + extra_tags if extra_tags else ''})")
         _t0 = time.time()
         rc, lines, killed, stalled = _stream_tool(
             cmd, timeout=T["nuclei"], log=self.log, label="nuclei",
@@ -6842,7 +8779,7 @@ class ReconPipeline:
         return res
 
     def stage7_nuclei(self):
-        stage(7, "Nuclei Vulnerability Scan (full live URL corpus)")
+        stage(7, "Template Vulnerability Scan")
         d = self.out / "07_nuclei"
         d.mkdir(parents=True, exist_ok=True)
         tgt_file = d / "nuclei_targets.txt"
@@ -6869,6 +8806,19 @@ class ReconPipeline:
                                       "targets": tstats}
             return
 
+        # Injection fuzzing before the CVE sweep. That sweep is hundreds of
+        # thousands of requests; stopping it used to skip DAST, so a custom
+        # vulnerable app was reported clean.
+        dast = {"findings": 0, "severity_counts": {}}
+        if not _INT.hard():
+            try:
+                dast = self._run_nuclei_dast(d)
+            except Exception as e:  # noqa: BLE001
+                err(f"Nuclei DAST pass crashed: {e}")
+                self.log.exception("nuclei dast fatal")
+        else:
+            dast["interrupted"] = True
+
         # v6.13: teknoloji-bazli hizli on-tarama. Tespit edilen teknolojilere
         # (wordpress, php, jenkins, vb.) ozel nuclei taglariyla kucuk ama
         # isabetli bir on-gecis yapar; boylece ilk anlamli bulgular cok daha
@@ -6876,7 +8826,7 @@ class ReconPipeline:
         # genel tarama calisir.
         # v6.15: stage7 artik sirali akista stage11'den ONCE calisiyor; tech_summary
         # henuz doldurulmamissa burada sessizce (banner basmadan) hesaplanir.
-        fastpass_enabled = bool(_cfg_get(self.cfg, "tools", "nuclei_tech_fastpass", default=True))
+        fastpass_enabled = bool(_cfg_get(self.cfg, "tools", "nuclei_tech_fastpass", default=True)) and not _INT.hard()
         if fastpass_enabled and not self.tech_summary:
             self._compute_tech_summary()
         tech_tags = self._nuclei_tech_tags() if fastpass_enabled else ""
@@ -6890,7 +8840,15 @@ class ReconPipeline:
             else:
                 ok("Fast pre-scan complete — no findings")
 
-        run = self._run_nuclei_once(tgt_file, d, "scan")
+        if _INT.hard():
+            run = {"findings": 0, "severity_counts": {}, "interrupted": True,
+                   "tool_failed": False, "tool_error": dast.get("tool_error", ""),
+                   "duration_sec": 0.0, "file_txt": "", "file_json": "",
+                   "template_path": self._get_nuclei_template_path() or "",
+                   "threads": 0, "rate": 0, "severity_filter": "",
+                   "targets_count": 0, "stalled": False}
+        else:
+            run = self._run_nuclei_once(tgt_file, d, "scan")
 
         # Fastpass + tam tarama bulgularini birlestir (dedup)
         if fastpass_run and fastpass_run.get("findings"):
@@ -6938,15 +8896,6 @@ class ReconPipeline:
                 run["file_json"] = str(canonical_json)
                 run["file_txt"] = str(canonical_txt)
 
-        # v8.6: DAST/fuzzing pass — the part that actually finds injection bugs
-        # (XSS/SQLi/SSTI/LFI/cmdi) on custom, vulnerable-by-design targets that
-        # match no CVE template.
-        dast = {"findings": 0, "severity_counts": {}}
-        try:
-            dast = self._run_nuclei_dast(d)
-        except Exception as e:  # noqa: BLE001
-            err(f"Nuclei DAST pass crashed: {e}")
-            self.log.exception("nuclei dast fatal")
         self.nuclei_dast_results = dast
 
         tool_failed = bool(run.get("tool_failed")) or bool(fastpass_run and fastpass_run.get("tool_failed"))
@@ -6958,8 +8907,11 @@ class ReconPipeline:
         combined_sev = dict(run["severity_counts"])
         for k, v in dast.get("severity_counts", {}).items():
             combined_sev[k] = combined_sev.get(k, 0) + v
+        stage_status = "tool_error" if tool_failed else "done"
+        if interrupted or _INT.hard() or dast.get("interrupted"):
+            stage_status = "partial"
         self.summary["stage7"] = {
-            "status": "done" if not tool_failed else "tool_error",
+            "status": stage_status,
             "findings": combined_findings,
             "findings_template": run["findings"],
             "findings_dast": dast.get("findings", 0),
@@ -7003,7 +8955,7 @@ class ReconPipeline:
     # Stage 9 — Param/Endpoint Discovery (arjun)
     # ══════════════════════════════════════════════════════════════════════════
     def stage9_params(self):
-        stage(9, "Param Discovery (arjun)")
+        stage(9, "Parameter Discovery")
         d = self.out / "09_params"
         all_params = []
         seen = set()
@@ -7021,14 +8973,18 @@ class ReconPipeline:
             max_hosts = int(_cfg_get(self.cfg, "tools", "arjun_max_hosts", default=10))
             ph_conf = int(_cfg_get(self.cfg, "tools", "arjun_timeout_per_host", default=180))
             per_host_t = min(max(30, ph_conf), T["arjun"])
-            info(f"arjun: probing the first {min(len(hosts), max_hosts)} alive hosts "
+            batch = hosts[:max_hosts]
+            info(f"arjun: probing the first {len(batch)} alive hosts "
                  f"({per_host_t}s/host)")
-            for h in hosts[:max_hosts]:
+            for i, h in enumerate(batch, 1):
                 if _INT.stage_skip():
                     break
-                run_cmd(f"arjun -u {h} -oJ {arjun_out} -q",
+                host_name = urlparse(h).hostname or "unknown"
+                run_cmd(f"arjun -u {h} -oJ {arjun_out}",
                         timeout=per_host_t, log=self.log,
-                        label=f"arjun-{urlparse(h).hostname or 'unknown'}", retries=0)
+                        label=f"arjun-{host_name}", retries=0,
+                        job={"index": i, "total": len(batch), "unit": "hosts",
+                             "item": host_name})
                 if arjun_out.exists() and arjun_out.stat().st_size > 0:
                     try:
                         rec = json.loads(arjun_out.read_text(errors="replace"))
@@ -7074,6 +9030,82 @@ class ReconPipeline:
         r"""['"`](\/[a-zA-Z0-9_\-\/\.]{3,}?)(?:\?|['"`])""")
     _JS_SECRET_RE = re.compile(
         r"""(?i)(?:['"]?(api[_-]?key|secret|token|password|authorization|username)['"]?\s*[:=]\s*['"])([^'"]{4,})(?:['"])""")
+    # Path tokens that usually belong to first-party code (secrets, API routes).
+    _JS_PRIORITY_HIGH_RE = re.compile(
+        r"(?:^|[^\w])("
+        r"config|settings|env|secret|credential|apikey|api[_-]?key|"
+        r"auth|login|session|oauth|sso|"
+        r"admin|dashboard|internal|"
+        r"main|app|bundle|chunk|runtime|webpack|index|"
+        r"api|graphql|client"
+        r")(?:[^\w]|$)",
+        re.I,
+    )
+    # Webpack / Vite / Next content-hashed bundles (main.a1b2c3d4.js).
+    _JS_PRIORITY_BUNDLE_RE = re.compile(
+        r"(?:^|[/_-])(?:main|app|index|runtime|chunk|page|pages|framework)"
+        r"[.-][a-f0-9]{6,}(?:\.chunk)?\.js(?:$|\?)",
+        re.I,
+    )
+    _JS_PRIORITY_DIR_RE = re.compile(
+        r"/(?:_next/static|static/js|assets(?:/js)?|build/static|dist(?:/js)?)/",
+        re.I,
+    )
+    # Third-party libraries and analytics. These dominate a raw URL list and
+    # almost never contain the target's own keys.
+    _JS_PRIORITY_LOW_RE = re.compile(
+        r"(?:^|[^\w])("
+        r"jquery|react(?:-dom)?|vue|angular|lodash|moment|bootstrap|popper|"
+        r"font-?awesome|core-js|regenerator-runtime|polyfill|"
+        r"gtag|google-analytics|googletagmanager|gtm|"
+        r"hotjar|mixpanel|fbevents|recaptcha|hcaptcha|"
+        r"sentry|newrelic|datadog|intercom|crisp|zendesk|"
+        r"cookieconsent|onetrust|clarity|mathjax|highlight\.js|"
+        r"chart\.js|chartjs|d3|three|swiper|slick"
+        r")(?:[^\w]|$)",
+        re.I,
+    )
+    _JS_PRIORITY_CDN_RE = re.compile(
+        r"(?:^|\.)("
+        r"cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|"
+        r"ajax\.googleapis\.com|fonts\.googleapis\.com|www\.google-analytics\.com|"
+        r"www\.googletagmanager\.com|stackpath\.bootstrapcdn\.com|"
+        r"maxcdn\.bootstrapcdn\.com|code\.jquery\.com"
+        r")$",
+        re.I,
+    )
+
+    def _js_url_priority(self, url: str) -> int:
+        """Higher score = scan sooner. Used so the file cap and time budget
+        spend themselves on app code instead of the first URLs discovered."""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return 0
+        path = parsed.path or ""
+        host = (parsed.hostname or "").lower()
+        score = 0
+        if self._JS_PRIORITY_HIGH_RE.search(path):
+            score += 50
+        if self._JS_PRIORITY_BUNDLE_RE.search(path):
+            score += 30
+        if self._JS_PRIORITY_DIR_RE.search(path):
+            score += 20
+        low_path = path.lower()
+        if "node_modules" in low_path or "/vendor/" in low_path or "/vendors/" in low_path:
+            score -= 40
+        if self._JS_PRIORITY_LOW_RE.search(path):
+            score -= 80
+        if host and self._JS_PRIORITY_CDN_RE.search(host):
+            score -= 60
+        return score
+
+    def _prioritize_js_urls(self, urls: list) -> list:
+        ranked = sorted(
+            enumerate(urls),
+            key=lambda iv: (-self._js_url_priority(iv[1]), iv[0]),
+        )
+        return [u for _, u in ranked]
 
     def _scan_js_url(self, js_url: str, scanned: set, details: list) -> None:
         if not js_url or not js_url.startswith(("http://", "https://")):
@@ -7199,23 +9231,28 @@ class ReconPipeline:
             self.summary["stage10"] = {"status": "done", "endpoints": 0, "secrets": 0}
             return
 
-        # v6.15: yuzlerce JS dosyasi tek tek/sirali indirilince stage suresiz
-        # "takili" gibi gorunuyordu (kullanici defalarca Ctrl+C basmak zorunda
-        # kaliyordu). Artik: (1) analiz edilecek dosya sayisi sinirlandirilir,
-        # (2) indirmeler paralel yapilir, (3) genel bir zaman butcesi asilirsa
-        # tarama guvenli sekilde erken kesilir (kalan dosyalar atlanir, ne
-        # kadar bulunduysa raporlanir), (4) ilerleme canli gosterilir.
-        max_files    = int(_cfg_get(self.cfg, "tools", "js_secrets_max_files", default=150))
-        concurrency  = max(1, int(_cfg_get(self.cfg, "tools", "js_secrets_concurrency", default=12)))
-        budget_sec   = int(_cfg_get(self.cfg, "tools", "js_secrets_budget_sec", default=180))
-        truncated = len(js_urls) > max_files
-        js_urls_scan = js_urls[:max_files]
-        if truncated:
+        # This stage runs from the Scan Center, after the report, so it can
+        # read every in-scope script. 0 in config means "no cap". A positive
+        # js_secrets_max_files / js_secrets_budget_sec restores a limit, and
+        # that limit is spent in priority order: app bundles, config, auth
+        # and API clients before libraries and CDN scripts.
+        max_files   = int(_cfg_get(self.cfg, "tools", "js_secrets_max_files", default=0) or 0)
+        concurrency = max(1, int(_cfg_get(self.cfg, "tools", "js_secrets_concurrency", default=12) or 12))
+        budget_sec  = int(_cfg_get(self.cfg, "tools", "js_secrets_budget_sec", default=0) or 0)
+        ranked_js = self._prioritize_js_urls(js_urls)
+        if max_files > 0 and len(ranked_js) > max_files:
+            truncated = True
+            js_urls_scan = ranked_js[:max_files]
             sub(f"JS file count ({len(js_urls):,}) hit the cap ({max_files}) — "
-                f"analysing the first {max_files} files (config: js_secrets_max_files)")
+                f"analysing the {max_files} highest-priority files "
+                f"(app bundles, config/auth/api first; libraries and CDN last)")
+        else:
+            truncated = False
+            js_urls_scan = ranked_js
+            sub(f"Deep JS pass: all {len(js_urls_scan):,} in-scope scripts, no file cap")
 
-        # ── TruffleHog (varsa) — paralel indirme, ilk 40 dosya ──────────────────
-        th_cap = min(40, len(js_urls_scan))
+        # ── TruffleHog — same file set as the regex pass, downloaded in parallel
+        th_cap = len(js_urls_scan)
         if tool_exists("trufflehog") and th_cap:
             js_dir = d / "js_downloads"
             js_dir.mkdir(parents=True, exist_ok=True)
@@ -7244,13 +9281,20 @@ class ReconPipeline:
                 except Exception:
                     pass
 
+            dl_t0 = time.time()
+            dl_list = js_urls_scan[:th_cap]
             with ThreadPoolExecutor(max_workers=concurrency) as ex:
-                list(ex.map(_dl_for_trufflehog, js_urls_scan[:th_cap]))
+                dl_futs = {ex.submit(_dl_for_trufflehog, u): u for u in dl_list}
+                for n, fut in enumerate(as_completed(dl_futs), 1):
+                    fut.result()
+                    _pulse_job("js download", dl_t0, n, len(dl_list),
+                               unit="files", item=dl_futs[fut])
 
             if saved[0]:
                 th_out = d / "trufflehog.txt"
+                th_timeout = max(900, min(7200, 12 * saved[0]))
                 run_cmd(f"trufflehog filesystem {js_dir} --json",
-                        out_file=th_out, timeout=300, log=self.log,
+                        out_file=th_out, timeout=th_timeout, log=self.log,
                         label="trufflehog", retries=0)
                 if th_out.exists():
                     for ln in th_out.read_text(errors="replace").splitlines():
@@ -7292,28 +9336,28 @@ class ReconPipeline:
                 details.extend(local)
                 completed[0] += 1
 
-        info(f"JS analysis starting: {len(js_urls_scan):,} files, {concurrency} in parallel, "
-             f"{budget_sec}s budget")
+        budget_note = f"{budget_sec}s budget" if budget_sec > 0 else "no time cap"
+        info(f"JS analysis starting: {len(js_urls_scan):,} files, "
+             f"{concurrency} in parallel, {budget_note}")
         ex = ThreadPoolExecutor(max_workers=concurrency)
         try:
             futures = {ex.submit(_worker, u): u for u in js_urls_scan}
-            last_print = start_t
             for fut in as_completed(futures):
                 now = time.time()
                 if _INT.stage_skip():
                     budget_hit[0] = True
                     break
-                if now - start_t > budget_sec:
+                if budget_sec > 0 and now - start_t > budget_sec:
                     if not budget_hit[0]:
                         warn(f"JS analiz zaman butcesi ({budget_sec}s) asildi — kalan "
                              f"{len(js_urls_scan) - completed[0]:,} dosya atlaniyor "
                              f"(config: js_secrets_budget_sec ile arttirilabilir)")
                     budget_hit[0] = True
                     break
-                if now - last_print >= 2:
-                    sub(f"JS scan: {completed[0]:,}/{len(js_urls_scan):,} "
-                        f"({int(now - start_t)}s)")
-                    last_print = now
+                _pulse_job("js", start_t, completed[0], len(js_urls_scan),
+                           unit="files", item=futures.get(fut) or "")
+            _pulse_job("js", start_t, completed[0], len(js_urls_scan),
+                       unit="files", force=True)
         finally:
             # v6.15: wait=False + cancel_futures — henuz baslamamis istekleri
             # iptal eder ve fonksiyon HEMEN doner; halihazirda calisan birkac
@@ -7453,29 +9497,51 @@ class ReconPipeline:
                     for t in techs:
                         host_techs[url]["techs"].add(self._normalize_tech(str(t)))
 
-        ww = self.out / "01_recon" / "whatweb.txt"
-        if ww.exists() and ww.stat().st_size > 0:
+        current_url = ""
+        for name in ("whatweb.txt", "whatweb_hosts.txt"):
+            ww = self.out / "01_recon" / name
+            if not ww.exists() or ww.stat().st_size == 0:
+                continue
             for ln in ww.read_text(errors="replace").splitlines():
                 ln = strip_ansi(ln.strip())
                 if not ln:
                     continue
                 m = re.search(r"(https?://[^\s]+)", ln)
-                if not m:
+                if m:
+                    url = m.group(1).rstrip(",").rstrip("]")
+                    # Plugin blurbs cite their own homepages
+                    # ("Website: https://www.php.net/"). Those are not the target.
+                    if self._is_in_scope_url(url):
+                        current_url = url
+                if not current_url:
                     continue
-                url = m.group(1).rstrip(",")
-                # whatweb's plugin blurbs contain their own homepages
-                # ("Website: https://www.asp.net/"). Those are not the target.
-                if not self._is_in_scope_url(url):
+                blob = ""
+                low = ln.lower()
+                if low.startswith("summary"):
+                    blob = ln.split(":", 1)[-1]
+                elif ln.startswith("http"):
+                    blob = re.sub(r"^https?://\S+\s*", "", ln)
+                    blob = re.sub(r"^\[\d{3}[^\]]*\]\s*", "", blob)
+                if not blob:
                     continue
-                found = re.findall(r"\[([^\[\]]+)\]", ln)
-                host_techs.setdefault(url, {"status": 0, "techs": set()})
-                for f in found:
-                    name = self._normalize_tech(f.split("[")[0])
-                    if name:
-                        host_techs[url]["techs"].add(name)
+                host_techs.setdefault(current_url, {"status": 0, "techs": set()})
+                for label in _techs_from_whatweb_blob(blob):
+                    host_techs[current_url]["techs"].add(self._normalize_tech(label))
 
-        ranked = []
+        merged = {}
         for url, info_ in host_techs.items():
+            key = _canon_url(url)
+            slot = merged.get(key)
+            if slot is None:
+                merged[key] = {"url": url, "status": info_["status"], "techs": set(info_["techs"])}
+                continue
+            slot["techs"].update(info_["techs"])
+            if info_["status"] and not slot["status"]:
+                slot["status"] = info_["status"]
+                slot["url"] = url
+        ranked = []
+        for info_ in merged.values():
+            url = info_["url"]
             techs = sorted(t for t in info_["techs"] if t)
             score = 0
             top = []
@@ -7524,7 +9590,8 @@ class ReconPipeline:
         if not ranked:
             sub("No technology information available (httpx/whatweb missing)")
             return
-        ok(f"Tech prioritisation: {len(ranked):,} host — {high} high, {medium} medium")
+        noun = "host" if len(ranked) == 1 else "hosts"
+        ok(f"Tech prioritisation: {len(ranked):,} {noun} — {high} high, {medium} medium")
         for r in ranked[:5]:
             sub(f"{r['risk_label'].upper():6} score={r['score']:3}  {r['url']}")
 
@@ -7548,15 +9615,20 @@ class ReconPipeline:
         alive_urls = []
         if self._check_on("cors") and alive_file.exists() and alive_file.stat().st_size > 0:
             alive_urls = [l.strip() for l in alive_file.read_text(errors="ignore").splitlines() if l.strip()]
+        cors_probed = 0
         if alive_urls:
             info(f"CORS testi: {len(alive_urls):,} alive host")
             jitter = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
-            for i, u in enumerate(alive_urls):
+            cors_t0 = time.time()
+            for i, u in enumerate(alive_urls, 1):
+                _pulse_job("cors", cors_t0, i, len(alive_urls), unit="hosts", item=u)
                 if _INT.stage_skip():
                     break
-                if i:
+                if i > 1:
                     time.sleep(random.random() * jitter)  # v6.17-fix: hedef/yuk koruma
                 r = check_cors_misconfig(u, self.cfg, log=self.log)
+                if r.get("checked"):
+                    cors_probed += 1
                 if r.get("acao") or r.get("vulnerable"):
                     results["cors"].append(r)
             vuln_cors = [r for r in results["cors"] if r.get("vulnerable")]
@@ -7572,15 +9644,19 @@ class ReconPipeline:
         subs = []
         if self._check_on("takeover") and subs_file.exists() and subs_file.stat().st_size > 0:
             subs = [l.strip() for l in subs_file.read_text(errors="ignore").splitlines() if l.strip()]
+        takeover_probed = 0
         if subs and tool_exists("dig"):
             info(f"Subdomain takeover check: {len(subs):,} subdomains (CNAME based)")
             jitter2 = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
-            for i, s in enumerate(subs):
+            tko_t0 = time.time()
+            for i, s in enumerate(subs, 1):
+                _pulse_job("takeover", tko_t0, i, len(subs), unit="hosts", item=s)
                 if _INT.stage_skip():
                     break
-                if i:
+                if i > 1:
                     time.sleep(random.random() * jitter2)  # v6.17-fix: hedef/yuk koruma
                 r = check_subdomain_takeover(s, self.cfg, log=self.log)
+                takeover_probed += 1
                 if r.get("cname"):
                     results["takeover"].append(r)
             vuln_tko = [r for r in results["takeover"] if r.get("vulnerable")]
@@ -7597,24 +9673,49 @@ class ReconPipeline:
             self.out / "04_urls" / "all_urls_raw.txt",
             self._cp("stage9_params"), self.out / "09_params" / "all.txt",
         ]
-        candidates = find_cloud_bucket_candidates(candidate_files) if self._check_on("bucket") else []
-        if candidates:
-            info(f"Cloud bucket check: {len(candidates):,} candidates")
-            jitter3 = float(_cfg_get(self.cfg, "settings", "jitter_max", default=0.6) or 0)
-            for i, (bucket_url, provider) in enumerate(candidates):
+        bucket_meta = {"checked": 0, "public": 0, "protected": 0, "tool": "", "keywords": [], "error": ""}
+        if self._check_on("bucket"):
+            d.mkdir(parents=True, exist_ok=True)
+            keywords = _bucket_keywords(self.target)
+            enum = run_cloud_enum(keywords, d, self.cfg)
+            seen = set()
+            for hit in enum.get("hits") or []:
+                url = hit.get("url") or ""
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                verified = check_cloud_bucket(url, hit.get("provider") or "", self.cfg, log=self.log)
+                if verified.get("status") in ("", "unknown") or verified.get("detail", "").startswith("request error"):
+                    verified = hit
+                results["buckets"].append(verified)
+            for bucket_url, provider in find_cloud_bucket_candidates(candidate_files):
                 if _INT.stage_skip():
                     break
-                if i:
-                    time.sleep(random.random() * jitter3)  # v6.17-fix: hedef/yuk koruma
-                r = check_cloud_bucket(bucket_url, provider, self.cfg, log=self.log)
-                results["buckets"].append(r)
-            public_buckets = [r for r in results["buckets"] if r.get("public_listing")]
-            if public_buckets:
-                ok(f"Cloud bucket: {len(public_buckets)} publicly listable bucket(s)!")
-            else:
-                ok("Cloud bucket: no publicly listable bucket found")
+                if bucket_url in seen:
+                    continue
+                seen.add(bucket_url)
+                results["buckets"].append(check_cloud_bucket(bucket_url, provider, self.cfg, log=self.log))
+            public_n = sum(1 for r in results["buckets"] if r.get("public_listing"))
+            protected_n = sum(1 for r in results["buckets"] if r.get("status") == "exists_protected")
+            bucket_meta = {
+                "checked": max(len(seen), 1 if enum.get("ran") else 0),
+                "public": public_n,
+                "protected": protected_n,
+                "tool": "cloud_enum" if enum.get("ran") else "",
+                "keywords": keywords,
+                "error": enum.get("error") or "",
+            }
+            if enum.get("error") and not enum.get("ran"):
+                err(f"Cloud bucket: {enum['error']}")
+            elif public_n:
+                ok(f"Cloud bucket: {public_n} publicly listable bucket(s), {protected_n} protected")
+            elif protected_n:
+                ok(f"Cloud bucket: no public listing. {protected_n} name(s) exist but are closed")
+            elif enum.get("ran"):
+                ok("Cloud bucket: cloud_enum finished — no open or protected bucket for these names")
         else:
-            sub("No cloud bucket candidates — skipped")
+            sub("Cloud bucket check not selected — skipped")
+        results["bucket_meta"] = bucket_meta
 
         # v9.4: when the report runs a single passive check on demand (--check),
         # keep the other categories' prior results instead of clobbering them —
@@ -7631,6 +9732,8 @@ class ReconPipeline:
                 ran = {"cors": "cors", "takeover": "takeover", "buckets": "bucket"}[cat]
                 if not self._check_on(ran) and prior.get(cat):
                     results[cat] = prior[cat]
+            if not self._check_on("bucket") and prior.get("bucket_meta"):
+                results["bucket_meta"] = prior["bucket_meta"]
 
         (d / "extra_results.json").write_text(
             json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -7639,13 +9742,31 @@ class ReconPipeline:
         n_cors_vuln = sum(1 for r in results["cors"] if r.get("vulnerable"))
         n_tko_vuln = sum(1 for r in results["takeover"] if r.get("vulnerable"))
         n_bucket_vuln = sum(1 for r in results["buckets"] if r.get("public_listing"))
+        if self.only_checks:
+            prev12 = {}
+            sf = self.out / "SUMMARY.json"
+            if sf.exists():
+                try:
+                    prev12 = ((json.loads(sf.read_text(encoding="utf-8", errors="replace")) or {})
+                              .get("stages") or {}).get("stage12") or {}
+                except Exception:
+                    prev12 = {}
+            if not self._check_on("cors"):
+                cors_probed = int(prev12.get("cors_checked") or 0)
+            if not self._check_on("takeover"):
+                takeover_probed = int(prev12.get("takeover_checked") or 0)
+        bucket_checked = int((results.get("bucket_meta") or {}).get("checked") or 0)
+        if not bucket_checked:
+            bucket_checked = len(results["buckets"])
+        if self.only_checks and not self._check_on("bucket"):
+            bucket_checked = int(prev12.get("bucket_checked") or bucket_checked)
         self.summary["stage12"] = {
             "status": "done",
-            "cors_checked": len(results["cors"]),
+            "cors_checked": cors_probed,
             "cors_vulnerable": n_cors_vuln,
-            "takeover_checked": len(results["takeover"]),
+            "takeover_checked": takeover_probed,
             "takeover_vulnerable": n_tko_vuln,
-            "bucket_checked": len(results["buckets"]),
+            "bucket_checked": bucket_checked,
             "bucket_public": n_bucket_vuln,
         }
         total_vuln = n_cors_vuln + n_tko_vuln + n_bucket_vuln
@@ -7699,7 +9820,7 @@ class ReconPipeline:
         return entry
 
     def stage14_network(self):
-        stage(14, "Network / Port Scan (naabu → nmap -sV)")
+        stage(14, "Network / Port Scan")
         d = self.out / "14_network"
         d.mkdir(parents=True, exist_ok=True)
 
@@ -7726,8 +9847,34 @@ class ReconPipeline:
             self.summary["stage14"] = {"status": "skipped", "reason": "naabu_not_installed"}
             return
 
+        # naabu's own resolver rejects some local names ("no valid ipv4")
+        # even when /etc/hosts answers them. Scan the addresses we resolved.
+        ip_to_names = {}
+        scan_targets = []
+        for h in hosts:
+            ip = self._resolve_ip(h)
+            key = ip or h
+            ip_to_names.setdefault(key, [])
+            if h not in ip_to_names[key]:
+                ip_to_names[key].append(h)
+            if key not in scan_targets:
+                scan_targets.append(key)
         hosts_file = d / "hosts.txt"
-        hosts_file.write_text("\n".join(hosts) + "\n", encoding="utf-8")
+        hosts_file.write_text("\n".join(scan_targets) + "\n", encoding="utf-8")
+        # Ports the target actually answered on. top-100 does not include
+        # 8088, so a lab on that port used to end as "no open ports" after
+        # nmap had already printed 8088/tcp open.
+        extra_ports = set()
+        if self.service_port:
+            extra_ports.add(int(self.service_port))
+        if alive_file.exists():
+            for line in alive_file.read_text(errors="ignore").splitlines():
+                try:
+                    port = urlparse(line.strip()).port
+                except Exception:
+                    port = None
+                if port:
+                    extra_ports.add(int(port))
         top  = int(_cfg_get(self.cfg, "tools", "naabu_top_ports", default=100) or 100)
         rate = int(_cfg_get(self.cfg, "tools", "naabu_rate", default=1000) or 1000)
         naabu_timeout = int(_cfg_get(self.cfg, "tools", "naabu_timeout_sec", default=1800) or 1800)
@@ -7735,14 +9882,28 @@ class ReconPipeline:
         if naabu_json.exists():
             try: naabu_json.unlink()
             except Exception: pass
-        info(f"naabu: {len(hosts):,} host(s), top-{top} ports @ {rate}/s")
-        run_cmd(f"naabu -list {hosts_file} -top-ports {top} -rate {rate} -silent "
-                f"-json -o {naabu_json}",
-                timeout=naabu_timeout, log=self.log, label="naabu", stream=True)
+        info(f"naabu: {len(scan_targets):,} address(es), top-{top} ports @ {rate}/s"
+             + (f", plus explicit port(s) {', '.join(str(p) for p in sorted(extra_ports))}"
+                if extra_ports else ""))
+        naabu_stats = _stats_cli(_help_text("naabu"), 5)
+        # -silent hides the stats line this stage's progress meter reads.
+        # -p and -top-ports together make this naabu build abort with
+        # "no valid ipv4", so the explicit ports are a second pass.
+        naabu_quiet = "" if naabu_stats else "-silent "
+        naabu_ok, _ = run_cmd(
+            f"naabu -list {hosts_file} -top-ports {top} -rate {rate} {naabu_quiet}"
+            f"{naabu_stats}-json -o {naabu_json}",
+            timeout=naabu_timeout, log=self.log, label="naabu", stream=True, retries=0)
+        if extra_ports:
+            extra_json = d / "naabu_explicit.json"
+            run_cmd(f"naabu -list {hosts_file} -p {','.join(str(p) for p in sorted(extra_ports))} "
+                    f"-rate {rate} -silent -json -o {extra_json}",
+                    timeout=naabu_timeout, log=self.log, label="naabu-ports", retries=0)
 
-        open_map = {}
-        if naabu_json.exists():
-            for line in naabu_json.read_text(errors="ignore").splitlines():
+        def _take_naabu(path: Path, into: dict):
+            if not path.exists():
+                return
+            for line in path.read_text(errors="ignore").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -7750,12 +9911,47 @@ class ReconPipeline:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                h = rec.get("host") or rec.get("ip")
-                p = rec.get("port")
-                if h and p:
-                    open_map.setdefault(h, set()).add(int(p))
+                port = rec.get("port")
+                if not port:
+                    continue
+                ip = rec.get("ip") or ""
+                names = ip_to_names.get(ip) or ip_to_names.get(rec.get("host") or "")
+                if not names:
+                    names = [rec.get("host") or ip or ""]
+                for name in names:
+                    if name:
+                        into.setdefault(name, set()).add(int(port))
+
+        open_map = {}
+        _take_naabu(naabu_json, open_map)
+        if extra_ports:
+            _take_naabu(d / "naabu_explicit.json", open_map)
+        if not open_map and not naabu_ok:
+            imported = []
+            nmap_txt = self.out / "01_recon" / "nmap.txt"
+            if nmap_txt.exists():
+                for line in nmap_txt.read_text(errors="ignore").splitlines():
+                    m = re.match(r"(\d+)/tcp\s+open\b", line.strip())
+                    if m:
+                        imported.append(int(m.group(1)))
+            if imported:
+                warn("naabu failed — keeping the open ports stage 1 already found")
+                for h in hosts:
+                    open_map[h] = set(imported)
+            else:
+                warn("naabu failed — this is not a clean 'no open ports' result")
+                self.network_results = {"hosts": []}
+                self.summary["stage14"] = {"status": "tool_error", "hosts_scanned": len(hosts),
+                                           "hosts_with_open": 0, "open_ports_total": 0,
+                                           "reason": "naabu_failed"}
+                return
         open_map = {h: sorted(ps) for h, ps in open_map.items()}
-        total_open = sum(len(v) for v in open_map.values())
+        seen_ip_port = set()
+        for h, ps in open_map.items():
+            ip = self._resolve_ip(h) or h
+            for p in ps:
+                seen_ip_port.add((ip, int(p)))
+        total_open = len(seen_ip_port)
 
         if not open_map:
             ok("naabu completed — no open ports found")
@@ -7770,20 +9966,33 @@ class ReconPipeline:
             warn("nmap not installed — reporting open ports without service detection")
         nmap_timeout = int(_cfg_get(self.cfg, "tools", "nmap_timeout_sec", default=1800) or 1800)
         services = []
-        for h, ports in open_map.items():
+        open_hosts = list(open_map.items())
+        nmap_done = {}
+        for i, (h, ports) in enumerate(open_hosts, 1):
             if _INT.stage_skip():
                 break
+            ip_key = (self._resolve_ip(h) or h, tuple(ports))
+            if ip_key in nmap_done:
+                copied = dict(nmap_done[ip_key])
+                copied["host"] = h
+                services.append(copied)
+                continue
             if have_nmap:
                 xmlf = d / f"nmap_{re.sub(r'[^A-Za-z0-9_.-]+', '_', h)}.xml"
                 pcsv = ",".join(str(p) for p in ports)
                 info(f"nmap -sV {h} ({len(ports)} port(s))")
-                run_cmd(f"nmap -sV -Pn -T4 -p {pcsv} -oX {xmlf} {h}",
-                        timeout=nmap_timeout, log=self.log, label=f"nmap:{h}", stream=True)
-                services.append(self._parse_nmap_xml(xmlf, h, ports))
+                run_cmd(f"nmap -v -sV -Pn -T4 --stats-every 5s -p {pcsv} -oX {xmlf} {h}",
+                        timeout=nmap_timeout, log=self.log, label=f"nmap:{h}", stream=True,
+                        job={"index": i, "total": len(open_hosts), "unit": "hosts", "item": h})
+                entry = self._parse_nmap_xml(xmlf, h, ports)
+                nmap_done[ip_key] = entry
+                services.append(entry)
             else:
-                services.append({"host": h, "ports": [{"port": p, "proto": "tcp",
-                                 "state": "open", "service": "", "product": "",
-                                 "version": ""} for p in ports]})
+                entry = {"host": h, "ports": [{"port": p, "proto": "tcp",
+                         "state": "open", "service": "", "product": "",
+                         "version": ""} for p in ports]}
+                nmap_done[ip_key] = entry
+                services.append(entry)
 
         (d / "network_results.json").write_text(
             json.dumps({"hosts": services}, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -7903,7 +10112,7 @@ class ReconPipeline:
         return {}
 
     def stage15_open_redirect(self):
-        stage(15, "Open Redirect Scan (OpenRedireX fuzz + canary verification)")
+        stage(15, "Open Redirect Scan")
         d = self.out / "15_open_redirect"
         d.mkdir(parents=True, exist_ok=True)
 
@@ -7919,14 +10128,28 @@ class ReconPipeline:
         except (TypeError, ValueError):
             cap = 0
         seen, redir_targets = set(), []
-        for key in ("stage4_urls", "stage9_params"):
-            uf = self._cp(key)
-            if uf.exists() and uf.stat().st_size > 0:
+        listed = self.out / "05_categorized" / "openredirect.txt"
+        if listed.exists() and listed.stat().st_size > 0:
+            for line in listed.read_text(errors="ignore").splitlines():
+                u = line.strip()
+                if u and u not in seen:
+                    seen.add(u)
+                    redir_targets.append(u)
+        else:
+            for key in ("stage4_urls", "stage9_params"):
+                uf = self._cp(key)
+                if not (uf.exists() and uf.stat().st_size > 0):
+                    continue
                 for line in uf.read_text(errors="ignore").splitlines():
                     u = line.strip()
-                    if u and redir_re.search(u) and u not in seen:
-                        seen.add(u)
-                        redir_targets.append(u)
+                    if not u or not redir_re.search(u):
+                        continue
+                    point = _xss_injection_point(u)
+                    key_u = point or u
+                    if key_u in seen:
+                        continue
+                    seen.add(key_u)
+                    redir_targets.append(u)
 
         if not redir_targets:
             ok("No URLs with redirect-like parameters — nothing to test")
@@ -7985,6 +10208,8 @@ class ReconPipeline:
                      f"checked {checked:,}/{len(redir_targets):,}")
                 break
             checked += 1
+            _pulse_job("open-redirect", t0, checked, len(redir_targets),
+                       unit="urls", item=u)
             hit = self._verify_open_redirect(u)
             if hit:
                 findings.append(hit)
@@ -8696,7 +10921,10 @@ class ReconPipeline:
                 warn(f"FULL report error: {e}")
 
         target_rp = report_path or full_report
-        if target_rp and not self._open_report_with_ai_bridge(target_rp):
+        # A scan started from the open report rewrites that same file. The
+        # page reloads itself. Opening a browser here would add a second tab.
+        in_place = os.environ.get("RECONX_REPORT_IN_PLACE") == "1"
+        if target_rp and not in_place and not self._open_report_with_ai_bridge(target_rp):
             try:
                 import webbrowser
                 # Windows'ta dogru file URI: file:///C:/... (file://C:\... okunmaz)
@@ -8765,6 +10993,21 @@ class ReconPipeline:
             urls.append(u)
         urls = [u for u in urls if u]
         urls = list(dict.fromkeys(urls))
+        if urls:
+            seed = urlparse(urls[0])
+            known = {(urlparse(u).hostname or "").lower() for u in urls}
+            siblings = []
+            for name in _etc_hosts_names(self.target):
+                if name in known:
+                    continue
+                known.add(name)
+                if seed.port:
+                    siblings.append(f"{seed.scheme}://{name}:{seed.port}/")
+                else:
+                    siblings.append(f"{seed.scheme}://{name}/")
+            if siblings:
+                info(f"/etc/hosts: {len(siblings)} related name(s) on the same port as the seed")
+                urls.extend(siblings)
         if not urls:
             err("No URLs found — exiting")
             sys.exit(1)
@@ -8857,6 +11100,9 @@ class ReconPipeline:
         if self.has_auth():
             hdrs = self._auth_headers(hdrs)
         _imp = _cfg_get(self.cfg, "settings", "curl_cffi_impersonate", default="chrome120") or "chrome120"
+        probe_total = len(base_hosts) * len(swagger_candidates)
+        probe_n = 0
+        api_t0 = time.time()
         for base in base_hosts:
             if _INT.stage_skip():
                 break
@@ -8864,6 +11110,8 @@ class ReconPipeline:
                 if _INT.stage_skip():
                     break
                 cu = base + cand
+                probe_n += 1
+                _pulse_job("api", api_t0, probe_n, probe_total, unit="probes", item=cu)
                 probe_results.append(cu)
                 if client is None:
                     continue
@@ -9177,9 +11425,10 @@ class ReconPipeline:
         # zaten auth yoksa kendi icinde net bir mesajla guvenle atlaniyor, o
         # yuzden her zaman dahil etmek numarayi hep ardisik tutar.
         if self.url_targets:
-            # URL-seed mode runs stage 1 and the seeder OUTSIDE the main loop, so
-            # they need their own state bookkeeping — otherwise stage 1 is never
-            # recorded as done and every --resume would pay for it again.
+            # URL-seed mode runs the seeder and stage 1 OUTSIDE the main loop.
+            # The seed goes first so the console order is 0 then 1, and so the
+            # host fingerprint uses a port the seed URL actually answered on.
+            self.stage0_seed_urls()
             if (not stages or 1 in stages):
                 if self.resume and self.state.is_done(1):
                     self._restore_stage(1)
@@ -9198,12 +11447,11 @@ class ReconPipeline:
                             1, "partial" if (_INT.stage_skip() or _INT.hard()) else "done",
                             self.summary.get("stage1"), time.time() - _t1)
                     _INT.reset()
-            self.stage0_seed_urls()
-            # XSS (6) and Nuclei (7) run in the default pass. Port scan, open
-            # redirect, CORS, takeover and cloud buckets stay on the Scan Center.
-            run_stages = stages or [4, 5, 6, 7, 8, 9, 10, 11, 13]
+            # Recon only. XSS, Nuclei, JS, API and open redirect stay on the
+            # Scan Center so they run after the report, against this corpus.
+            run_stages = stages or [4, 5, 8, 9, 11, 14]
         else:
-            run_stages = stages or [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+            run_stages = stages or [1, 2, 3, 4, 5, 8, 9, 11, 14]
 
         # -s ile acikca stage secildiyse kullanicinin secimi aynen kullanilir
         # (stage 8 istemeden zorla eklenmez); yalniz login/cookie verilip de
@@ -9224,6 +11472,10 @@ class ReconPipeline:
         # --auto ("auto_mode") ise varsayilan tam taramada bile bu sorulari
         # tamamen bypass eder — full pipeline hicbir onay beklemeden calisir.
         interactive = stages is None and not self.auto_mode
+        if stages is None:
+            info("Recon pass: subdomains, URLs, parameters, technology, IPs and ports. "
+                 "XSS, Nuclei, JS analysis, API discovery, open redirect, CORS, "
+                 "takeover and cloud buckets run afterwards from the report Scan Center.")
         if self.auto_mode:
             info("Auto mode (--auto): all stages will run without interactive prompts.")
 
@@ -9268,7 +11520,7 @@ class ReconPipeline:
                 if n == 6:
                     if interactive:
                         self.xss_asked = True
-                        if not ask_yes_no("Run an XSS (Dalfox) scan against the high-value URLs?", default="y"):
+                        if not ask_yes_no("Run XSS testing against the high-value URLs?", default="y"):
                             self.state.finish_stage(n, "skipped", {"status": "skipped",
                                                                    "reason": "declined"})
                             _INT.reset()
@@ -9277,7 +11529,7 @@ class ReconPipeline:
                 if n == 7:
                     if interactive:
                         self.nuclei_asked = True
-                        if not ask_yes_no("Run a Nuclei vulnerability scan against every live URL?", default="y"):
+                        if not ask_yes_no("Run a template vulnerability scan against every live URL?", default="y"):
                             self.state.finish_stage(n, "skipped", {"status": "skipped",
                                                                    "reason": "declined"})
                             _INT.reset()
@@ -9397,15 +11649,15 @@ _TOOL_CHECKS = [
     ("findomain",         "recommended", "Stage 2 — extra subdomain source"),
     ("dnsx",              "recommended", "Stage 3 — DNS validation"),
     ("dig",               "recommended", "Stage 12 — CNAME / subdomain-takeover checks"),
-    ("dalfox",            "critical",    "Stage 6 — XSS scanning"),
-    ("nuclei",            "critical",    "Stage 7 — vulnerability scan + DAST fuzzing"),
+    ("dalfox",            "recommended", "Scan Center — XSS, after the recon report"),
+    ("nuclei",            "recommended", "Scan Center — vulnerability scan, after the recon report"),
     ("arjun",             "recommended", "Stage 9 — hidden parameter brute force"),
     ("whatweb",           "recommended", "Stage 1/11 — technology fingerprinting"),
     ("wafw00f",           "optional",    "Stage 1 — WAF fingerprinting"),
-    ("naabu",             "recommended", "Stage 14 — on-demand network/port discovery"),
+    ("naabu",             "recommended", "Stage 14 — network/port discovery during recon"),
     ("nmap",              "recommended", "Stage 1 + Stage 14 — port/service + version detection"),
     ("openredirex",       "recommended", "Stage 15 — open-redirect fuzzing"),
-    ("trufflehog",        "optional",    "Stage 10 — deeper JS secret detection"),
+    ("trufflehog",        "recommended", "Scan Center — JS secret detection on the downloaded scripts"),
     ("interactsh-client", "optional",    "Stage 6 — blind-XSS OOB callback"),
     ("tor",               "optional",    "Automatic IP rotation when blocked"),
 ]
@@ -9604,15 +11856,17 @@ def preflight_warn(cfg):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    show_banner = not any(a in sys.argv for a in ("-h", "--help"))
+    # Scan Center starts one process per button. The logo would otherwise
+    # fill the live console on every click; the stage header is the label.
+    show_banner = not any(a in sys.argv for a in ("-h", "--help", "--session-dir"))
     if show_banner:
         _bw = 55
         _lines = [
             f"ReconX  ·  Sequential Bug-Bounty Scanner  ·  v{VERSION}",
             "",
-            "Recon → subs, URLs, params, XSS, Nuclei",
-            "Port, redirect and CORS stay on demand",
-            "from the report, against this same corpus",
+            "Recon → subs, URLs, tech, IPs, ports",
+            "XSS, templates, JS, API, redirect: after",
+            "the report, from Scan Center",
             "AI Analysis: Claude ranks what to test, in the report",
             "",
             "linkedin.com/in/2u1fuk4r",
@@ -9791,6 +12045,10 @@ def main():
             domain = _extract_domain_from_any(url_targets[0])
             if domain:
                 info(f"Domain auto-detected: {domain}")
+                if not service_port:
+                    _, service_port = _split_host_port(url_targets[0])
+                    if service_port:
+                        info(f"Service port from URL: {service_port}")
             else:
                 err("Domain could not be detected — use -d"); sys.exit(1)
         elif args.login_url:
